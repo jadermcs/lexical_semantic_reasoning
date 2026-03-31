@@ -291,35 +291,5 @@ def main():
         f"Saved {len(success_logger._seen)} successful completions → {SUCCESSFUL_DATA_PATH}"
     )
 
-
-# ---------------------------------------------------------------------------
-# Evaluation on test set
-# ---------------------------------------------------------------------------
-
-    model.eval()
-    dataset_test = load_data("mcl-wic", split="test")
-
-    correct = 0
-    for example in dataset_test:
-        text = format_prompt(example)["prompt"]
-        inputs = tokenizer(text, return_tensors="pt").to(model.device)
-        with torch.no_grad():
-            outputs = model.generate(
-                **inputs,
-                max_new_tokens=512,
-                temperature=0.3,  # low temp for eval — greedy-ish
-                top_p=0.9,
-                do_sample=True,
-                pad_token_id=tokenizer.eos_token_id,
-            )
-        decoded = tokenizer.decode(
-            outputs[0][inputs["input_ids"].shape[1] :], skip_special_tokens=True
-        )
-        pred = _extract_answer(decoded)
-        label = "True" if example["label"] else "False"
-        correct += (pred or "").lower() == label.lower()
-
-    print(f"Accuracy: {correct / len(dataset_test):.4f}")
-
 if __name__ == "__main__":
     main()
