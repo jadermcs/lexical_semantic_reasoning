@@ -249,7 +249,7 @@ def main():
         # -- training --
         per_device_train_batch_size=4,
         gradient_accumulation_steps=4,  # effective batch = 4*4 = 16 prompts × 8 completions
-        num_train_epochs=3,
+        num_train_epochs=10,
         warmup_steps=50,
         learning_rate=5e-6,  # lower LR than SFT — RL is less stable
         lr_scheduler_type="cosine",
