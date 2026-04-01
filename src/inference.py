@@ -1,4 +1,5 @@
 import torch
+import argparse
 from tqdm import tqdm
 from pprint import pprint
 from peft import PeftModel
@@ -11,7 +12,7 @@ def main():
     parser.add_argument("--model", type=str, default="Qwen/Qwen3-1.7B")
     parser.add_argument("--lora", type=str, default="qwen-wic-grpo/checkpoint-2700")
     parser.add_argument("--dataset", type=str, default="mcl-wic")
-    args = parser.parse()
+    args = parser.parse_args()
     # Load the fine-tuned model
     tokenizer = AutoTokenizer.from_pretrained(args.model)
     base_model = AutoModelForCausalLM.from_pretrained(args.model, device_map="auto")
@@ -28,7 +29,8 @@ def main():
             outputs = model.generate(
                 **inputs,
                 max_new_tokens=512,
-                temperature=0.3,  # low temp for eval — greedy-ish
+                temperature=0.7,  # low temp for eval — greedy-ish
+                top_k=20,
                 top_p=0.9,
                 do_sample=True,
                 pad_token_id=tokenizer.eos_token_id,
@@ -37,7 +39,6 @@ def main():
             outputs[0][inputs["input_ids"].shape[1] :], skip_special_tokens=True
         )
         pred = grpo_finetune._extract_answer(decoded)
-        print(pred)
         label = "True" if example["label"] else "False"
         correct += (pred or "").lower() == label.lower()
     print(f"Accuracy: {correct / len(dataset_test):.4f}")

@@ -285,7 +285,6 @@ def main():
     )
 
     trainer.train()
-    trainer.save_model("./qwen-wic-grpo-final")
     success_logger.flush()
     print(
         f"Saved {len(success_logger._seen)} successful completions → {SUCCESSFUL_DATA_PATH}"
