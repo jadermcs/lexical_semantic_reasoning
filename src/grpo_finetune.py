@@ -19,10 +19,7 @@ from trl import GRPOConfig, GRPOTrainer
 
 from utils import load_data
 
-MODEL_NAME = "Qwen/Qwen3-1.7B"
 
-tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME, trust_remote_code=True)
-tokenizer.pad_token = tokenizer.eos_token
 
 SYSTEM_PROMPT = (
     "You are a linguistic expert specializing in word sense disambiguation. "
@@ -42,7 +39,7 @@ SYSTEM_PROMPT = (
 # ---------------------------------------------------------------------------
 
 
-def format_prompt(example):
+def format_prompt(example, tokenizer):
     messages = [
         {"role": "system", "content": SYSTEM_PROMPT},
         {
@@ -63,15 +60,6 @@ def format_prompt(example):
         "label": example["label"],
     }
 
-
-
-
-# ---------------------------------------------------------------------------
-# Reward functions
-# Each function receives:
-#   completions: list[str]  — one per sample in the batch
-#   **kwargs               — dataset columns as lists (e.g. kwargs["label"])
-# ---------------------------------------------------------------------------
 
 SUCCESSFUL_DATA_PATH = Path("./grpo_successful_completions.jsonl")
 
@@ -211,16 +199,19 @@ def reward_reasoning_quality(completions: list[str], **kwargs) -> list[float]:
     return rewards
 
 def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--model", type=str, default="Qwen/Qwen3-1.7B")
+    parser.add_argument("--dataset", type=str, default="mcl-wic")
+    args = parser.parse_args()
     dataset = DatasetDict(
-        {split: load_data("mcl-wic", split=split) for split in ("train", "dev")}
+        {split: load_data(args.dataset, split=split) for split in ("train", "dev")}
     )
     dataset = dataset.map(format_prompt, remove_columns=["lemma", "sentence1", "sentence2"])
-# ---------------------------------------------------------------------------
-# Model + LoRA
-# ---------------------------------------------------------------------------
 
+    tokenizer = AutoTokenizer.from_pretrained(args.model, trust_remote_code=True)
+    tokenizer.pad_token = tokenizer.eos_token
     model = AutoModelForCausalLM.from_pretrained(
-        MODEL_NAME,
+        args.model,
         device_map="cuda",
         trust_remote_code=True,
         dtype=torch.bfloat16,  # bfloat16 is preferred for RL stability
@@ -234,11 +225,6 @@ def main():
         lora_dropout=0.05,
         bias="none",
     )
-
-
-# ---------------------------------------------------------------------------
-# GRPO trainer
-# ---------------------------------------------------------------------------
 
     training_args = GRPOConfig(
         output_dir="./qwen-wic-grpo",

@@ -5,13 +5,15 @@ from pprint import pprint
 from peft import PeftModel
 from utils import load_data
 import grpo_finetune
+import finetune
 from transformers import AutoTokenizer, AutoModelForCausalLM, TrainingArguments
 
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--model", type=str, default="Qwen/Qwen3-1.7B")
-    parser.add_argument("--lora", type=str, default="qwen-wic-grpo/checkpoint-2700")
+    parser.add_argument("--lora", type=str, default="qwen-wic-grpo-final")
     parser.add_argument("--dataset", type=str, default="mcl-wic")
+    parser.add_argument("--sft", default=False, action="store_true")
     args = parser.parse_args()
     # Load the fine-tuned model
     tokenizer = AutoTokenizer.from_pretrained(args.model)
@@ -23,7 +25,10 @@ def main():
     # Evaluate accuracy on test set
     correct = 0
     for example in tqdm(dataset_test):
-        text = grpo_finetune.format_prompt(example)["prompt"]
+        if args.sft:
+            text = grpo_finetune.format_prompt(example, tokenizer)["prompt"]
+        else:
+            text = finetune.format_prompt(example, tokenizer)["prompt"]
         inputs = tokenizer(text, return_tensors="pt").to(model.device)
         with torch.no_grad():
             outputs = model.generate(
