@@ -259,7 +259,6 @@ def main():
         logging_steps=10,
         report_to="wandb",
         run_name="qwen-wic-grpo",
-        use_liger_kernel=True,
     )
 
 
