@@ -8,6 +8,7 @@ completions per prompt, so the reward signal can be sparse without issue.
 
 import json
 import re
+import argparse
 from pathlib import Path
 from threading import Lock
 
