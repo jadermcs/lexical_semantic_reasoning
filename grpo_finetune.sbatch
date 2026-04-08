@@ -18,9 +18,11 @@ module purge
 # module load cuda/12.4
 # module load python/3.11
 
-# Activate your virtual / conda environment
-# conda activate <env>
-# source .venv/bin/activate
+# Activate conda environment
+# Replace CONDA_BASE with the output of: conda info | grep "base environment"
+CONDA_BASE=/opt/miniconda3   # e.g. ~/miniconda3 or /opt/conda
+source "$CONDA_BASE/etc/profile.d/conda.sh"
+conda activate <env>          # replace <env> with your environment name
 
 # ── housekeeping ──────────────────────────────────────────────────────────────
 mkdir -p logs
