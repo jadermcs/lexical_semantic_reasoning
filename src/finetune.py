@@ -37,13 +37,14 @@ def main():
     dataset = DatasetDict(
         {split: load_data(args.dataset, split=split) for split in ("train", "dev")}
     )
-    dataset = dataset.map(format_message)  # apply prompt template from above
-    print(dataset["train"][0])
-    print(dataset_test[0])
-
 
     tokenizer = AutoTokenizer.from_pretrained(args.model, trust_remote_code=True)
     tokenizer.pad_token = tokenizer.eos_token
+
+    partial_format = partial(format_prompt, tokenizer=tokenizer)
+    dataset = dataset.map(format_prompt, remove_columns=["lemma", "sentence1", "sentence2"])
+    print(dataset["train"][0])
+
     model = AutoModelForCausalLM.from_pretrained(
         args.model,
         device_map="cuda",

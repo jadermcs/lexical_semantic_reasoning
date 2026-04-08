@@ -18,6 +18,8 @@ from peft import LoraConfig, TaskType
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from trl import GRPOConfig, GRPOTrainer
 
+from functools import partial
+
 from utils import load_data
 
 
@@ -207,10 +209,14 @@ def main():
     dataset = DatasetDict(
         {split: load_data(args.dataset, split=split) for split in ("train", "dev")}
     )
-    dataset = dataset.map(format_prompt, remove_columns=["lemma", "sentence1", "sentence2"])
 
     tokenizer = AutoTokenizer.from_pretrained(args.model, trust_remote_code=True)
     tokenizer.pad_token = tokenizer.eos_token
+
+    partial_format = partial(format_prompt, tokenizer=tokenizer)
+    dataset = dataset.map(partial_format, remove_columns=["lemma", "sentence1", "sentence2"])
+    print(dataset["train"][0])
+
     model = AutoModelForCausalLM.from_pretrained(
         args.model,
         device_map="cuda",
