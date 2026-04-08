@@ -1,5 +1,6 @@
 import argparse
-import torch
+from functools import partial
+
 from datasets import DatasetDict
 from peft import LoraConfig, TaskType, get_peft_model
 from transformers import AutoModelForCausalLM, AutoTokenizer
@@ -8,8 +9,7 @@ from trl import SFTConfig, SFTTrainer
 from utils import load_data
 
 
-
-def format_message(example, tokenizer):
+def format_prompt(example, tokenizer):
     answer = "True" if example["label"] else "False"
     messages = [
         {
@@ -42,7 +42,9 @@ def main():
     tokenizer.pad_token = tokenizer.eos_token
 
     partial_format = partial(format_prompt, tokenizer=tokenizer)
-    dataset = dataset.map(format_prompt, remove_columns=["lemma", "sentence1", "sentence2"])
+    dataset = dataset.map(
+        partial_format, remove_columns=["lemma", "sentence1", "sentence2"]
+    )
     print(dataset["train"][0])
 
     model = AutoModelForCausalLM.from_pretrained(
@@ -61,7 +63,6 @@ def main():
     )
     model = get_peft_model(model, lora_config)
     model.print_trainable_parameters()
-
 
     trainer = SFTTrainer(
         model=model,

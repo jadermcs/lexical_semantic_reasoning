@@ -1,12 +1,14 @@
-import torch
 import argparse
-from tqdm import tqdm
-from pprint import pprint
+
+import torch
 from peft import PeftModel
-from utils import load_data
-import grpo_finetune
+from tqdm import tqdm
+from transformers import AutoModelForCausalLM, AutoTokenizer
+
 import finetune
-from transformers import AutoTokenizer, AutoModelForCausalLM, TrainingArguments
+import grpo_finetune
+from utils import load_data
+
 
 def main():
     parser = argparse.ArgumentParser()
@@ -47,6 +49,7 @@ def main():
         label = "True" if example["label"] else "False"
         correct += (pred or "").lower() == label.lower()
     print(f"Accuracy: {correct / len(dataset_test):.4f}")
+
 
 if __name__ == "__main__":
     main()

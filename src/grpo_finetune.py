@@ -6,9 +6,10 @@ The model is prompted to reason inside <think> tags before giving a final
 completions per prompt, so the reward signal can be sparse without issue.
 """
 
+import argparse
 import json
 import re
-import argparse
+from functools import partial
 from pathlib import Path
 from threading import Lock
 
@@ -18,11 +19,7 @@ from peft import LoraConfig, TaskType
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from trl import GRPOConfig, GRPOTrainer
 
-from functools import partial
-
 from utils import load_data
-
-
 
 SYSTEM_PROMPT = (
     "You are a linguistic expert specializing in word sense disambiguation. "
@@ -201,6 +198,7 @@ def reward_reasoning_quality(completions: list[str], **kwargs) -> list[float]:
             rewards.append(0.0)  # too long / borderline
     return rewards
 
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--model", type=str, default="Qwen/Qwen3-1.7B")
@@ -214,7 +212,9 @@ def main():
     tokenizer.pad_token = tokenizer.eos_token
 
     partial_format = partial(format_prompt, tokenizer=tokenizer)
-    dataset = dataset.map(partial_format, remove_columns=["lemma", "sentence1", "sentence2"])
+    dataset = dataset.map(
+        partial_format, remove_columns=["lemma", "sentence1", "sentence2"]
+    )
     print(dataset["train"][0])
 
     model = AutoModelForCausalLM.from_pretrained(
@@ -261,7 +261,6 @@ def main():
         run_name="qwen-wic-grpo",
     )
 
-
     trainer = GRPOTrainer(
         model=model,
         processing_class=tokenizer,
@@ -281,6 +280,7 @@ def main():
     print(
         f"Saved {len(success_logger._seen)} successful completions → {SUCCESSFUL_DATA_PATH}"
     )
+
 
 if __name__ == "__main__":
     main()

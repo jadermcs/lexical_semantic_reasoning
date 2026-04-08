@@ -26,5 +26,3 @@ def load_data(datasets, split="train"):
                 )
             all_data.extend(data)
     return Dataset.from_list(all_data)
-
-
