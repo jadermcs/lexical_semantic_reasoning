@@ -5,7 +5,7 @@
 #SBATCH --partition=gpu           # adjust to your cluster's GPU partition name
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
-#SBATCH --gpus-per-node=1         # 1 GPU; bump to 2+ if OOM on 1.7B + G=8
+#SBATCH --gpus-per-node=2
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=32G
 #SBATCH --time=12:00:00
@@ -37,4 +37,4 @@ export WANDB_PROJECT="wic-grpo"
 # ── run ───────────────────────────────────────────────────────────────────────
 cd "$SLURM_SUBMIT_DIR"
 
-python src/grpo_finetune.py
+accelerate launch --num_processes 2 src/grpo_finetune.py
