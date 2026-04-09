@@ -8,9 +8,10 @@
 #SBATCH --gpus-per-node=2
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=32G
-#SBATCH --time=12:00:00
+#SBATCH --time=48:00:00
 #SBATCH --mail-type=END,FAIL
 #SBATCH --mail-user=your@email.com   # optional: remove or replace
+#SBATCH --open-mode=append            # don't truncate logs on requeue
 
 # ── environment ──────────────────────────────────────────────────────────────
 module purge
@@ -37,4 +38,12 @@ export WANDB_PROJECT="wic-grpo"
 # ── run ───────────────────────────────────────────────────────────────────────
 cd "$SLURM_SUBMIT_DIR"
 
-accelerate launch --num_processes 2 src/grpo_finetune.py
+# Resubmit this job if it hits the time limit (SIGTERM sent 60s before kill)
+resubmit() {
+    echo "Time limit approaching — resubmitting job for continuation..."
+    sbatch "$0"
+}
+trap resubmit SIGTERM
+
+accelerate launch --num_processes 2 src/grpo_finetune.py &
+wait $!

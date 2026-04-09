@@ -275,7 +275,16 @@ def main():
         peft_config=lora_config,
     )
 
-    trainer.train()
+    # Resume from the latest checkpoint if one exists (e.g. after a SLURM time-limit requeue)
+    last_checkpoint = None
+    output_path = Path(training_args.output_dir)
+    if output_path.exists():
+        checkpoints = sorted(output_path.glob("checkpoint-*"), key=lambda p: int(p.name.split("-")[-1]))
+        if checkpoints:
+            last_checkpoint = str(checkpoints[-1])
+            print(f"Resuming from checkpoint: {last_checkpoint}")
+
+    trainer.train(resume_from_checkpoint=last_checkpoint)
     success_logger.flush()
     print(
         f"Saved {len(success_logger._seen)} successful completions → {SUCCESSFUL_DATA_PATH}"
