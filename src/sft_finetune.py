@@ -70,7 +70,7 @@ def main():
         train_dataset=dataset["train"],
         eval_dataset=dataset["dev"],
         args=SFTConfig(
-            output_dir="./qwen-wic-lora",
+            output_dir="./qwen-wic-sft",
             dataset_text_field="text",
             per_device_train_batch_size=16,
             num_train_epochs=10,

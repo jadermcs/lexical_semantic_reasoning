@@ -242,8 +242,8 @@ def main():
         max_completion_length=512,
         temperature=0.9,
         # -- training --
-        per_device_train_batch_size=8,
-        gradient_accumulation_steps=2,
+        per_device_train_batch_size=4,
+        gradient_accumulation_steps=4,
         num_train_epochs=10,
         warmup_steps=50,
         learning_rate=5e-6,

@@ -5,7 +5,7 @@ from peft import PeftModel
 from tqdm import tqdm
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
-import finetune
+import sft_finetune
 import grpo_finetune
 from utils import load_data
 
@@ -28,7 +28,7 @@ def main():
     correct = 0
     for example in tqdm(dataset_test):
         if args.sft:
-            text = finetune.format_prompt(example, tokenizer)["prompt"]
+            text = stf_finetune.format_prompt(example, tokenizer)["prompt"]
         else:
             text = grpo_finetune.format_prompt(example, tokenizer)["prompt"]
         inputs = tokenizer(text, return_tensors="pt").to(model.device)
