@@ -207,6 +207,7 @@ def main():
     dataset = DatasetDict(
         {split: load_data(args.dataset, split=split) for split in ("train", "dev")}
     )
+    dataset["dev"] = dataset["dev"].select(range(200))
 
     tokenizer = AutoTokenizer.from_pretrained(args.model, trust_remote_code=True)
     tokenizer.pad_token = tokenizer.eos_token
@@ -221,7 +222,8 @@ def main():
         args.model,
         device_map="cuda",
         trust_remote_code=True,
-        dtype=torch.bfloat16,  # bfloat16 is preferred for RL stability
+        dtype=torch.bfloat16,
+        attn_implementation="sdpa",
     )
 
     lora_config = LoraConfig(
@@ -236,17 +238,18 @@ def main():
     training_args = GRPOConfig(
         output_dir="./qwen-wic-grpo",
         # -- generation --
-        num_generations=8,  # G: group size for relative reward computation
-        max_completion_length=512,  # enough room for <think> + <answer>
-        temperature=0.9,  # high temp encourages diverse completions in group
+        num_generations=8,
+        max_completion_length=512,
+        temperature=0.9,
         # -- training --
-        per_device_train_batch_size=4,
-        gradient_accumulation_steps=4,  # effective batch = 4*4 = 16 prompts × 8 completions
+        per_device_train_batch_size=8,
+        gradient_accumulation_steps=2,
         num_train_epochs=10,
         warmup_steps=50,
-        learning_rate=5e-6,  # lower LR than SFT — RL is less stable
+        learning_rate=5e-6,
         lr_scheduler_type="cosine",
         bf16=True,
+        torch_compile=True,
         # -- eval & save --
         eval_strategy="steps",
         eval_steps=100,

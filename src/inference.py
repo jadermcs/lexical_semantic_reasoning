@@ -13,7 +13,7 @@ from utils import load_data
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--model", type=str, default="Qwen/Qwen3-1.7B")
-    parser.add_argument("--lora", type=str, default="qwen-wic-grpo-final")
+    parser.add_argument("--lora", type=str, default="qwen-wic-grpo/checkpoint-1000")
     parser.add_argument("--dataset", type=str, default="mcl-wic")
     parser.add_argument("--sft", default=False, action="store_true")
     args = parser.parse_args()
@@ -28,9 +28,9 @@ def main():
     correct = 0
     for example in tqdm(dataset_test):
         if args.sft:
-            text = grpo_finetune.format_prompt(example, tokenizer)["prompt"]
-        else:
             text = finetune.format_prompt(example, tokenizer)["prompt"]
+        else:
+            text = grpo_finetune.format_prompt(example, tokenizer)["prompt"]
         inputs = tokenizer(text, return_tensors="pt").to(model.device)
         with torch.no_grad():
             outputs = model.generate(
