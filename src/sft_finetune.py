@@ -1,5 +1,6 @@
 import argparse
 import re
+from pathlib import Path
 from functools import partial
 
 import numpy as np
@@ -20,21 +21,44 @@ def preprocess_logits_for_metrics(logits, labels):
 
 
 def compute_metrics(eval_pred, tokenizer):
-    """Accuracy: check if the predicted 'true'/'false' token matches the label."""
-    predictions, labels = eval_pred  # predictions are argmax token ids
+    predictions, labels = eval_pred
+    predictions = np.asarray(predictions)
+    labels = np.asarray(labels)
 
-    true_id = tokenizer.encode("true", add_special_tokens=False)[-1]
-    false_id = tokenizer.encode("false", add_special_tokens=False)[-1]
+    gold_token_lists = []
+    pred_token_lists = []
 
-    correct = 0
-    total = 0
     for pred_seq, label_seq in zip(predictions, labels):
-        for pos in range(1, len(label_seq)):
-            if label_seq[pos] in (true_id, false_id):
-                # In causal LM logits[pos-1] predicts label[pos]
-                correct += int(pred_seq[pos - 1] == label_seq[pos])
-                total += 1
-                break
+        mask = label_seq != -100
+        if not mask.any():
+            gold_token_lists.append([])
+            pred_token_lists.append([])
+            continue
+
+        positions = np.where(mask)[0]
+        gold_token_lists.append(label_seq[positions].tolist())
+        # Shift left by 1: logits[t-1] predicts token[t]
+        pred_token_lists.append(pred_seq[positions - 1].tolist())
+
+    golds = tokenizer.batch_decode(gold_token_lists, skip_special_tokens=True)
+    preds = tokenizer.batch_decode(pred_token_lists, skip_special_tokens=True)
+
+    correct, total = 0, 0
+    for gold, pred in zip(golds, preds):
+        gold = gold.strip().lower()
+        pred = pred.strip().lower()
+
+        if "true" in gold:
+            gold_label = "true"
+        elif "false" in gold:
+            gold_label = "false"
+        else:
+            continue
+
+        pred_label = "true" if "true" in pred else "false" if "false" in pred else None
+        total += 1
+        if pred_label == gold_label:
+            correct += 1
 
     return {"accuracy": correct / total if total > 0 else 0.0}
 
@@ -46,7 +70,6 @@ def mark_target(sentence: str, word: str) -> str:
         r"<t>\1</t>",
         sentence,
         count=1,
-        flags=re.IGNORECASE,
     )
 
 
@@ -113,7 +136,25 @@ def main():
     )
     model = get_peft_model(model, lora_config)
     model.print_trainable_parameters()
-
+    training_args = SFTConfig(
+        output_dir="./qwen-wic-sft",
+        dataset_text_field="text",
+        per_device_train_batch_size=16,
+        gradient_accumulation_steps=2,
+        num_train_epochs=10,
+        warmup_steps=100,
+        learning_rate=2e-4,
+        lr_scheduler_type="cosine",
+        bf16=True,
+        torch_compile=True,
+        eval_strategy="epoch",
+        save_strategy="epoch",
+        save_total_limit=2,
+        load_best_model_at_end=True,
+        metric_for_best_model="eval_accuracy",
+        report_to="wandb",
+        run_name="qwen-wic-sft",
+    )
 
     trainer = SFTTrainer(
         model=model,
@@ -122,26 +163,17 @@ def main():
         eval_dataset=dataset["dev"],
         compute_metrics=partial_metrics,
         preprocess_logits_for_metrics=preprocess_logits_for_metrics,
-        args=SFTConfig(
-            output_dir="./qwen-wic-sft",
-            dataset_text_field="text",
-            per_device_train_batch_size=16,
-            gradient_accumulation_steps=2,
-            num_train_epochs=10,
-            warmup_steps=100,
-            learning_rate=2e-4,
-            lr_scheduler_type="cosine",
-            bf16=True,
-            torch_compile=True,
-            eval_strategy="epoch",
-            save_strategy="epoch",
-            save_total_limit=2,
-            load_best_model_at_end=True,
-            metric_for_best_model="eval_accuracy",
-            report_to="wandb",
-            run_name="qwen-wic-sft",
-        ),
+        args=training_args,
     )
+    last_checkpoint = None
+    output_path = Path(training_args.output_dir)
+    if output_path.exists():
+        checkpoints = sorted(output_path.glob("checkpoint-*"), key=lambda p: int(p.name.split("-")[-1]))
+        if checkpoints:
+            last_checkpoint = str(checkpoints[-1])
+            print(f"Resuming from checkpoint: {last_checkpoint}")
+
+    trainer.train(resume_from_checkpoint=last_checkpoint)
     trainer.train(resume_from_checkpoint=True)
 
 
