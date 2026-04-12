@@ -2,7 +2,7 @@
 GRPO fine-tuning for Word-in-Context (WiC) with R1-style chain-of-thought reasoning.
 
 The model is prompted to reason inside <think> tags before giving a final
-<answer>True/False</answer>. GRPO uses relative rewards within a group of
+<answer>true/false</answer>. GRPO uses relative rewards within a group of
 completions per prompt, so the reward signal can be sparse without issue.
 """
 
@@ -24,13 +24,15 @@ from utils import load_data
 SYSTEM_PROMPT = (
     "You are a linguistic expert specializing in word sense disambiguation. "
     "Given a target word and two sentences, determine whether the word is used "
-    "in the same sense in both sentences.\n\n"
+    "in the same sense in both sentences. "
+    "The target word is marked with <t> tags in each sentence.\n\n"
     "First, reason step by step inside <think> tags:\n"
-    "  1. Identify the specific meaning/sense of the word in Sentence 1.\n"
-    "  2. Identify the specific meaning/sense of the word in Sentence 2.\n"
-    "  3. Compare the two senses.\n\n"
-    "Then provide your final answer inside <answer> tags as exactly 'True' or 'False'.\n"
-    "Format: <think>your reasoning here</think><answer>True or False</answer>"
+    "  1. Gloss for use 1: <short dictionary-style definition>\n"
+    "  2. Gloss for use 2: <short dictionary-style definition>\n"
+    "  3. Do these glosses describe the same concept? <yes/no>\n"
+    "  4. Final answer: <true/false>\n\n"
+    "Then provide your final answer inside <answer> tags as exactly 'true' or 'false'.\n"
+    "Format: <think>your reasoning here</think><answer>true or false</answer>"
 )
 
 
@@ -38,17 +40,27 @@ SYSTEM_PROMPT = (
 # Dataset preparation
 # ---------------------------------------------------------------------------
 
+def mark_target(sentence: str, word: str) -> str:
+    """Wrap the first occurrence of *word* (case-insensitive) with <t> tags."""
+    return re.sub(
+        rf"\b({re.escape(word)})\b",
+        r"<t>\1</t>",
+        sentence,
+        count=1,
+        flags=re.IGNORECASE,
+    )
 
 def format_prompt(example, tokenizer):
+    s1 = mark_target(example["sentence1"], example["word1"])
+    s2 = mark_target(example["sentence2"], example["word2"])
     messages = [
         {"role": "system", "content": SYSTEM_PROMPT},
         {
             "role": "user",
             "content": (
-                f"Word: {example['lemma']}\n"
-                f"Sentence 1: {example['sentence1']}\n"
-                f"Sentence 2: {example['sentence2']}\n"
-                "Same sense?"
+                f"Word: {example['lemma']} ({example['pos']})\n"
+                f"Sentence 1: {s1}\n"
+                f"Sentence 2: {s2}\n"
             ),
         },
     ]
@@ -122,13 +134,13 @@ success_logger = SuccessLogger(SUCCESSFUL_DATA_PATH, flush_every=50)
 
 
 def _extract_answer(text: str) -> str | None:
-    """Return 'True' or 'False' from the completion, or None if not found."""
+    """Return 'true' or 'false' from the completion, or None if not found."""
     # prefer explicit <answer> tags
-    m = re.search(r"<answer>\s*(True|False)\s*</answer>", text, re.IGNORECASE)
+    m = re.search(r"<answer>\s*(true|false)\s*</answer>", text, re.IGNORECASE)
     if m:
         return m.group(1).capitalize()
-    # fallback: last bare True/False token
-    tokens = re.findall(r"\b(True|False)\b", text, re.IGNORECASE)
+    # fallback: last bare true/false token
+    tokens = re.findall(r"\b(true|false)\b", text, re.IGNORECASE)
     return tokens[-1].capitalize() if tokens else None
 
 
@@ -145,7 +157,7 @@ def reward_correctness(completions: list[str], **kwargs) -> list[float]:
     prompts = kwargs.get("prompts", [None] * len(completions))
     rewards = []
     for prompt, completion, lbl in zip(prompts, completions, labels):
-        expected = "True" if lbl else "False"
+        expected = "true" if lbl else "false"
         pred = _extract_answer(completion)
         if pred is None:
             rewards.append(-0.5)
@@ -171,7 +183,7 @@ def reward_format(completions: list[str], **kwargs) -> list[float]:
         r = 0.0
         if re.search(r"<think>.+?</think>", completion, re.DOTALL):
             r += 0.2
-        if re.search(r"<answer>(True|False)</answer>", completion, re.IGNORECASE):
+        if re.search(r"<answer>(true|false)</answer>", completion, re.IGNORECASE):
             r += 0.1
         rewards.append(r)
     return rewards
@@ -179,9 +191,17 @@ def reward_format(completions: list[str], **kwargs) -> list[float]:
 
 def reward_reasoning_quality(completions: list[str], **kwargs) -> list[float]:
     """
-    Soft reward for reasoning that is substantive but concise.
-    Rewards 30–200-word think blocks; penalises empty or runaway reasoning.
-    Keeps the model from collapsing to zero-shot answers or rambling.
+    Soft reward for reasoning that follows the gloss-based structure:
+      1. Gloss for use 1: ...
+      2. Gloss for use 2: ...
+      3. Do these glosses describe the same concept? yes/no
+      4. Final answer: true/false
+
+    +0.1  for each gloss line present (up to +0.2)
+    +0.1  for the same-concept question with a yes/no answer
+    +0.1  for the final answer line
+    -0.1  if <think> block is absent entirely
+    -0.05 if <think> block is trivially short (< 10 words)
     """
     rewards = []
     for completion in completions:
@@ -189,13 +209,20 @@ def reward_reasoning_quality(completions: list[str], **kwargs) -> list[float]:
         if not m:
             rewards.append(-0.1)
             continue
-        n_words = len(m.group(1).split())
-        if n_words < 10:
-            rewards.append(-0.05)  # trivially short
-        elif 30 <= n_words <= 200:
-            rewards.append(0.1)  # good range
-        else:
-            rewards.append(0.0)  # too long / borderline
+        think = m.group(1)
+        if len(think.split()) < 10:
+            rewards.append(-0.05)
+            continue
+        r = 0.0
+        if re.search(r"gloss for use 1\s*:", think, re.IGNORECASE):
+            r += 0.1
+        if re.search(r"gloss for use 2\s*:", think, re.IGNORECASE):
+            r += 0.1
+        if re.search(r"same concept\b.{0,30}\b(yes|no)\b", think, re.IGNORECASE):
+            r += 0.1
+        if re.search(r"final answer\s*:\s*(true|false)", think, re.IGNORECASE):
+            r += 0.1
+        rewards.append(r)
     return rewards
 
 
@@ -207,14 +234,14 @@ def main():
     dataset = DatasetDict(
         {split: load_data(args.dataset, split=split) for split in ("train", "dev")}
     )
-    dataset["dev"] = dataset["dev"].select(range(200))
+    dataset["dev"] = dataset["dev"].shuffle(seed=42).select(range(200))
 
     tokenizer = AutoTokenizer.from_pretrained(args.model, trust_remote_code=True)
     tokenizer.pad_token = tokenizer.eos_token
 
     partial_format = partial(format_prompt, tokenizer=tokenizer)
     dataset = dataset.map(
-        partial_format, remove_columns=["lemma", "sentence1", "sentence2"]
+        partial_format, remove_columns=["lemma", "word1", "word2", "pos", "sentence1", "sentence2"]
     )
     print(dataset["train"][0])
 
@@ -225,6 +252,7 @@ def main():
         dtype=torch.bfloat16,
         attn_implementation="sdpa",
     )
+
 
     lora_config = LoraConfig(
         task_type=TaskType.CAUSAL_LM,
@@ -241,10 +269,11 @@ def main():
         num_generations=8,
         max_completion_length=512,
         temperature=0.9,
+        weight_decay = 0.001,
         # -- training --
         per_device_train_batch_size=4,
         gradient_accumulation_steps=4,
-        num_train_epochs=10,
+        num_train_epochs=2,
         warmup_steps=50,
         learning_rate=5e-6,
         lr_scheduler_type="cosine",
@@ -268,9 +297,9 @@ def main():
         model=model,
         processing_class=tokenizer,
         reward_funcs=[
-            reward_correctness,  # main signal  (scale ≈ ±1)
-            reward_format,  # structure    (scale  0–0.3)
-            reward_reasoning_quality,  # length proxy (scale -0.1–0.1)
+            reward_correctness,
+            reward_format,
+            reward_reasoning_quality,
         ],
         args=training_args,
         train_dataset=dataset["train"],
@@ -279,15 +308,8 @@ def main():
     )
 
     # Resume from the latest checkpoint if one exists (e.g. after a SLURM time-limit requeue)
-    last_checkpoint = None
-    output_path = Path(training_args.output_dir)
-    if output_path.exists():
-        checkpoints = sorted(output_path.glob("checkpoint-*"), key=lambda p: int(p.name.split("-")[-1]))
-        if checkpoints:
-            last_checkpoint = str(checkpoints[-1])
-            print(f"Resuming from checkpoint: {last_checkpoint}")
 
-    trainer.train(resume_from_checkpoint=last_checkpoint)
+    trainer.train(resume_from_checkpoint=True)
     success_logger.flush()
     print(
         f"Saved {len(success_logger._seen)} successful completions → {SUCCESSFUL_DATA_PATH}"

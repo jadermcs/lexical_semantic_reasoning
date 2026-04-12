@@ -28,7 +28,7 @@ def main():
     correct = 0
     for example in tqdm(dataset_test):
         if args.sft:
-            text = stf_finetune.format_prompt(example, tokenizer)["prompt"]
+            text = stf_finetune.format_prompt(example, tokenizer)["text"]
         else:
             text = grpo_finetune.format_prompt(example, tokenizer)["prompt"]
         inputs = tokenizer(text, return_tensors="pt").to(model.device)
@@ -46,7 +46,7 @@ def main():
             outputs[0][inputs["input_ids"].shape[1] :], skip_special_tokens=True
         )
         pred = grpo_finetune._extract_answer(decoded)
-        label = "True" if example["label"] else "False"
+        label = "true" if example["label"] else "false"
         correct += (pred or "").lower() == label.lower()
     print(f"Accuracy: {correct / len(dataset_test):.4f}")
 
