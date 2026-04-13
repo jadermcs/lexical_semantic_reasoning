@@ -30,7 +30,6 @@ SYSTEM_PROMPT = (
     "  1. Gloss for use 1: <short dictionary-style definition>\n"
     "  2. Gloss for use 2: <short dictionary-style definition>\n"
     "  3. Do these glosses describe the same concept? <yes/no>\n"
-    "  4. Final answer: <true/false>\n\n"
     "Then provide your final answer inside <answer> tags as exactly 'true' or 'false'.\n"
     "Format: <think>your reasoning here</think><answer>true or false</answer>"
 )
@@ -138,7 +137,7 @@ def _extract_answer(text: str) -> str | None:
     # prefer explicit <answer> tags
     m = re.search(r"<answer>\s*(true|false)\s*</answer>", text, re.IGNORECASE)
     if m:
-        return m.group(1).capitalize()
+        return m.group(1)
     # fallback: last bare true/false token
     tokens = re.findall(r"\b(true|false)\b", text, re.IGNORECASE)
     return tokens[-1].capitalize() if tokens else None
@@ -219,8 +218,6 @@ def reward_reasoning_quality(completions: list[str], **kwargs) -> list[float]:
         if re.search(r"gloss for use 2\s*:", think, re.IGNORECASE):
             r += 0.1
         if re.search(r"same concept\b.{0,30}\b(yes|no)\b", think, re.IGNORECASE):
-            r += 0.1
-        if re.search(r"final answer\s*:\s*(true|false)", think, re.IGNORECASE):
             r += 0.1
         rewards.append(r)
     return rewards
