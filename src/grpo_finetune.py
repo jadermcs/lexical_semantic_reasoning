@@ -43,7 +43,7 @@ def mark_target(sentence: str, word: str) -> str:
     """Wrap the first occurrence of *word* (case-insensitive) with <t> tags."""
     return re.sub(
         rf"\b({re.escape(word)})\b",
-        r"<t>\1</t>",
+        r"<t> \1 </t>",
         sentence,
         count=1,
         flags=re.IGNORECASE,
