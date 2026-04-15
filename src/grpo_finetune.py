@@ -225,7 +225,7 @@ def reward_reasoning_quality(completions: list[str], **kwargs) -> list[float]:
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--model", type=str, default="Qwen/Qwen3-4B-Thinking-2507")
+    parser.add_argument("--model", type=str, default="Qwen/Qwen3-1.7B")
     parser.add_argument("--dataset", type=str, default="mcl-wic")
     args = parser.parse_args()
     dataset = DatasetDict(
