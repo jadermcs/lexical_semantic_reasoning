@@ -27,9 +27,9 @@ SYSTEM_PROMPT = (
     "in the same sense in both sentences. "
     "The target word is marked with <t> tags in each sentence.\n\n"
     "First, reason step by step inside <think> tags:\n"
-    "  1. Gloss for use 1: <short dictionary-style definition>\n"
-    "  2. Gloss for use 2: <short dictionary-style definition>\n"
-    "  3. Do these glosses describe the same concept? <yes/no>\n"
+    "  1. Gloss for use 1: short dictionary-style definition\n"
+    "  2. Gloss for use 2: short dictionary-style definition\n"
+    "  3. Do these glosses describe the same concept? yes/no\n"
     "Then provide your final answer inside <answer> tags as exactly 'true' or 'false'.\n"
     "Format: <think>your reasoning here</think><answer>true or false</answer>"
 )
@@ -225,7 +225,7 @@ def reward_reasoning_quality(completions: list[str], **kwargs) -> list[float]:
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--model", type=str, default="Qwen/Qwen3-1.7B")
+    parser.add_argument("--model", type=str, default="Qwen/Qwen3-4B-Thinking-2507")
     parser.add_argument("--dataset", type=str, default="mcl-wic")
     args = parser.parse_args()
     dataset = DatasetDict(
@@ -275,7 +275,6 @@ def main():
         learning_rate=5e-6,
         lr_scheduler_type="cosine",
         bf16=True,
-        torch_compile=True,
         # -- eval & save --
         eval_strategy="steps",
         eval_steps=100,
@@ -288,6 +287,7 @@ def main():
         logging_steps=10,
         report_to="wandb",
         run_name="qwen-wic-grpo",
+        use_liger_kernel=True,
     )
 
     trainer = GRPOTrainer(
