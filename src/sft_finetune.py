@@ -3,7 +3,6 @@ import re
 from pathlib import Path
 from functools import partial
 
-import numpy as np
 import torch
 from datasets import DatasetDict
 from peft import LoraConfig, TaskType, get_peft_model
@@ -14,12 +13,13 @@ from utils import load_data
 
 
 def mark_target(sentence: str, word: str) -> str:
-    """Wrap the first occurrence of *word* (case-insensitive) with <t> tags."""
+    """Wrap the first occurrence of *word* (case-insensitive) with <target> tags."""
     return re.sub(
         rf"\b({re.escape(word)})\b",
-        r"<t> \1 </t>",
+        r"<target> \1 </target>",
         sentence,
         count=1,
+        flags=re.IGNORECASE,
     )
 
 
@@ -33,7 +33,7 @@ def format_prompt(example, tokenizer):
             "content": (
                 "You are a linguistic expert. Determine if the target word is used "
                 "in the same sense in both sentences. The target word is marked with "
-                "<t> tags in each sentence. Answer only 'true' or 'false'."
+                "<target> tags in each sentence. Answer only 'true' or 'false'."
             ),
         },
         {
@@ -62,17 +62,17 @@ def main():
     tokenizer.pad_token = tokenizer.eos_token
 
     partial_format = partial(format_prompt, tokenizer=tokenizer)
-    partial_metrics = partial(compute_metrics, tokenizer=tokenizer)
     dataset = dataset.map(
         partial_format, remove_columns=["lemma", "word1", "word2", "pos", "sentence1", "sentence2"]
     )
     print(dataset["train"][0])
 
+
     model = AutoModelForCausalLM.from_pretrained(
         args.model,
         device_map="cuda",
-        trust_remote_code=True,
         dtype=torch.bfloat16,
+        trust_remote_code=True,
         attn_implementation="sdpa",
     )
 
@@ -89,8 +89,8 @@ def main():
     training_args = SFTConfig(
         output_dir="./qwen-wic-sft",
         dataset_text_field="text",
-        per_device_train_batch_size=16,
-        gradient_accumulation_steps=2,
+        per_device_train_batch_size=8,
+        gradient_accumulation_steps=4,
         num_train_epochs=5,
         warmup_steps=100,
         learning_rate=2e-4,
@@ -99,9 +99,8 @@ def main():
         torch_compile=True,
         eval_strategy="epoch",
         save_strategy="epoch",
-        save_total_limit=2,
+        save_total_limit=1,
         load_best_model_at_end=True,
-        metric_for_best_model="eval_mean_token_accuracy",
         report_to="wandb",
         run_name="qwen-wic-sft",
     )
@@ -122,7 +121,6 @@ def main():
             print(f"Resuming from checkpoint: {last_checkpoint}")
 
     trainer.train(resume_from_checkpoint=last_checkpoint)
-    trainer.train(resume_from_checkpoint=True)
 
 
 if __name__ == "__main__":
