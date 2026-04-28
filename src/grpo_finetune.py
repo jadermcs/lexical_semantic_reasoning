@@ -275,6 +275,7 @@ def main():
         learning_rate=5e-6,
         lr_scheduler_type="cosine",
         bf16=True,
+        loss_type="sapo",
         # -- eval & save --
         eval_strategy="steps",
         eval_steps=100,
