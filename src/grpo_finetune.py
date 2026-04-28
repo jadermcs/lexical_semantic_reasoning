@@ -265,7 +265,10 @@ def main():
         # -- generation --
         num_generations=8,
         max_completion_length=512,
-        temperature=0.9,
+        temperature=0.6,
+        top_p=0.95,
+        top_k=20,
+        min_p=0,
         weight_decay = 0.001,
         # -- training --
         per_device_train_batch_size=4,
