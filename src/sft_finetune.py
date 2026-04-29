@@ -28,6 +28,7 @@ import torch
 import wn
 from datasets import Dataset, DatasetDict
 from peft import LoraConfig, TaskType, get_peft_model
+from rapidfuzz import fuzz, process
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from trl import SFTConfig, SFTTrainer
 
@@ -48,12 +49,29 @@ SYSTEM_PROMPT = (
 POS_MAP = {"n": "noun", "v": "verb", "a": "adjective", "s": "adjective", "r": "adverb"}
 
 
-def mark_target(sentence: str, word: str) -> str:
-    """Wrap the first occurrence of *word* (case-insensitive) with <t> tags."""
+def mark_target(sentence: str, word: str, fuzzy_threshold: float = 70.0) -> str:
+    """Wrap the best match for *word* in *sentence* with <t> tags.
+
+    Tries an exact word-boundary match first; falls back to a rapidfuzz QRatio
+    search over tokens to catch inflected forms (run → ran, mouse → mice).
+    """
     pattern = rf"\b({re.escape(word)}\w*)\b"
     if re.search(pattern, sentence, flags=re.IGNORECASE):
         return re.sub(pattern, r"<t> \1 </t>", sentence, count=1, flags=re.IGNORECASE)
-    # fall back to lemma form if surface form not literally present
+
+    tokens = re.findall(r"\w+", sentence)
+    if tokens:
+        match = process.extractOne(
+            word.lower(),
+            [t.lower() for t in tokens],
+            scorer=fuzz.QRatio,
+            score_cutoff=fuzzy_threshold,
+        )
+        if match is not None:
+            _, _, idx = match
+            best = tokens[idx]
+            return re.sub(rf"\b{re.escape(best)}\b", f"<t> {best} </t>", sentence, count=1)
+
     return sentence + f" <t> {word} </t>"
 
 
@@ -123,7 +141,7 @@ def build_wordnet_dataset(
         for ((s1, ex1), (s2, ex2)), label in chosen:
             records.append(
                 {
-                    "lemma": lemma,
+                    "lemma": lemma
                     "pos": POS_MAP.get(pos, pos),
                     "word1": lemma,
                     "word2": lemma,
@@ -138,8 +156,14 @@ def build_wordnet_dataset(
             break
 
     rng.shuffle(records)
+
+    pos_records = [r for r in records if r["label"] == 1]
+    neg_records = [r for r in records if r["label"] == 0]
+    n = min(len(pos_records), len(neg_records))
     if max_total:
-        records = records[:max_total]
+        n = min(n, max_total // 2)
+    records = pos_records[:n] + neg_records[:n]
+    rng.shuffle(records)
     return Dataset.from_list(records)
 
 

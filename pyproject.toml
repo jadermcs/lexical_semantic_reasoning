@@ -15,4 +15,5 @@ dependencies = [
     "peft>=0.18.1",
     "liger-kernel>=0.7.0",
     "wn>=0.9",
+    "rapidfuzz>=3.14.5",
 ]
