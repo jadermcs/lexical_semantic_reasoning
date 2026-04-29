@@ -141,7 +141,7 @@ def build_wordnet_dataset(
         for ((s1, ex1), (s2, ex2)), label in chosen:
             records.append(
                 {
-                    "lemma": lemma
+                    "lemma": lemma,
                     "pos": POS_MAP.get(pos, pos),
                     "word1": lemma,
                     "word2": lemma,
