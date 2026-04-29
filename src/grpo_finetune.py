@@ -15,7 +15,7 @@ from threading import Lock
 
 import torch
 from datasets import DatasetDict
-from peft import LoraConfig, TaskType
+from peft import LoraConfig, PeftModel, TaskType
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from trl import GRPOConfig, GRPOTrainer
 
@@ -39,6 +39,7 @@ SYSTEM_PROMPT = (
 # Dataset preparation
 # ---------------------------------------------------------------------------
 
+
 def mark_target(sentence: str, word: str) -> str:
     """Wrap the first occurrence of *word* (case-insensitive) with <t> tags."""
     return re.sub(
@@ -48,6 +49,7 @@ def mark_target(sentence: str, word: str) -> str:
         count=1,
         flags=re.IGNORECASE,
     )
+
 
 def format_prompt(example, tokenizer):
     s1 = mark_target(example["sentence1"], example["word1"])
@@ -226,6 +228,7 @@ def reward_reasoning_quality(completions: list[str], **kwargs) -> list[float]:
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--model", type=str, default="Qwen/Qwen3-1.7B")
+    parser.add_argument("--lora", type=str, default=None)
     parser.add_argument("--dataset", type=str, default="mcl-wic")
     args = parser.parse_args()
     dataset = DatasetDict(
@@ -238,7 +241,8 @@ def main():
 
     partial_format = partial(format_prompt, tokenizer=tokenizer)
     dataset = dataset.map(
-        partial_format, remove_columns=["lemma", "word1", "word2", "pos", "sentence1", "sentence2"]
+        partial_format,
+        remove_columns=["lemma", "word1", "word2", "pos", "sentence1", "sentence2"],
     )
     print(dataset["train"][0])
 
@@ -250,6 +254,9 @@ def main():
         attn_implementation="sdpa",
     )
 
+    if args.lora:
+        model = PeftModel.from_pretrained(model, args.lora, is_trainable=True)
+        print(f"Loaded LoRA adapter from: {args.lora}")
 
     lora_config = LoraConfig(
         task_type=TaskType.CAUSAL_LM,
@@ -269,7 +276,7 @@ def main():
         top_p=0.95,
         top_k=20,
         min_p=0,
-        weight_decay = 0.001,
+        weight_decay=0.001,
         # -- training --
         per_device_train_batch_size=4,
         gradient_accumulation_steps=4,
@@ -304,13 +311,15 @@ def main():
         args=training_args,
         train_dataset=dataset["train"],
         eval_dataset=dataset["dev"],
-        peft_config=lora_config,
+        peft_config=None if args.lora else lora_config,
     )
 
     last_checkpoint = None
     output_path = Path(training_args.output_dir)
     if output_path.exists():
-        checkpoints = sorted(output_path.glob("checkpoint-*"), key=lambda p: int(p.name.split("-")[-1]))
+        checkpoints = sorted(
+            output_path.glob("checkpoint-*"), key=lambda p: int(p.name.split("-")[-1])
+        )
         if checkpoints:
             last_checkpoint = str(checkpoints[-1])
             print(f"Resuming from checkpoint: {last_checkpoint}")
