@@ -32,7 +32,6 @@ from rapidfuzz import fuzz, process
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from trl import SFTConfig, SFTTrainer
 
-
 SYSTEM_PROMPT = (
     "You are a linguistic expert specializing in word sense disambiguation. "
     "Given a target word and two sentences, determine whether the word is used "
@@ -70,7 +69,9 @@ def mark_target(sentence: str, word: str, fuzzy_threshold: float = 70.0) -> str:
         if match is not None:
             _, _, idx = match
             best = tokens[idx]
-            return re.sub(rf"\b{re.escape(best)}\b", f"<t> {best} </t>", sentence, count=1)
+            return re.sub(
+                rf"\b{re.escape(best)}\b", f"<t> {best} </t>", sentence, count=1
+            )
 
     return sentence + f" <t> {word} </t>"
 
@@ -220,7 +221,17 @@ def main():
     tokenizer.pad_token = tokenizer.eos_token
 
     partial_format = partial(format_example, tokenizer=tokenizer)
-    cols = ["lemma", "pos", "word1", "word2", "sentence1", "sentence2", "gloss1", "gloss2", "label"]
+    cols = [
+        "lemma",
+        "pos",
+        "word1",
+        "word2",
+        "sentence1",
+        "sentence2",
+        "gloss1",
+        "gloss2",
+        "label",
+    ]
     dataset = dataset.map(partial_format, remove_columns=cols)
     print(dataset["train"][0]["text"])
 
@@ -254,9 +265,9 @@ def main():
         lr_scheduler_type="cosine",
         bf16=True,
         torch_compile=True,
-        eval_strategy="step",
-        save_strategy="step",
-        eval_steps=100,
+        eval_strategy="steps",
+        save_strategy="steps",
+        eval_steps=500,
         save_total_limit=1,
         load_best_model_at_end=True,
         report_to="wandb",
@@ -274,7 +285,9 @@ def main():
     last_checkpoint = None
     output_path = Path(training_args.output_dir)
     if output_path.exists():
-        checkpoints = sorted(output_path.glob("checkpoint-*"), key=lambda p: int(p.name.split("-")[-1]))
+        checkpoints = sorted(
+            output_path.glob("checkpoint-*"), key=lambda p: int(p.name.split("-")[-1])
+        )
         if checkpoints:
             last_checkpoint = str(checkpoints[-1])
             print(f"Resuming from checkpoint: {last_checkpoint}")
