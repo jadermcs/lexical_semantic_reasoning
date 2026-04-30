@@ -14,6 +14,7 @@ from pathlib import Path
 from threading import Lock
 
 import torch
+import torch.nn.functional as F
 from datasets import DatasetDict
 from peft import LoraConfig, PeftModel, TaskType
 from transformers import AutoModelForCausalLM, AutoTokenizer
@@ -172,6 +173,56 @@ def reward_correctness(completions: list[str], **kwargs) -> list[float]:
     return rewards
 
 
+@torch.no_grad()
+def _seq_mean_logprob(model, tokenizer, context: str, target: str) -> float:
+    """Mean per-token log-prob of *target* conditioned on *context*."""
+    ctx = tokenizer(context, return_tensors="pt", add_special_tokens=False).input_ids.to(model.device)
+    tgt = tokenizer(target, return_tensors="pt", add_special_tokens=False).input_ids.to(model.device)
+    if tgt.size(1) == 0:
+        return 0.0
+    input_ids = torch.cat([ctx, tgt], dim=1)
+    logits = model(input_ids).logits[:, ctx.size(1) - 1 : -1, :]
+    logp = F.log_softmax(logits.float(), dim=-1)
+    token_logp = logp.gather(-1, tgt.unsqueeze(-1)).squeeze(-1)
+    return token_logp.mean().item()
+
+
+def make_reward_rlpr(model, tokenizer, debias: bool = True):
+    """
+    RLPR reward: mean token probability of the reference answer given
+    prompt + reasoning. Optionally debiased by subtracting the same score
+    conditioned on the prompt alone, isolating the contribution of reasoning.
+    """
+
+    def reward_rlpr(completions: list[str], **kwargs) -> list[float]:
+        labels = kwargs["label"]
+        prompts = kwargs.get("prompts", [""] * len(completions))
+        rewards = []
+        for prompt, completion, lbl in zip(prompts, completions, labels):
+            ref = f"<answer>{'true' if lbl else 'false'}</answer>"
+            think_end = completion.find("</think>")
+            reasoning = (
+                completion[: think_end + len("</think>")] if think_end != -1 else completion
+            )
+
+            lp_with = _seq_mean_logprob(model, tokenizer, (prompt or "") + reasoning, ref)
+            r = float(torch.tensor(lp_with).exp())
+            if debias:
+                lp_without = _seq_mean_logprob(model, tokenizer, prompt or "", ref)
+                r -= float(torch.tensor(lp_without).exp())
+
+            # Still log fully-correct, well-formatted completions for SFT reuse.
+            pred = _extract_answer(completion)
+            expected = "true" if lbl else "false"
+            if pred == expected and re.search(r"<think>.+?</think>", completion, re.DOTALL):
+                success_logger.log(prompt or "", completion, int(lbl))
+
+            rewards.append(r)
+        return rewards
+
+    return reward_rlpr
+
+
 def reward_format(completions: list[str], **kwargs) -> list[float]:
     """
     Structural reward: encourage <think>…</think><answer>…</answer> format.
@@ -230,6 +281,16 @@ def main():
     parser.add_argument("--model", type=str, default="Qwen/Qwen3-1.7B")
     parser.add_argument("--lora", type=str, default=None)
     parser.add_argument("--dataset", type=str, default="mcl-wic")
+    parser.add_argument(
+        "--rlpr",
+        action="store_true",
+        help="Use RLPR (reference-probability) reward instead of rule-based correctness.",
+    )
+    parser.add_argument(
+        "--rlpr-no-debias",
+        action="store_true",
+        help="With --rlpr, skip the prompt-only baseline subtraction.",
+    )
     args = parser.parse_args()
     dataset = DatasetDict(
         {split: load_data(args.dataset, split=split) for split in ("train", "dev")}
@@ -300,11 +361,21 @@ def main():
         use_liger_kernel=True,
     )
 
+    if args.rlpr:
+        correctness_reward = make_reward_rlpr(
+            model, tokenizer, debias=not args.rlpr_no_debias
+        )
+        print(
+            f"Using RLPR reward (debias={not args.rlpr_no_debias}) instead of rule-based correctness."
+        )
+    else:
+        correctness_reward = reward_correctness
+
     trainer = GRPOTrainer(
         model=model,
         processing_class=tokenizer,
         reward_funcs=[
-            reward_correctness,
+            correctness_reward,
             reward_format,
             reward_reasoning_quality,
         ],
