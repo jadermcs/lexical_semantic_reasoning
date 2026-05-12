@@ -246,7 +246,7 @@ def make_grpo_config(output_dir: str, max_steps: int, run_name: str) -> GRPOConf
         top_p=0.95,
         top_k=20,
         min_p=0,
-        num_train_epochs=3,
+        num_train_epochs=5,
         weight_decay=0.001,
         per_device_train_batch_size=4,
         gradient_accumulation_steps=4,
