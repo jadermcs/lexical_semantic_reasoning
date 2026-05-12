@@ -109,7 +109,9 @@ def reward_verify_format(completions: list[str], **kwargs) -> list[float]:
         r = 0.0
         if re.search(r"<think>.+?</think>", completion, re.DOTALL):
             r += 0.1
-        if re.search(r"<verdict>(correct|incorrect)</verdict>", completion, re.IGNORECASE):
+        if re.search(
+            r"<verdict>(correct|incorrect)</verdict>", completion, re.IGNORECASE
+        ):
             r += 0.1
         rewards.append(r)
     return rewards
@@ -200,8 +202,8 @@ def build_verify_dataset(
     pos, neg = [], []
     for qid, ts in kept_per_query.items():
         rng.shuffle(ts)
-        per_query_pos = [t for t in ts if t["correctness"] == 1][: max_per_query]
-        per_query_neg = [t for t in ts if t["correctness"] == 0][: max_per_query]
+        per_query_pos = [t for t in ts if t["correctness"] == 1][:max_per_query]
+        per_query_neg = [t for t in ts if t["correctness"] == 0][:max_per_query]
         pos.extend(per_query_pos)
         neg.extend(per_query_neg)
 
@@ -244,6 +246,7 @@ def make_grpo_config(output_dir: str, max_steps: int, run_name: str) -> GRPOConf
         top_p=0.95,
         top_k=20,
         min_p=0,
+        num_train_epochs=3,
         weight_decay=0.001,
         per_device_train_batch_size=4,
         gradient_accumulation_steps=4,
@@ -275,11 +278,15 @@ def run_verify_init(
     # --- Stage 1: self-verification ---
     print(f"[verify-init] Sampling {args.verify_queries} on-policy queries...")
     triplets = sample_candidates(
-        model, tokenizer, raw_train,
+        model,
+        tokenizer,
+        raw_train,
         n_queries=args.verify_queries,
         group_size=args.group_size,
     )
-    verify_ds = build_verify_dataset(triplets, tokenizer, max_per_query=args.max_per_query)
+    verify_ds = build_verify_dataset(
+        triplets, tokenizer, max_per_query=args.max_per_query
+    )
     print(f"[verify-init] Verification dataset: {len(verify_ds)} balanced samples")
 
     v_args = make_grpo_config(
@@ -353,7 +360,9 @@ def run_verify_alter(
 
         # --- Verification phase (uses on-policy answers from updated model) ---
         triplets = sample_candidates(
-            model, tokenizer, raw_train,
+            model,
+            tokenizer,
+            raw_train,
             n_queries=args.verify_queries,
             group_size=args.group_size,
             seed=cycle,
@@ -366,9 +375,9 @@ def run_verify_alter(
             continue
         print(f"[verify-alter] cycle {cycle}: verification set size {len(verify_ds)}")
         v_args = make_grpo_config(
-            output_dir=str(Path(args.output_dir) / f"cycle{cycle}_verify"),
+            output_dir=str(Path(args.output_dir) / f"cycle{cycle}"),
             max_steps=args.verify_steps_per_cycle,
-            run_name=f"{args.run_name}-c{cycle}-verify",
+            run_name=f"{args.run_name}-c{cycle}",
         )
         v_trainer = GRPOTrainer(
             model=model,
@@ -405,8 +414,12 @@ def main():
     parser.add_argument("--generate-steps", type=int, default=600)
     # verify-alter schedule
     parser.add_argument("--total-steps", type=int, default=1000)
-    parser.add_argument("--alter-n", type=int, default=100,
-                        help="generation steps between verification phases")
+    parser.add_argument(
+        "--alter-n",
+        type=int,
+        default=100,
+        help="generation steps between verification phases",
+    )
     parser.add_argument("--verify-steps-per-cycle", type=int, default=50)
     # on-policy sampling
     parser.add_argument("--verify-queries", type=int, default=512)
