@@ -26,8 +26,10 @@ train = [
 # Inference machine: vLLM generation server. trl is needed for `trl vllm-serve`,
 # which exposes the weight-syncing endpoint the trainer connects to.
 infer = [
-    "vllm>=0.8.0",
+    "vllm==0.18.0",
     "trl>=1.1.0",
+    "flashinfer-python==0.6.6",
+    "flashinfer-cubin==0.6.6",
 ]
 
 [tool.uv]
