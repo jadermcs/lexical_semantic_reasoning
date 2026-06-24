@@ -42,3 +42,12 @@ conflicts = [
         { extra = "infer" },
     ],
 ]
+
+[tool.uv.sources]
+# Pull torch (and friends) from the CUDA 12.6 wheel index instead of PyPI.
+torch = [{ index = "pytorch-cu126" }]
+
+[[tool.uv.index]]
+name = "pytorch-cu126"
+url = "https://download.pytorch.org/whl/cu126"
+explicit = true
