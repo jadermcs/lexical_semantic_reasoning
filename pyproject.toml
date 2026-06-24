@@ -17,3 +17,12 @@ dependencies = [
     "wn>=0.9",
     "rapidfuzz>=3.14.5",
 ]
+
+[[tool.uv.index]]
+name = "pytorch-cu13"
+url = "https://download.pytorch.org/whl/cu13"
+explicit = true
+
+torch = [
+  { index = "pytorch-cu13", marker = "sys_platform == 'linux'" },
+]

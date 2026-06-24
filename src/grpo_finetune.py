@@ -228,8 +228,7 @@ def reward_reasoning_quality(completions: list[str], **kwargs) -> list[float]:
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--model", type=str, default="Qwen/Qwen3-1.7B")
-    parser.add_argument("--lora", type=str, default=None)
+    parser.add_argument("--model", type=str, default="Qwen/Qwen3-0.6B")
     parser.add_argument("--dataset", type=str, default="mcl-wic")
     args = parser.parse_args()
     dataset = DatasetDict(
@@ -253,19 +252,6 @@ def main():
         trust_remote_code=True,
         dtype=torch.bfloat16,
         attn_implementation="sdpa",
-    )
-
-    if args.lora:
-        model = PeftModel.from_pretrained(model, args.lora, is_trainable=True)
-        print(f"Loaded LoRA adapter from: {args.lora}")
-
-    lora_config = LoraConfig(
-        task_type=TaskType.CAUSAL_LM,
-        r=64,
-        lora_alpha=64,
-        target_modules="all-linear",
-        lora_dropout=0.05,
-        bias="none",
     )
 
     training_args = GRPOConfig(
