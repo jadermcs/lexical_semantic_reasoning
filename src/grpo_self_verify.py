@@ -20,7 +20,6 @@ from pathlib import Path
 
 import torch
 from datasets import Dataset, DatasetDict
-from peft import LoraConfig, PeftModel, TaskType
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from trl import GRPOConfig, GRPOTrainer
 
@@ -226,15 +225,6 @@ def build_verify_dataset(
 # ---------------------------------------------------------------------------
 
 
-def make_lora_config() -> LoraConfig:
-    return LoraConfig(
-        task_type=TaskType.CAUSAL_LM,
-        r=64,
-        lora_alpha=64,
-        target_modules="all-linear",
-        lora_dropout=0.05,
-        bias="none",
-    )
 
 
 def make_grpo_config(
@@ -288,7 +278,7 @@ def make_grpo_config(
 
 
 def run_verify_init(
-    model, tokenizer, raw_train, gen_train, eval_dataset, args, peft_config
+    model, tokenizer, raw_train, gen_train, eval_dataset, args
 ):
     """Stage-wise: pure self-verification, then standard generation GRPO."""
 
@@ -319,7 +309,6 @@ def run_verify_init(
         reward_funcs=[reward_verification, reward_verify_format],
         args=v_args,
         train_dataset=verify_ds,
-        peft_config=peft_config,
     )
     v_trainer.train()
     model = v_trainer.model  # carry adapters/weights forward
@@ -341,21 +330,19 @@ def run_verify_init(
         args=g_args,
         train_dataset=gen_train,
         eval_dataset=eval_dataset,
-        peft_config=None,  # already attached by stage 1
     )
     g_trainer.train()
     return g_trainer
 
 
 def run_verify_alter(
-    model, tokenizer, raw_train, gen_train, eval_dataset, args, peft_config
+    model, tokenizer, raw_train, gen_train, eval_dataset, args
 ):
     """Alternate: N steps generation, then a verification phase, repeat."""
     n_cycles = args.total_steps // (args.alter_n + args.verify_steps_per_cycle)
     if n_cycles == 0:
         raise ValueError("total_steps too small for one cycle")
 
-    attached_peft = peft_config  # only used on the very first trainer
     last_trainer = None
 
     for cycle in range(n_cycles):
@@ -374,11 +361,9 @@ def run_verify_alter(
             args=g_args,
             train_dataset=gen_train,
             eval_dataset=eval_dataset,
-            peft_config=attached_peft,
         )
         g_trainer.train()
         model = g_trainer.model
-        attached_peft = None
         last_trainer = g_trainer
 
         # --- Verification phase (uses on-policy answers from updated model) ---
@@ -410,7 +395,6 @@ def run_verify_alter(
             reward_funcs=[reward_verification, reward_verify_format],
             args=v_args,
             train_dataset=verify_ds,
-            peft_config=None,
         )
         v_trainer.train()
         model = v_trainer.model
@@ -427,7 +411,6 @@ def run_verify_alter(
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--model", type=str, default="Qwen/Qwen3-1.7B")
-    parser.add_argument("--lora", type=str, default=None)
     parser.add_argument("--dataset", type=str, default="mcl-wic")
     parser.add_argument(
         "--strategy", choices=["verify-init", "verify-alter"], default="verify-init"
@@ -491,19 +474,15 @@ def main():
         dtype=torch.bfloat16,
         attn_implementation="sdpa",
     )
-    if args.lora:
-        model = PeftModel.from_pretrained(model, args.lora, is_trainable=True)
-        print(f"Loaded LoRA adapter from: {args.lora}")
-    peft_config = None if args.lora else make_lora_config()
 
     # NOTE: on-policy sampling needs the raw fields, so pass raw_train (not gen_train).
     if args.strategy == "verify-init":
         run_verify_init(
-            model, tokenizer, raw_train, gen_train, gen_eval, args, peft_config
+            model, tokenizer, raw_train, gen_train, gen_eval, args
         )
     else:
         run_verify_alter(
-            model, tokenizer, raw_train, gen_train, gen_eval, args, peft_config
+            model, tokenizer, raw_train, gen_train, gen_eval, args
         )
 
     print("Training complete.")
