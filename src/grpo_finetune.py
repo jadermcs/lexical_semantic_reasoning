@@ -298,7 +298,6 @@ def main():
         args=training_args,
         train_dataset=dataset["train"],
         eval_dataset=dataset["dev"],
-        peft_config=None if args.lora else lora_config,
     )
 
     last_checkpoint = None
