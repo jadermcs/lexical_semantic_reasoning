@@ -20,7 +20,7 @@ from pathlib import Path
 
 import torch
 from datasets import Dataset, DatasetDict
-from transformers import AutoModelForCausalLM, AutoTokenizer
+from transformers import AutoTokenizer, Qwen3ForCausalLM
 from trl import GRPOConfig, GRPOTrainer
 
 from grpo_finetune import (
@@ -225,8 +225,6 @@ def build_verify_dataset(
 # ---------------------------------------------------------------------------
 
 
-
-
 def make_grpo_config(
     output_dir: str,
     max_steps: int,
@@ -277,9 +275,7 @@ def make_grpo_config(
 # ---------------------------------------------------------------------------
 
 
-def run_verify_init(
-    model, tokenizer, raw_train, gen_train, eval_dataset, args
-):
+def run_verify_init(model, tokenizer, raw_train, gen_train, eval_dataset, args):
     """Stage-wise: pure self-verification, then standard generation GRPO."""
 
     # --- Stage 1: self-verification ---
@@ -335,9 +331,7 @@ def run_verify_init(
     return g_trainer
 
 
-def run_verify_alter(
-    model, tokenizer, raw_train, gen_train, eval_dataset, args
-):
+def run_verify_alter(model, tokenizer, raw_train, gen_train, eval_dataset, args):
     """Alternate: N steps generation, then a verification phase, repeat."""
     n_cycles = args.total_steps // (args.alter_n + args.verify_steps_per_cycle)
     if n_cycles == 0:
@@ -467,7 +461,7 @@ def main():
         remove_columns=["lemma", "word1", "word2", "pos", "sentence1", "sentence2"],
     )
 
-    model = AutoModelForCausalLM.from_pretrained(
+    model = Qwen3ForCausalLM.from_pretrained(
         args.model,
         device_map="cuda",
         trust_remote_code=True,
@@ -477,13 +471,9 @@ def main():
 
     # NOTE: on-policy sampling needs the raw fields, so pass raw_train (not gen_train).
     if args.strategy == "verify-init":
-        run_verify_init(
-            model, tokenizer, raw_train, gen_train, gen_eval, args
-        )
+        run_verify_init(model, tokenizer, raw_train, gen_train, gen_eval, args)
     else:
-        run_verify_alter(
-            model, tokenizer, raw_train, gen_train, gen_eval, args
-        )
+        run_verify_alter(model, tokenizer, raw_train, gen_train, gen_eval, args)
 
     print("Training complete.")
 

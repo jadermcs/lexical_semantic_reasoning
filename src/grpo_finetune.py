@@ -16,7 +16,6 @@ from threading import Lock
 import torch
 import torch.nn.functional as F
 from datasets import DatasetDict
-from peft import LoraConfig, PeftModel, TaskType
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from trl import GRPOConfig, GRPOTrainer
 
