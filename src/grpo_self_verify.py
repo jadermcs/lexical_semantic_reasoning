@@ -237,7 +237,23 @@ def make_lora_config() -> LoraConfig:
     )
 
 
-def make_grpo_config(output_dir: str, max_steps: int, run_name: str) -> GRPOConfig:
+def make_grpo_config(
+    output_dir: str,
+    max_steps: int,
+    run_name: str,
+    vllm_host: str | None = None,
+    vllm_port: int = 8000,
+) -> GRPOConfig:
+    # When a vLLM server host is given, offload rollout generation to the remote
+    # inference machine (`trl vllm-serve`). Otherwise generate in-process.
+    vllm_kwargs = {}
+    if vllm_host:
+        vllm_kwargs = dict(
+            use_vllm=True,
+            vllm_mode="server",
+            vllm_server_host=vllm_host,
+            vllm_server_port=vllm_port,
+        )
     return GRPOConfig(
         output_dir=output_dir,
         num_generations=8,
@@ -262,6 +278,7 @@ def make_grpo_config(output_dir: str, max_steps: int, run_name: str) -> GRPOConf
         report_to="wandb",
         run_name=run_name,
         use_liger_kernel=True,
+        **vllm_kwargs,
     )
 
 
@@ -293,6 +310,8 @@ def run_verify_init(
         output_dir=str(Path(args.output_dir) / "stage1_verify"),
         max_steps=args.verify_steps,
         run_name=f"{args.run_name}-verify",
+        vllm_host=args.vllm_server_host,
+        vllm_port=args.vllm_server_port,
     )
     v_trainer = GRPOTrainer(
         model=model,
@@ -310,6 +329,8 @@ def run_verify_init(
         output_dir=str(Path(args.output_dir) / "stage2_generate"),
         max_steps=args.generate_steps,
         run_name=f"{args.run_name}-generate",
+        vllm_host=args.vllm_server_host,
+        vllm_port=args.vllm_server_port,
     )
     g_args.eval_strategy = "steps"
     g_args.eval_steps = max(100, args.generate_steps // 5)
@@ -343,6 +364,8 @@ def run_verify_alter(
             output_dir=str(Path(args.output_dir) / f"cycle{cycle}_gen"),
             max_steps=args.alter_n,
             run_name=f"{args.run_name}-c{cycle}-gen",
+            vllm_host=args.vllm_server_host,
+            vllm_port=args.vllm_server_port,
         )
         g_trainer = GRPOTrainer(
             model=model,
@@ -378,6 +401,8 @@ def run_verify_alter(
             output_dir=str(Path(args.output_dir) / f"cycle{cycle}"),
             max_steps=args.verify_steps_per_cycle,
             run_name=f"{args.run_name}-c{cycle}",
+            vllm_host=args.vllm_server_host,
+            vllm_port=args.vllm_server_port,
         )
         v_trainer = GRPOTrainer(
             model=model,
@@ -425,6 +450,16 @@ def main():
     parser.add_argument("--verify-queries", type=int, default=512)
     parser.add_argument("--group-size", type=int, default=8)
     parser.add_argument("--max-per-query", type=int, default=2)
+    # Remote inference: offload GRPO rollouts to a `trl vllm-serve` server running
+    # on a separate machine. Leave unset to generate in-process.
+    parser.add_argument(
+        "--vllm-server-host",
+        type=str,
+        default=None,
+        help="Host/IP of the vLLM inference machine (trl vllm-serve). "
+        "If unset, rollouts are generated locally.",
+    )
+    parser.add_argument("--vllm-server-port", type=int, default=8000)
     args = parser.parse_args()
 
     dataset = DatasetDict(
