@@ -73,8 +73,40 @@ uv run python src/gen_reasoning_data.py --mode both --annotate --model gpt-5-nan
 ```
 
 Outputs `data/semcor_distill_{direct,triplet}.jsonl`. Each record carries the
-`prompt`, the `sft_answer` block, and (after `--annotate`) the `argument` and the
-assembled `sft_target` = `<think>…</think><answer>…</answer>`.
+`prompt`, the `sft_answer` block, and (after `--annotate`) the `argument`, the
+assembled `sft_target` = `<think>…</think><answer>…</answer>`, and (when filtering
+is on) the per-record `bertscore`.
+
+### Quality control (annotate-only)
+
+The teacher occasionally refuses or drifts off the target sense; those traces are
+poison for the warm-start. Two guards run under `--annotate`:
+
+- **Empty/refused completions** are always dropped (a `None`/blank completion is
+  skipped, not written).
+- **`--min-bertscore`** drops traces whose reasoning is semantically far from the
+  gold definition it is meant to arrive at. Each `argument` is scored against its
+  gold gloss (`definition` for direct, `definition_same` for triplet) with
+  **BERTScore**, baseline-rescaled so the threshold is interpretable (~0 unrelated
+  → ~1). Default `0.0` = off; `~0.15` is a reasonable start. Needs the
+  `bert-score` package (`uv add bert-score`); the default `roberta-large` model
+  (~1.4 GB) downloads on first use, so run this on a server.
+
+```bash
+# annotate, then drop traces that wander off the gold sense
+uv run python src/gen_reasoning_data.py --mode both --annotate --model gpt-5-nano \
+    --min-bertscore 0.15
+```
+
+Every kept record stores its `{precision, recall, f1}` under `bertscore`, so you
+can build the JSONL once with `--min-bertscore 0` and inspect the distribution
+before committing to a threshold.
+
+| Filter flag | Default | Effect |
+|-------------|---------|--------|
+| `--min-bertscore F` | `0.0` (off) | drop traces scoring below `F` vs. the gold gloss |
+| `--bertscore-metric {f1,recall,precision}` | `f1` | which component to threshold; `recall` rewards covering the gloss and is lenient on the argument's extra reasoning |
+| `--bertscore-model NAME` | `roberta-large` (via `lang=en`) | override the scoring model; a custom model skips baseline rescaling |
 
 ### Leakage control: `--lemma-split`
 
@@ -99,7 +131,9 @@ uv run python src/gen_reasoning_data.py --mode both --lemma-split train --annota
 ```
 
 Useful flags: `--mode {direct,triplet,both}`, `--max-per-lemma N`,
-`--max-examples N` (cap for a quick sample), `--out PATH` (single mode only).
+`--max-examples N` (cap for a quick sample), `--out PATH` (single mode only). See
+[Quality control](#quality-control-annotate-only) above for the `--annotate`
+filtering flags.
 
 ---
 

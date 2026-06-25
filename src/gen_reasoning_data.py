@@ -20,6 +20,11 @@ These traces warm-start the RLVR policy in `ch05_implementation_plan.md` (Phase 
 Pure data prep: by default it only writes the assembled prompts. Pass `--annotate`
 (needs OPENAI_API_KEY + the `openai` package) to call ChatGPT and emit finished
 `<think>…</think><answer>…</answer>` SFT records.
+
+Quality control (annotate-only): empty/refused completions are always dropped, and
+`--min-bertscore` filters traces whose reasoning is semantically far from the gold
+definition it is meant to justify (BERTScore, baseline-rescaled; needs the
+`bert-score` package: `uv add bert-score`).
 """
 
 import argparse
@@ -302,11 +307,45 @@ def annotate(records: list[dict], model: str) -> None:
                 raise
             kwargs.pop("temperature")
             resp = client.chat.completions.create(**kwargs)
-        argument = resp.choices[0].message.content.strip()
+        msg = resp.choices[0].message.content
+        argument = (msg or "").strip()
         rec["argument"] = argument
+        if not argument:
+            continue  # refusal / empty completion; dropped after the loop
         rec["sft_target"] = f"<think>\n{argument}\n</think>\n{rec['sft_answer']}"
         if i % 25 == 0:
             print(f"  annotated {i}/{len(records)}")
+
+
+# the gold definition each mode's reasoning trace is meant to justify
+DEF_KEY = {"triplet": "definition_same", "direct": "definition"}
+
+
+def filter_by_bertscore(records, def_key, min_score, metric="f1", model_type=None):
+    """Drop traces whose argument is semantically far from the gold definition.
+
+    Scores each record's reasoning ``argument`` against the sense definition it is
+    supposed to arrive at (BERTScore). Off-topic, wrong-sense, or punted traces
+    land far from the gold gloss and fall below ``min_score``. Scores are
+    baseline-rescaled (~0 for unrelated text, up to ~1) so the threshold is
+    interpretable across runs; a starting value around 0.15 is reasonable.
+    """
+    from bert_score import score  # lazy import; needs the `bert-score` package
+
+    cands = [r["argument"] for r in records]
+    refs = [r[def_key] for r in records]
+    kwargs = {"lang": "en", "rescale_with_baseline": True, "verbose": True}
+    if model_type:  # baseline files only ship for the default models -> skip rescale
+        kwargs.update(model_type=model_type, rescale_with_baseline=False)
+    P, R, F1 = score(cands, refs, **kwargs)
+
+    for r, p, rc, f in zip(records, P.tolist(), R.tolist(), F1.tolist()):
+        r["bertscore"] = {"precision": p, "recall": rc, "f1": f}
+    threshold = {"precision": P, "recall": R, "f1": F1}[metric].tolist()
+    kept = [r for r, s in zip(records, threshold) if s >= min_score]
+    print(f"  BERTScore {metric} filter (>= {min_score}): "
+          f"kept {len(kept)}, dropped {len(records) - len(kept)}.")
+    return kept
 
 
 # --------------------------------------------------------------------------- #
@@ -330,6 +369,16 @@ def main():
                         help="output path (single mode only; default data/semcor_distill_<mode>.jsonl)")
     parser.add_argument("--annotate", action="store_true", help="call ChatGPT for traces")
     parser.add_argument("--model", default="gpt-4o", help="OpenAI model for --annotate")
+    parser.add_argument("--min-bertscore", type=float, default=0.0,
+                        help="with --annotate, drop traces whose BERTScore vs. the gold "
+                        "definition is below this (baseline-rescaled; try ~0.15). 0 = off.")
+    parser.add_argument("--bertscore-metric", choices=["f1", "recall", "precision"],
+                        default="f1", help="which BERTScore component to threshold; "
+                        "'recall' rewards covering the gloss and is lenient on the "
+                        "argument's extra reasoning")
+    parser.add_argument("--bertscore-model", default=None,
+                        help="override the BERTScore model (default: roberta-large via "
+                        "lang=en, with baseline rescaling)")
     args = parser.parse_args()
 
     if args.annotate and not os.environ.get("OPENAI_API_KEY"):
@@ -376,6 +425,14 @@ def main():
         if args.annotate:
             print(f"[{mode}] annotating with {args.model} ...")
             annotate(records, args.model)
+            before = len(records)
+            records = [r for r in records if r.get("argument")]
+            if len(records) < before:
+                print(f"  dropped {before - len(records)} empty/refused traces.")
+            if args.min_bertscore > 0 and records:
+                records = filter_by_bertscore(
+                    records, DEF_KEY[mode], args.min_bertscore,
+                    metric=args.bertscore_metric, model_type=args.bertscore_model)
 
         out = args.out or Path(f"data/semcor_distill_{mode}.jsonl")
         out.parent.mkdir(parents=True, exist_ok=True)
