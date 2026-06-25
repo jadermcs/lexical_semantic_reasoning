@@ -32,7 +32,7 @@ dependencies = [
     "liger-kernel>=0.7.0",
     # rollout / inference: vLLM generation server (`trl vllm-serve`).
     # <0.20 keeps the CUDA-12 build and stays inside TRL 1.6's supported range.
-    "vllm>=0.19.0,<0.20",
+    "vllm==0.19.0",
     "flashinfer-python>=0.6.6",
 ]
 
