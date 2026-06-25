@@ -292,7 +292,7 @@ def main():
         bf16=True,
         # -- eval & save --
         eval_strategy="steps",
-        eval_steps=100,
+        eval_steps=10,
         save_strategy="steps",
         save_steps=10,
         save_total_limit=2,
