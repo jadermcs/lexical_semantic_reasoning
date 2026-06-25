@@ -292,9 +292,9 @@ def main():
         bf16=True,
         # -- eval & save --
         eval_strategy="steps",
-        eval_steps=10,
+        eval_steps=100,
         save_strategy="steps",
-        save_steps=10,
+        save_steps=100,
         save_total_limit=2,
         load_best_model_at_end=True,
         metric_for_best_model="eval_loss",
