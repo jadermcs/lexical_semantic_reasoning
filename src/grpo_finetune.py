@@ -273,6 +273,15 @@ def main():
             vllm_server_host=args.vllm_server_host,
             vllm_server_port=args.vllm_server_port,
         )
+        # TRL's VLLMGeneration._init_vllm() gates on is_vllm_available() before the
+        # server/colocate branch, so it demands a local vLLM install even though
+        # server mode only talks to the remote `trl vllm-serve` over HTTP and never
+        # touches any vLLM runtime symbol. This train env deliberately has no vLLM
+        # (it pins torch/transformers that clash with the training stack), so force
+        # the check to pass.
+        import trl.generation.vllm_generation as _vllm_gen
+
+        _vllm_gen.is_vllm_available = lambda: True
 
     training_args = GRPOConfig(
         output_dir="./qwen-wic-grpo",
