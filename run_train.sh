@@ -11,4 +11,4 @@ export WANDB_PROJECT="wic-grpo"
 # export HF_HOME=/scratch/$USER/.cache/huggingface
 
 uv sync --extra train          # idempotent; resolves from the shared uv.lock
-uv run accelerate launch --num_processes 2 src/grpo_finetune.py
+uv run accelerate launch --num_processes 2 src/grpo_self_verify.py
