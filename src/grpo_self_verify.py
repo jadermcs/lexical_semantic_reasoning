@@ -404,7 +404,7 @@ def run_verify_alter(model, tokenizer, raw_train, gen_train, eval_dataset, args)
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--model", type=str, default="Qwen/Qwen3-1.7B")
+    parser.add_argument("--model", type=str, default="Qwen/Qwen3-0.6B")
     parser.add_argument("--dataset", type=str, default="mcl-wic")
     parser.add_argument(
         "--strategy", choices=["verify-init", "verify-alter"], default="verify-init"
