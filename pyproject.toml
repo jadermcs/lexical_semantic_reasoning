@@ -4,42 +4,27 @@ version = "0.1.0"
 description = "Add your description here"
 readme = "README.md"
 requires-python = ">=3.10"
-# Shared deps both machines need (datasets, logging, wordnet helpers).
+# Single unified env for both machines. vLLM >=0.23 supports transformers 5.x
+# and pins torch 2.11.0, which the training stack accepts -- so the trainer
+# (GRPOTrainer) and the rollout server (`trl vllm-serve`) share one dependency
+# set. The train machine gets vLLM's NCCL weight-sync classes natively; no need
+# for the old train/infer conflict split.
 dependencies = [
+    # shared (datasets, logging, wordnet helpers)
     "datasets>=4.8.0",
     "tqdm>=4.5.0",
     "wandb>=0.23.1",
     "wn>=0.9",
     "rapidfuzz>=3.14.5",
-]
-
-[project.optional-dependencies]
-# Training machine: GRPO trainer + LoRA, no vLLM.
-train = [
+    # training: GRPO trainer + LoRA
     "accelerate>=1.4.0",
     "transformers>=5.3.0",
     "torch>=2.11.0",
-    "trl>=1.1.0",
+    "trl>=1.6.0",
     "liger-kernel>=0.7.0",
-]
-# Inference machine: vLLM generation server. trl is needed for `trl vllm-serve`,
-# which exposes the weight-syncing endpoint the trainer connects to.
-infer = [
-    "vllm==0.18.0",
-    "trl>=1.1.0",
-    "flashinfer-python==0.6.6",
-    "flashinfer-cubin==0.6.6",
-]
-
-[tool.uv]
-# train and infer can never be installed into the same environment (vLLM pins
-# torch/transformers versions that clash with the training stack). Declaring the
-# conflict lets uv resolve each extra independently in a single lockfile.
-conflicts = [
-    [
-        { extra = "train" },
-        { extra = "infer" },
-    ],
+    # rollout / inference: vLLM generation server (`trl vllm-serve`)
+    "vllm>=0.23.0",
+    "flashinfer-python>=0.6.12",
 ]
 
 [tool.uv.sources]
