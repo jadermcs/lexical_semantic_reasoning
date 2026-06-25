@@ -6,6 +6,7 @@ set -euo pipefail
 cd "$(dirname "$0")"
 
 export WANDB_PROJECT="wic-grpo"
+export TORCHDYNAMO_DISABLE=1
 # export WANDB_MODE=disabled
 # export HF_HOME=/scratch/$USER/.cache/huggingface
 
