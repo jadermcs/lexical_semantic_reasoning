@@ -5,7 +5,6 @@
 set -euo pipefail
 cd "$(dirname "$0")"
 
-export UV_PROJECT_ENVIRONMENT=".venv-train"
 export WANDB_PROJECT="wic-grpo"
 # export WANDB_MODE=disabled
 # export HF_HOME=/scratch/$USER/.cache/huggingface

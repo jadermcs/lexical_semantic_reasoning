@@ -5,7 +5,5 @@
 set -euo pipefail
 cd "$(dirname "$0")"
 
-export UV_PROJECT_ENVIRONMENT=".venv-infer"
-
 uv sync                        # idempotent; resolves from the shared uv.lock
 uv run trl vllm-serve "$@"
