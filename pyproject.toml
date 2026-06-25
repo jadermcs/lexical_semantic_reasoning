@@ -4,11 +4,13 @@ version = "0.1.0"
 description = "Add your description here"
 readme = "README.md"
 requires-python = ">=3.10"
-# Single unified env for both machines. vLLM >=0.23 supports transformers 5.x
-# and pins torch 2.11.0, which the training stack accepts -- so the trainer
-# (GRPOTrainer) and the rollout server (`trl vllm-serve`) share one dependency
-# set. The train machine gets vLLM's NCCL weight-sync classes natively; no need
-# for the old train/infer conflict split.
+# Single unified env (train + vLLM) shared by both machines, so the trainer
+# (GRPOTrainer) and the rollout server (`trl vllm-serve`) use one dependency set
+# and the train machine gets vLLM's NCCL weight-sync classes natively -- no more
+# train/infer conflict split. Stack is pinned to CUDA 12 (cu126) to match this
+# cluster's toolkit: vLLM 0.19.x is the last CUDA-12 build, and it requires
+# transformers <5 and torch 2.10. (transformers 5.x would force vLLM >=0.20,
+# a CUDA-13 build that needs libcudart.so.13 / a cu130 torch.)
 dependencies = [
     # shared (datasets, logging, wordnet helpers)
     "datasets>=4.8.0",
@@ -18,15 +20,20 @@ dependencies = [
     "rapidfuzz>=3.14.5",
     # training: GRPO trainer + LoRA
     "accelerate>=1.4.0",
-    "transformers>=5.3.0",
-    "torch>=2.11.0",
-    "torchvision>=0.26.0",
-    "torchaudio>=2.11.0",
+    # transformers stays <5: vLLM 0.19.x (CUDA-12 build) requires it.
+    "transformers>=4.56.2,<5",
+    "torch>=2.10.0",
+    # Pin torchvision/torchaudio to the same cu126 build as torch; otherwise they
+    # resolve from PyPI against a different torch ABI -> `torchvision::nms does
+    # not exist` at import. Exact versions are driven by vLLM (torchvision 0.25).
+    "torchvision>=0.25.0",
+    "torchaudio>=2.10.0",
     "trl>=1.6.0",
     "liger-kernel>=0.7.0",
-    # rollout / inference: vLLM generation server (`trl vllm-serve`)
-    "vllm>=0.23.0",
-    "flashinfer-python>=0.6.12",
+    # rollout / inference: vLLM generation server (`trl vllm-serve`).
+    # <0.20 keeps the CUDA-12 build and stays inside TRL 1.6's supported range.
+    "vllm>=0.19.0,<0.20",
+    "flashinfer-python>=0.6.6",
 ]
 
 [tool.uv.sources]
