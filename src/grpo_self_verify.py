@@ -20,6 +20,7 @@ from pathlib import Path
 
 import torch
 from datasets import Dataset, DatasetDict
+from tqdm.auto import tqdm
 from transformers import AutoTokenizer, Qwen3ForCausalLM
 from trl import GRPOConfig, GRPOTrainer
 
@@ -141,7 +142,7 @@ def sample_candidates(
     model.eval()
     device = next(model.parameters()).device
 
-    for idx in indices:
+    for idx in tqdm(indices, desc="sampling on-policy candidates", unit="query"):
         ex = dataset[idx]
         # Build the generation prompt the same way training does.
         gen_prompt = format_prompt(ex, tokenizer)["prompt"]

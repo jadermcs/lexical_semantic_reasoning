@@ -229,6 +229,16 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--model", type=str, default="Qwen/Qwen3-0.6B")
     parser.add_argument("--dataset", type=str, default="mcl-wic")
+    # Remote inference: offload GRPO rollouts to a `trl vllm-serve` server running
+    # on a separate machine. Leave unset to generate in-process.
+    parser.add_argument(
+        "--vllm-server-host",
+        type=str,
+        default=None,
+        help="Host/IP of the vLLM inference machine (trl vllm-serve). "
+        "If unset, rollouts are generated locally.",
+    )
+    parser.add_argument("--vllm-server-port", type=int, default=8000)
     args = parser.parse_args()
     dataset = DatasetDict(
         {split: load_data(args.dataset, split=split) for split in ("train", "dev")}
@@ -252,6 +262,17 @@ def main():
         dtype=torch.bfloat16,
         attn_implementation="sdpa",
     )
+
+    # When a vLLM server host is given, offload rollout generation to the remote
+    # inference machine (`trl vllm-serve`). Otherwise generate in-process.
+    vllm_kwargs = {}
+    if args.vllm_server_host:
+        vllm_kwargs = dict(
+            use_vllm=True,
+            vllm_mode="server",
+            vllm_server_host=args.vllm_server_host,
+            vllm_server_port=args.vllm_server_port,
+        )
 
     training_args = GRPOConfig(
         output_dir="./qwen-wic-grpo",
@@ -284,6 +305,7 @@ def main():
         report_to="wandb",
         run_name="qwen-wic-grpo",
         use_liger_kernel=True,
+        **vllm_kwargs,
     )
 
     trainer = GRPOTrainer(
