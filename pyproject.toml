@@ -21,6 +21,7 @@ dependencies = [
     "transformers>=5.3.0",
     "torch>=2.11.0",
     "torchvision>=0.26.0",
+    "torchaudio>=2.11.0",
     "trl>=1.6.0",
     "liger-kernel>=0.7.0",
     # rollout / inference: vLLM generation server (`trl vllm-serve`)
@@ -33,6 +34,7 @@ dependencies = [
 # their CUDA builds stay ABI-compatible with each other.
 torch = [{ index = "pytorch-cu126" }]
 torchvision = [{ index = "pytorch-cu126" }]
+torchaudio = [{ index = "pytorch-cu126" }]
 
 [[tool.uv.index]]
 name = "pytorch-cu126"
