@@ -9,6 +9,8 @@ format term.
 """
 
 import argparse
+import json
+import os
 import re
 from functools import partial
 from pathlib import Path
@@ -161,6 +163,49 @@ KEEP_COLS = {
     "direct": ["lemma", "gloss"],
     "triplet": ["lemma", "gloss_same", "gloss_diff"],
 }
+# The fidelity reward already scores a completion against its gold gloss(es); the
+# trace saver reuses it to decide which generations are "successful".
+FIDELITY = {"direct": reward_direct_fidelity, "triplet": reward_triplet_fidelity}
+
+
+# --------------------------------------------------------------------------- #
+# Self-distillation: log successful reasoning traces for later SFT
+# --------------------------------------------------------------------------- #
+def make_trace_saver(mode, path, threshold):
+    """Pass-through reward fn that appends high-reward completions to a JSONL.
+
+    Returns all-zero rewards, so it never perturbs training (a constant reward
+    yields zero advantage after GRPO's group normalisation). It records the
+    prompt + generated reasoning/gloss + fidelity score + gold columns; a
+    downstream builder can turn the best generations into an SFT dataset.
+
+    Writes one file per process rank to avoid interleaved appends under
+    multi-GPU launches.
+    """
+    rank = os.environ.get("RANK") or os.environ.get("LOCAL_RANK") or "0"
+    out_path = Path(f"{path}.rank{rank}.jsonl")
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    keep = KEEP_COLS[mode]
+    fidelity = FIDELITY[mode]
+
+    def save_successful_traces(completions, **kwargs):
+        scores = fidelity(completions, **kwargs)
+        prompts = kwargs.get("prompts")
+        with out_path.open("a", encoding="utf-8") as f:
+            for i, (c, s) in enumerate(zip(completions, scores)):
+                if s < threshold:
+                    continue
+                rec = {"mode": mode, "score": round(float(s), 4), "completion": c}
+                if prompts is not None:
+                    rec["prompt"] = prompts[i]
+                for col in keep:
+                    rec[col] = kwargs[col][i]
+                f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+        return [0.0] * len(completions)
+
+    # GRPOTrainer logs/derives metric names from the fn name.
+    save_successful_traces.__name__ = "save_successful_traces"
+    return save_successful_traces
 
 
 def _load_or_build(mode):
@@ -178,6 +223,13 @@ def main():
     ap.add_argument("--mode", choices=["direct", "triplet"], required=True)
     ap.add_argument("--vllm-server-host", default=None)
     ap.add_argument("--vllm-server-port", type=int, default=8000)
+    ap.add_argument(
+        "--distill-out",
+        default=None,
+        help="If set, append completions with fidelity >= --distill-threshold to "
+        "'<path>.rank<N>.jsonl' for self-distillation. Does not affect training.",
+    )
+    ap.add_argument("--distill-threshold", type=float, default=0.5)
     args = ap.parse_args()
 
     dataset = _load_or_build(args.mode)
@@ -228,10 +280,20 @@ def main():
         use_liger_kernel=True,
         **vllm_kwargs,
     )
+    reward_funcs = list(REWARDS[args.mode])
+    if args.distill_out:
+        reward_funcs.append(
+            make_trace_saver(args.mode, args.distill_out, args.distill_threshold)
+        )
+        print(
+            f"Self-distillation: saving completions with fidelity >= "
+            f"{args.distill_threshold} to {args.distill_out}.rank*.jsonl"
+        )
+
     trainer = GRPOTrainer(
         model=model,
         processing_class=tokenizer,
-        reward_funcs=REWARDS[args.mode],
+        reward_funcs=reward_funcs,
         args=training_args,
         train_dataset=dataset["train"],
         eval_dataset=dataset["dev"],

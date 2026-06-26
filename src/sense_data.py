@@ -269,6 +269,10 @@ def triplet_messages(rec, with_target=False):
 
 def extract_direct_gloss(text: str) -> str:
     text = text.split("</think>")[-1]
+    # An unclosed <think> (reasoning ran past the length budget) leaves no gloss;
+    # don't pass the dangling tag through as one or the format reward fires on it.
+    if "<think>" in text:
+        return ""
     return text.strip().splitlines()[0].strip() if text.strip() else ""
 
 
@@ -278,9 +282,17 @@ def _answer_body(text: str) -> str:
 
 
 def _extract_labeled_gloss(text: str, label: str) -> str:
-    """Pull the 'Label: ...' line from the <answer> block of a triplet completion."""
+    """Pull the 'Label: ...' line from the <answer> block of a triplet completion.
+
+    Tolerant of the markdown small models like to add — leading bullets/quotes
+    and bold around the label (``**Positive:**``, ``- Negative:``) — so a correct
+    gloss isn't scored 0 (and dropped from distillation) just for being decorated.
+    Stays anchored at line start, so a stray ``Positive:`` mid-reasoning is ignored.
+    """
     m = re.search(
-        rf"^\s*{label}\s*:\s*(.+)$", _answer_body(text), re.IGNORECASE | re.MULTILINE
+        rf"^[\s>\-*_]*{re.escape(label)}[\s*_]*:[\s*_]*(.+?)[\s*_]*$",
+        _answer_body(text),
+        re.IGNORECASE | re.MULTILINE,
     )
     return m.group(1).strip() if m else ""
 
