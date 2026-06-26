@@ -58,7 +58,7 @@ def main():
     if args.max_samples:
         data = data[: args.max_samples]
     gold_key = "gloss" if args.mode == "direct" else "gloss_same"
-    extract = sd.extract_direct_gloss if args.mode == "direct" else sd.extract_anchor_gloss
+    extract = sd.extract_direct_gloss if args.mode == "direct" else sd.extract_shared_gloss
 
     hyps, refs, records = [], [], []
     for i in tqdm(range(0, len(data), args.batch_size)):

@@ -7,12 +7,13 @@ train/dev/test split (no lemma crosses splits):
   WordNet gloss for that sense. Single-usage definition modeling.
 * ``triplet`` — given an anchor + positive (same synset) and a negative
   (different synset of the same lemma), generate the contrastive reasoning and
-  the three glosses (anchor == positive gloss, negative gloss differs). Mirrors
-  the (u_a, u_p, u_n) format in ``ch05_implementation_plan.md``.
+  two glosses: the shared anchor/positive sense ("Positive") and the negative
+  sense ("Negative"). Mirrors the (u_a, u_p, u_n) format in
+  ``ch05_implementation_plan.md``.
 
 Gold glosses are WordNet definitions; usages are synset example sentences.
 Evaluation metric is BLEU of the generated gloss against the gold gloss
-(for ``triplet`` we score the anchor gloss only).
+(for ``triplet`` we score the shared/positive gloss only).
 
 This module imports neither torch nor trl, so the dataset can be built and
 inspected on the laptop; the training scripts import the heavy stack.
@@ -24,7 +25,6 @@ import math
 import random
 import re
 from collections import Counter
-from itertools import combinations
 from pathlib import Path
 
 import wn
@@ -47,13 +47,13 @@ DIRECT_SYSTEM = (
 TRIPLET_SYSTEM = (
     "You are an expert lexicographer. You are given three usages of one target word "
     "(marked with <t> tags) — an anchor, a positive, and a negative. The anchor and "
-    "positive share one sense; the negative is a different sense. In a brief, tight "
-    "argument inside <think> tags, state what the word means in each usage, name the "
+    "positive share one sense; the negative is a different sense. Inside "
+    "<think> tags, state what the word means in each usage, name the "
     "genus the anchor and positive share, and give the differentia that sets them "
-    "apart from the negative. Then, inside <answer> tags, give the gloss for each "
-    "usage as three numbered lines (1 anchor, 2 positive, 3 negative). Never use the "
-    "target word to define itself.\n"
-    "Format: <think>...</think><answer>\n1. ...\n2. ...\n3. ...\n</answer>"
+    "apart from the negative. Then, inside <answer> tags, give two concise "
+    "dictionary definitions without using the target word or the sentence to define "
+    "itself: one for the single sense shared by the anchor and positive, and one for the negative. "
+    "Format: <think>...</think><answer>\nPositive: ...\nNegative: ...\n</answer>"
 )
 
 
@@ -68,12 +68,16 @@ def mark_target(sentence: str, word: str, fuzzy_threshold: float = 70.0) -> str:
     tokens = re.findall(r"\w+", sentence)
     if tokens:
         match = process.extractOne(
-            word.lower(), [t.lower() for t in tokens],
-            scorer=fuzz.QRatio, score_cutoff=fuzzy_threshold,
+            word.lower(),
+            [t.lower() for t in tokens],
+            scorer=fuzz.QRatio,
+            score_cutoff=fuzzy_threshold,
         )
         if match is not None:
             best = tokens[match[2]]
-            return re.sub(rf"\b{re.escape(best)}\b", f"<t> {best} </t>", sentence, count=1)
+            return re.sub(
+                rf"\b{re.escape(best)}\b", f"<t> {best} </t>", sentence, count=1
+            )
     return sentence + f" <t> {word} </t>"
 
 
@@ -151,10 +155,15 @@ def build_dataset(lexicon="oewn:2024", max_per_lemma=4, seed=42):
         usages = [(s, ex) for pairs in by_syn.values() for (s, ex) in pairs]
         rng.shuffle(usages)
         for syn, ex in usages[:max_per_lemma]:
-            out[split]["direct"].append({
-                "lemma": lemma, "pos": pos, "synset": syn.id,
-                "usage": mark_target(ex, lemma), "gloss": syn.definition(),
-            })
+            out[split]["direct"].append(
+                {
+                    "lemma": lemma,
+                    "pos": pos,
+                    "synset": syn.id,
+                    "usage": mark_target(ex, lemma),
+                    "gloss": syn.definition(),
+                }
+            )
 
         # --- triplet: needs a synset with >=2 usages + another synset ---
         if len(by_syn) < 2:
@@ -170,14 +179,19 @@ def build_dataset(lexicon="oewn:2024", max_per_lemma=4, seed=42):
                     continue
                 (sa, ua), (sp, up) = rng.sample(same, 2)
                 sn, un = rng.choice(diff)
-                triplets.append({
-                    "lemma": lemma, "pos": pos,
-                    "synset_same": same_sid, "synset_diff": diff_sid,
-                    "anchor": mark_target(ua, lemma),
-                    "positive": mark_target(up, lemma),
-                    "negative": mark_target(un, lemma),
-                    "gloss_same": sa.definition(), "gloss_diff": sn.definition(),
-                })
+                triplets.append(
+                    {
+                        "lemma": lemma,
+                        "pos": pos,
+                        "synset_same": same_sid,
+                        "synset_diff": diff_sid,
+                        "anchor": mark_target(ua, lemma),
+                        "positive": mark_target(up, lemma),
+                        "negative": mark_target(un, lemma),
+                        "gloss_same": sa.definition(),
+                        "gloss_diff": sn.definition(),
+                    }
+                )
         rng.shuffle(triplets)
         out[split]["triplet"].extend(triplets[:max_per_lemma])
 
@@ -206,8 +220,10 @@ def load_split(mode: str, split: str, data_dir: Path = DATA_DIR) -> list[dict]:
 def direct_messages(rec, with_target=False):
     msgs = [
         {"role": "system", "content": DIRECT_SYSTEM},
-        {"role": "user",
-         "content": f"Word: {rec['lemma']} ({rec['pos']})\nSentence: {rec['usage']}\nDefinition:"},
+        {
+            "role": "user",
+            "content": f"Word: {rec['lemma']} ({rec['pos']})\nSentence: {rec['usage']}\nDefinition:",
+        },
     ]
     if with_target:
         msgs.append({"role": "assistant", "content": rec["gloss"]})
@@ -215,43 +231,68 @@ def direct_messages(rec, with_target=False):
 
 
 def triplet_answer(rec) -> str:
-    return (f"<answer>\n1. {rec['gloss_same']}\n2. {rec['gloss_same']}\n"
-            f"3. {rec['gloss_diff']}\n</answer>")
+    return (
+        f"<answer>\nPositive: {rec['gloss_same']}\n"
+        f"Negative: {rec['gloss_diff']}\n</answer>"
+    )
 
 
 def triplet_think(rec) -> str:
     # Templated contrast (Phase-3 warm-start: optimise for format + gloss copy).
-    return (f"<think>\nThe anchor and positive usages both mean: {rec['gloss_same']}. "
-            f"They share that genus and are used the same way in context. The negative "
-            f"usage instead means: {rec['gloss_diff']}, which is the differentia that "
-            f"sets it apart.\n</think>")
+    return (
+        f"<think>\nThe anchor and positive usages both mean: {rec['gloss_same']}. "
+        f"They share that genus and are used the same way in context. The negative "
+        f"usage instead means: {rec['gloss_diff']}, which is the differentia that "
+        f"sets it apart.\n</think>"
+    )
 
 
 def triplet_messages(rec, with_target=False):
-    user = (f"Target word: {rec['lemma']} ({rec['pos']})\n\n"
-            f"Anchor usage: {rec['anchor']}\n"
-            f"Positive usage: {rec['positive']}\n"
-            f"Negative usage: {rec['negative']}\n\n"
-            "Give the gloss for each usage.")
+    user = (
+        f"Target word: {rec['lemma']}\n"
+        f"POS: {rec['pos']}\n\n"
+        f"Anchor usage: {rec['anchor']}\n"
+        f"Positive usage: {rec['positive']}\n"
+        f"Negative usage: {rec['negative']}\n\n"
+        "Give the shared (positive) gloss and the negative gloss."
+    )
     msgs = [
         {"role": "system", "content": TRIPLET_SYSTEM},
         {"role": "user", "content": user},
     ]
     if with_target:
-        msgs.append({"role": "assistant", "content": triplet_think(rec) + triplet_answer(rec)})
+        msgs.append(
+            {"role": "assistant", "content": triplet_think(rec) + triplet_answer(rec)}
+        )
     return msgs
 
 
 def extract_direct_gloss(text: str) -> str:
+    text = text.split("</think>")[-1]
     return text.strip().splitlines()[0].strip() if text.strip() else ""
 
 
-def extract_anchor_gloss(text: str) -> str:
-    """Pull line '1. ...' from the <answer> block of a triplet completion."""
+def _answer_body(text: str) -> str:
     m = re.search(r"<answer>(.*?)</answer>", text, re.DOTALL)
-    body = m.group(1) if m else text
-    m1 = re.search(r"^\s*1[.)]\s*(.+)$", body, re.MULTILINE)
-    return m1.group(1).strip() if m1 else ""
+    return m.group(1) if m else text
+
+
+def _extract_labeled_gloss(text: str, label: str) -> str:
+    """Pull the 'Label: ...' line from the <answer> block of a triplet completion."""
+    m = re.search(
+        rf"^\s*{label}\s*:\s*(.+)$", _answer_body(text), re.IGNORECASE | re.MULTILINE
+    )
+    return m.group(1).strip() if m else ""
+
+
+def extract_shared_gloss(text: str) -> str:
+    """The shared anchor/positive gloss (the 'Positive:' line)."""
+    return _extract_labeled_gloss(text, "Positive")
+
+
+def extract_negative_gloss(text: str) -> str:
+    """The negative-sense gloss (the 'Negative:' line)."""
+    return _extract_labeled_gloss(text, "Negative")
 
 
 # --------------------------------------------------------------------------- #
@@ -307,6 +348,7 @@ def corpus_bleu(hyps: list[str], refs: list[str], max_n: int = 4) -> float:
     """Corpus BLEU in [0,100]. Reported eval metric; prefers sacrebleu if installed."""
     try:
         import sacrebleu
+
         return sacrebleu.corpus_bleu(hyps, [refs]).score
     except ImportError:
         pass
@@ -324,7 +366,9 @@ def corpus_bleu(hyps: list[str], refs: list[str], max_n: int = 4) -> float:
             totals[n - 1] += max(sum(hn.values()), 0)
     if hyp_len == 0:
         return 0.0
-    precisions = [(clipped[i] + 1) / (totals[i] + 1) for i in range(max_n)]  # +1 smoothing
+    precisions = [
+        (clipped[i] + 1) / (totals[i] + 1) for i in range(max_n)
+    ]  # +1 smoothing
     geo = math.exp(sum(math.log(p) for p in precisions) / max_n)
     bp = 1.0 if hyp_len > ref_len else math.exp(1 - ref_len / hyp_len)
     return 100.0 * bp * geo
@@ -345,11 +389,19 @@ def main():
     lemma_sets = {}
     for split, modes in data.items():
         n_d, n_t = len(modes["direct"]), len(modes["triplet"])
-        lemmas = {r["lemma"] for r in modes["direct"]} | {r["lemma"] for r in modes["triplet"]}
+        lemmas = {r["lemma"] for r in modes["direct"]} | {
+            r["lemma"] for r in modes["triplet"]
+        }
         lemma_sets[split] = lemmas
         print(f"{split:5s}  direct={n_d:6d}  triplet={n_t:6d}  lemmas={len(lemmas)}")
     a, b, c = lemma_sets.values()
-    print("lemma overlap across splits:", len(a & b), len(a & c), len(b & c), "(must be 0,0,0)")
+    print(
+        "lemma overlap across splits:",
+        len(a & b),
+        len(a & c),
+        len(b & c),
+        "(must be 0,0,0)",
+    )
 
 
 if __name__ == "__main__":

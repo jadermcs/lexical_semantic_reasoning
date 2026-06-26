@@ -34,39 +34,104 @@ def format_prompt(rec, tokenizer, mode):
 # --------------------------------------------------------------------------- #
 # Reward functions
 # --------------------------------------------------------------------------- #
+SELF_REF_PENALTY = -0.5
+
+
+_VOWELS = "aeiou"
+
+
+def _target_variants(lemma):
+    """Lemma plus its common English inflections, lower-cased."""
+    l = lemma.lower()
+    v = {l, l + "s", l + "es", l + "ed", l + "ing", l + "d", l + "er", l + "est"}
+    if l.endswith("e"):
+        v |= {l[:-1] + "ing", l[:-1] + "ed", l + "r", l + "st"}
+    if l.endswith("y") and len(l) > 1 and l[-2] not in _VOWELS:
+        v |= {l[:-1] + "ies", l[:-1] + "ied", l[:-1] + "ier", l[:-1] + "iest"}
+    # CVC words double the final consonant: run -> running, big -> bigger
+    if (len(l) >= 3 and l[-1] not in _VOWELS + "wxy"
+            and l[-2] in _VOWELS and l[-3] not in _VOWELS):
+        d = l + l[-1]
+        v |= {d + "ing", d + "ed", d + "er", d + "est"}
+    return v
+
+
+def _uses_target(gloss, lemma):
+    """True if the gloss defines the word using the word itself (or an inflection)."""
+    return bool(set(sd._tok(gloss)) & _target_variants(lemma))
+
+
+LENGTH_TOL = 1.5      # free allowance: up to 1.5x the gold gloss length
+LENGTH_PENALTY = -0.5  # max penalty, reached once the excess equals the allowance
+
+
+def _length_penalty(hyp, ref):
+    """Penalise glosses longer than the gold definition; in [LENGTH_PENALTY, 0]."""
+    budget = LENGTH_TOL * max(len(sd._tok(ref)), 1)
+    excess = max(0, len(sd._tok(hyp)) - budget) / budget
+    return LENGTH_PENALTY * min(1.0, excess)
+
+
 def reward_direct_fidelity(completions, **kwargs):
     golds = kwargs["gloss"]
     return [sd.gloss_similarity(sd.extract_direct_gloss(c), g) for c, g in zip(completions, golds)]
 
 
-def reward_direct_format(completions, **kwargs):
-    """Penalise empty output or self-reference; reward a single concise line."""
+def reward_direct_no_target(completions, **kwargs):
+    """Punish glosses that define the target word using the word itself."""
     out = []
     for c, lemma in zip(completions, kwargs["lemma"]):
-        gloss = sd.extract_direct_gloss(c)
-        r = 0.0
-        if gloss:
-            r += 0.1
-        if lemma.lower() not in sd._tok(gloss):
-            r += 0.1
-        out.append(r)
+        out.append(SELF_REF_PENALTY if _uses_target(sd.extract_direct_gloss(c), lemma) else 0.0)
     return out
 
 
+def reward_direct_length(completions, **kwargs):
+    """Punish glosses much longer than the gold definition."""
+    return [
+        _length_penalty(sd.extract_direct_gloss(c), g)
+        for c, g in zip(completions, kwargs["gloss"])
+    ]
+
+
+def reward_direct_format(completions, **kwargs):
+    """Reward a single concise line; penalise empty output."""
+    return [0.1 if sd.extract_direct_gloss(c) else 0.0 for c in completions]
+
+
 def reward_triplet_fidelity(completions, **kwargs):
-    """Mean similarity of the three generated glosses to their gold definitions."""
+    """Mean similarity of the shared & negative glosses to their gold definitions."""
     same, diff = kwargs["gloss_same"], kwargs["gloss_diff"]
     out = []
     for c, gs, gd in zip(completions, same, diff):
-        a = sd.extract_anchor_gloss(c)
-        nums = re.findall(r"^\s*([123])[.)]\s*(.+)$", c, re.MULTILINE)
-        by_idx = {i: g.strip() for i, g in nums}
         scores = [
-            sd.gloss_similarity(by_idx.get("1", a), gs),
-            sd.gloss_similarity(by_idx.get("2", ""), gs),
-            sd.gloss_similarity(by_idx.get("3", ""), gd),
+            sd.gloss_similarity(sd.extract_shared_gloss(c), gs),
+            sd.gloss_similarity(sd.extract_negative_gloss(c), gd),
         ]
-        out.append(sum(scores) / 3)
+        out.append(sum(scores) / 2)
+    return out
+
+
+def reward_triplet_no_target(completions, **kwargs):
+    """Punish either gloss for defining the target word using the word itself."""
+    out = []
+    for c, lemma in zip(completions, kwargs["lemma"]):
+        pen = 0.0
+        if _uses_target(sd.extract_shared_gloss(c), lemma):
+            pen += SELF_REF_PENALTY / 2
+        if _uses_target(sd.extract_negative_gloss(c), lemma):
+            pen += SELF_REF_PENALTY / 2
+        out.append(pen)
+    return out
+
+
+def reward_triplet_length(completions, **kwargs):
+    """Punish either gloss for running much longer than its gold definition."""
+    same, diff = kwargs["gloss_same"], kwargs["gloss_diff"]
+    out = []
+    for c, gs, gd in zip(completions, same, diff):
+        p = _length_penalty(sd.extract_shared_gloss(c), gs)
+        p += _length_penalty(sd.extract_negative_gloss(c), gd)
+        out.append(p / 2)
     return out
 
 
@@ -76,17 +141,26 @@ def reward_triplet_format(completions, **kwargs):
         r = 0.0
         if re.search(r"<think>.+?</think>", c, re.DOTALL):
             r += 0.1
-        if len(re.findall(r"^\s*[123][.)]\s*.+$", c, re.MULTILINE)) == 3:
+        if sd.extract_shared_gloss(c) and sd.extract_negative_gloss(c):
             r += 0.1
         out.append(r)
     return out
 
 
 REWARDS = {
-    "direct": [reward_direct_fidelity, reward_direct_format],
-    "triplet": [reward_triplet_fidelity, reward_triplet_format],
+    "direct": [
+        reward_direct_fidelity, reward_direct_no_target,
+        reward_direct_length, reward_direct_format,
+    ],
+    "triplet": [
+        reward_triplet_fidelity, reward_triplet_no_target,
+        reward_triplet_length, reward_triplet_format,
+    ],
 }
-KEEP_COLS = {"direct": ["lemma", "gloss"], "triplet": ["gloss_same", "gloss_diff"]}
+KEEP_COLS = {
+    "direct": ["lemma", "gloss"],
+    "triplet": ["lemma", "gloss_same", "gloss_diff"],
+}
 
 
 def _load_or_build(mode):
