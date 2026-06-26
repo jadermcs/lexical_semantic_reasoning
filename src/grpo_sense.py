@@ -174,7 +174,7 @@ def _load_or_build(mode):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--model", default="Qwen/Qwen3-1.7B")
+    ap.add_argument("--model", default="Qwen/Qwen3-0.6B")
     ap.add_argument("--mode", choices=["direct", "triplet"], required=True)
     ap.add_argument("--vllm-server-host", default=None)
     ap.add_argument("--vllm-server-port", type=int, default=8000)
