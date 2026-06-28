@@ -3,8 +3,6 @@
   --mode direct   -> config 1: single-usage definition generation
   --mode triplet  -> config 2: anchor/positive/negative contrastive glosses
 
-Both train Qwen3-1.7B with LoRA on the WordNet splits from ``sense_data`` and
-write a checkpoint that ``grpo_sense.py`` warm-starts from.
 """
 
 import argparse
@@ -41,7 +39,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--model", default="Qwen/Qwen3-0.6B")
     ap.add_argument("--mode", choices=["direct", "triplet"], required=True)
-    ap.add_argument("--epochs", type=float, default=2.0)
+    ap.add_argument("--epochs", type=int, default=2)
     args = ap.parse_args()
 
     dataset = _load_or_build(args.mode)

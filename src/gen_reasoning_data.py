@@ -3,28 +3,33 @@
 Two modes, matching the two sense-modeling ablation configs:
 
 * ``triplet`` — an in-lexeme triplet of usages of one lemma:
-      anchor, positive  -> share the SAME WordNet sense   (definition_same)
-      negative          -> a DIFFERENT WordNet sense       (definition_diff)
+      anchor, positive  -> share the SAME WordNet sense
+      negative          -> a DIFFERENT WordNet sense
   ChatGPT argues why the anchor/positive share a sense and why the negative
-  differs; the trace warm-starts the contrastive policy. SFT target:
-  `<think>τ</think><answer>1./2. d_same  3. d_diff</answer>`.
+  differs, and *generates* a single gloss for the shared anchor/positive sense
+  from the contexts (the gold WordNet definitions are never shown to it; the
+  negative is used only to sharpen the reasoning, not glossed). SFT target:
+  `<think>τ</think><answer>d_pos</answer>`.
 
 * ``direct`` — a single sense-tagged usage. ChatGPT argues, from the contextual
-  cues, why the target word carries the supplied dictionary sense. SFT target:
-  `<think>τ</think><answer>definition</answer>`.
+  cues, what the target word means and *generates* the definition (again without
+  seeing the gold). SFT target: `<think>τ</think>\ndefinition`.
 
-Sense labels come from SemCor's gold annotations; the dictionary definitions come
-from `wn` (Open English WordNet 2024), resolved from SemCor's WN3.0 sense keys.
+One record is built per (lemma, pos): a single representative usage / triplet, so
+the distilled set is one example per word. SemCor's gold sense keys, resolved to
+`wn` (Open English WordNet 2024) definitions, are kept only as the gold *reference*
+for quality control — never injected into the prompt or the answer.
 These traces warm-start the RLVR policy in `ch05_implementation_plan.md` (Phase 3).
 
 Pure data prep: by default it only writes the assembled prompts. Pass `--annotate`
 (needs OPENAI_API_KEY + the `openai` package) to call ChatGPT and emit finished
-`<think>…</think><answer>…</answer>` SFT records.
+`<think>…</think>…` SFT records with model-generated definitions.
 
-Quality control (annotate-only): empty/refused completions are always dropped, and
-`--min-bertscore` filters traces whose reasoning is semantically far from the gold
-definition it is meant to justify (BERTScore, baseline-rescaled; needs the
-`bert-score` package: `uv add bert-score`).
+Quality control (annotate-only): empty/refused completions and ones with no
+extractable gloss are always dropped, and `--min-bertscore` drops records whose
+*generated* definition (the shared anchor/positive gloss, for triplet) is semantically far from
+the gold WordNet definition it should match (BERTScore, baseline-rescaled; needs
+the `bert-score` package: `uv add bert-score`).
 """
 
 import argparse
@@ -152,9 +157,70 @@ def collect_groups(data_p: Path, gold: dict[str, str], en: wn.Wordnet):
     return groups
 
 
-def build_triplets(groups, max_per_lemma: int, rng: random.Random):
-    """For each lemma: (anchor, positive) from one sense, negative from another."""
-    records = []
+class GlossSimilarity:
+    """Semantic similarity between two short glosses for hard-negative mining.
+
+    A negative sense whose *definition* is close to the positive's makes the
+    triplet hard (a fine-grained, easily-confused sense distinction). Similarity
+    is BERTScore-style: layer-17 roberta-large contextual token embeddings with
+    greedy cosine matching (F1) — captures paraphrase that word overlap misses
+    (e.g. "link together" vs "form a pair"). torch/transformers are imported
+    lazily so the default (random-negative) build needs neither.
+    """
+
+    LAYER = 17
+
+    def __init__(self, model_name: str = "roberta-large", batch_size: int = 64,
+                 device: str | None = None):
+        import torch
+        from transformers import AutoModel, AutoTokenizer
+
+        self._torch = torch
+        self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
+        self.tok = AutoTokenizer.from_pretrained(model_name)
+        self.model = AutoModel.from_pretrained(model_name).to(self.device).eval()
+        self.batch_size = batch_size
+        self._emb: dict = {}  # gloss -> (T, H) normalized token vectors, cpu/fp16
+
+    def prepare(self, glosses) -> None:
+        """Embed (once) every gloss we will compare, caching per-token vectors."""
+        torch = self._torch
+        todo = sorted({g for g in glosses if g and g not in self._emb})
+        for i in range(0, len(todo), self.batch_size):
+            chunk = todo[i: i + self.batch_size]
+            enc = self.tok(chunk, return_tensors="pt", padding=True,
+                           truncation=True, max_length=64).to(self.device)
+            with torch.no_grad():
+                hs = self.model(**enc, output_hidden_states=True).hidden_states[self.LAYER]
+            hs = torch.nn.functional.normalize(hs, dim=-1)
+            mask = enc["attention_mask"].bool()
+            for j, g in enumerate(chunk):
+                m = mask[j].clone()
+                m[0] = False                   # drop <s>
+                m[m.nonzero()[-1]] = False      # drop trailing </s>
+                self._emb[g] = hs[j][m].half().cpu()
+
+    def f1(self, a: str, b: str) -> float:
+        ea, eb = self._emb[a].float(), self._emb[b].float()
+        if ea.numel() == 0 or eb.numel() == 0:
+            return 0.0
+        sim = ea @ eb.T
+        p = sim.max(dim=1).values.mean().item()  # each token of a -> best in b
+        r = sim.max(dim=0).values.mean().item()  # each token of b -> best in a
+        return 2 * p * r / (p + r) if p + r else 0.0
+
+
+def build_triplets(groups, max_per_lemma: int, rng: random.Random,
+                   sim: "GlossSimilarity | None" = None, min_sim: float = 0.0):
+    """For each lemma: (anchor, positive) from one sense, negative from another.
+
+    With ``sim`` (hard-negative mode): for every anchor/positive sense, the negative
+    is the *most definition-similar* other sense — the hardest to tell apart — and the
+    triplet is kept only if that similarity clears ``min_sim``. A lemma's hardest
+    triplets are taken first. Without ``sim``: the negative is a random other sense
+    (original behaviour).
+    """
+    eligible = []
     for (lemma, pos), usages in groups.items():
         by_sense: dict[str, list[dict]] = defaultdict(list)
         for u in usages:
@@ -163,19 +229,37 @@ def build_triplets(groups, max_per_lemma: int, rng: random.Random):
         multi = [sk for sk, us in by_sense.items() if len(us) >= 2]
         if not multi or len(by_sense) < 2:
             continue
+        eligible.append((lemma, pos, by_sense, multi))
 
-        per_lemma = []
+    if sim is not None:
+        defs = {us[0]["definition"] for _, _, bs, _ in eligible for us in bs.values()}
+        print(f"  embedding {len(defs)} sense definitions for hard-negative mining ...")
+        sim.prepare(defs)
+
+    records = []
+    for lemma, pos, by_sense, multi in eligible:
+        def_of = {sk: us[0]["definition"] for sk, us in by_sense.items()}
+        cands = []  # (score | None, same_sk, diff_sk)
         for same_sk in multi:
-            same_us = by_sense[same_sk]
-            for diff_sk, diff_us in by_sense.items():
-                if diff_sk == same_sk:
+            others = [dk for dk in by_sense if dk != same_sk]
+            if sim is not None:
+                score, diff_sk = max(
+                    (sim.f1(def_of[same_sk], def_of[dk]), dk) for dk in others)
+                if score < min_sim:
                     continue
-                u1, u2 = rng.sample(same_us, 2)
-                u3 = rng.choice(diff_us)
-                per_lemma.append((u1, u2, u3))
-        rng.shuffle(per_lemma)
-        for u1, u2, u3 in per_lemma[:max_per_lemma]:
-            records.append({
+            else:
+                score, diff_sk = None, rng.choice(others)
+            cands.append((score, same_sk, diff_sk))
+
+        if sim is not None:
+            cands.sort(key=lambda c: c[0], reverse=True)  # hardest first
+        else:
+            rng.shuffle(cands)
+
+        for score, same_sk, diff_sk in cands[:max_per_lemma]:
+            u1, u2 = rng.sample(by_sense[same_sk], 2)
+            u3 = rng.choice(by_sense[diff_sk])
+            rec = {
                 "lemma": lemma,
                 "pos": pos,
                 "sense_same": u1["sense_key"],
@@ -185,7 +269,10 @@ def build_triplets(groups, max_per_lemma: int, rng: random.Random):
                 "anchor": {"text": u1["text"], "marked": u1["marked"]},
                 "positive": {"text": u2["text"], "marked": u2["marked"]},
                 "negative": {"text": u3["text"], "marked": u3["marked"]},
-            })
+            }
+            if score is not None:
+                rec["sense_sim"] = round(score, 4)
+            records.append(rec)
     return records
 
 
@@ -206,93 +293,168 @@ def build_direct(groups, max_per_lemma: int, rng: random.Random):
     return records
 
 
-# --------------------------------------------------------------------------- #
-# Prompt assembly + optional ChatGPT annotation
-# --------------------------------------------------------------------------- #
-# --- triplet (unchanged: this prompt was getting good results) ---
 TRIPLET_SYSTEM_PROMPT = (
     "You are an expert lexicographer. You are given three usages of one target word "
-    "(marked with <t> tags) — an anchor, a positive, and a negative — plus two "
-    "candidate senses. Write a brief, tight argument (one short paragraph, no bullet "
-    "lists) that: (1) briefly states what the word means in the anchor, positive, and "
-    "negative usages, read from their context; (2) names the genus the anchor and "
-    "positive share; (3) gives the differentia that sets the anchor and positive apart "
-    "from the negative. Argue from the contextual cues and close by stating which sense "
-    "each usage takes. Keep it concise — no padding or restating — and never use the "
-    "target word to define itself."
+    "(marked with <t> tags) — an anchor, a positive, and a negative. The anchor and "
+    "positive share one sense; the negative is a different sense of the same word. "
+    "Inside <think> tags, write a brief, tight argument (one short paragraph, no bullet "
+    "lists) that: (1) states what the word means in the anchor, positive, and negative "
+    "usages, read from their context; (2) names the genus the anchor and positive share; "
+    "(3) gives the differentia that sets them apart from the negative. Then, inside "
+    "<answer> tags, give one concise dictionary definition read off that argument: the "
+    "sense shared by the anchor and positive. Do not define the negative sense. Keep it "
+    "concise and never use the target word to define itself. "
+    "Format: <think>...</think><answer>\n...\n</answer>"
 )
 
 
-def build_triplet_prompt(rec: dict) -> list[dict]:
-    user = (
-        f"Target word: {rec['lemma']} ({rec['pos']})\n\n"
-        f"Anchor usage: {rec['anchor']['marked']}\n"
-        f"Positive usage: {rec['positive']['marked']}\n"
-        f"Negative usage: {rec['negative']['marked']}\n\n"
-        f"Sense A: {rec['definition_same']}\n"
-        f"Sense B: {rec['definition_diff']}\n\n"
-        "Briefly describe the sense in the anchor, positive, and negative usages; give "
-        "the genus the anchor and positive share and the differentia that separates them "
-        "from the negative; then state that the anchor and positive carry Sense A and the "
-        "negative carries Sense B."
+def _triplet_user(lemma: str, pos: str, anchor: str, positive: str, negative: str) -> str:
+    return (
+        f"Target word: {lemma} ({pos})\n\n"
+        f"Anchor usage: {anchor}\n"
+        f"Positive usage: {positive}\n"
+        f"Negative usage: {negative}\n\n"
+        "Argue from the contextual cues what the word means in each usage, the genus the "
+        "anchor and positive share, and the differentia that separates them from the "
+        "negative; then give the gloss for the sense shared by the anchor and positive."
     )
+
+
+def _triplet_shot(lemma, pos, anchor, positive, negative, think, pos_gloss):
+    """One few-shot (user, assistant) demonstration pair for the triplet mode."""
+    answer = f"<answer>\n{pos_gloss}\n</answer>"
     return [
-        {"role": "system", "content": TRIPLET_SYSTEM_PROMPT},
-        {"role": "user", "content": user},
+        {"role": "user", "content": _triplet_user(lemma, pos, anchor, positive, negative)},
+        {"role": "assistant", "content": f"<think>\n{think}\n</think>{answer}"},
     ]
 
 
-def assemble_triplet_answer(rec: dict) -> str:
-    return (
-        "<answer>\n"
-        f"1. {rec['definition_same']}\n"
-        f"2. {rec['definition_same']}\n"
-        f"3. {rec['definition_diff']}\n"
-        "</answer>"
-    )
+TRIPLET_FEWSHOT = [
+    _triplet_shot(
+        "crane", "noun",
+        "A <t> crane </t> waded through the shallow marsh, hunting frogs.",
+        "The tall <t> crane </t> stood on one leg at the water's edge.",
+        "The <t> crane </t> hoisted the steel beam to the top of the tower.",
+        "In the anchor and positive the word stands in water — wading a marsh, balanced "
+        "on one leg at the water's edge — so it names a tall long-legged wading bird. The "
+        "negative instead hoists a steel beam up a tower, an inanimate lifting machine. "
+        "They share the genus of a tall, long-necked form, but the differentia is a living "
+        "bird versus a construction machine.",
+        "a tall long-legged long-necked wading bird of marshes and open country"),
+    _triplet_shot(
+        "charge", "verb",
+        "The cavalry <t> charged </t> across the open field at the enemy line.",
+        "The bull lowered its horns and <t> charged </t> straight at the matador.",
+        "The garage will <t> charge </t> your card once the repair is finished.",
+        "The anchor and positive both show a rapid, aggressive rush forward — cavalry at a "
+        "line, a bull at the matador — so the shared genus is to rush ahead in attack. The "
+        "negative has a garage billing a card, a demand for payment with no motion at all; "
+        "that financial sense is the differentia.",
+        "to rush forward in a violent attack"),
+    _triplet_shot(
+        "mint", "noun",
+        "She tore a few leaves of <t> mint </t> for the tea.",
+        "The garden bed was overrun with <t> mint </t>, its scent sharp in the heat.",
+        "The rare coin had just been struck at the royal <t> mint </t>.",
+        "In the anchor and positive the word is a leafy, aromatic garden plant — leaves "
+        "torn for tea, a sharp scent rising in the heat — so the genus is an aromatic herb. "
+        "The negative is a place where coins are struck, an industrial facility; herb "
+        "versus money-making works is the differentia.",
+        "an aromatic herb whose leaves are used for flavoring"),
+]
 
 
-# --- direct (single-usage reasoning, same concise/forward-argument style) ---
+def build_triplet_prompt(rec: dict, shots=()) -> list[dict]:
+    msgs = [{"role": "system", "content": TRIPLET_SYSTEM_PROMPT}]
+    for shot in shots:
+        msgs.extend(shot)
+    msgs.append({"role": "user", "content": _triplet_user(
+        rec["lemma"], rec["pos"], rec["anchor"]["marked"],
+        rec["positive"]["marked"], rec["negative"]["marked"])})
+    return msgs
+
+
+# --- direct: argue the sense and generate the gloss from context ---
 DIRECT_SYSTEM_PROMPT = (
     "You are an expert lexicographer. You are given one usage of a target word "
-    "(marked with <t> tags) and the dictionary sense it carries there. Write a brief, "
-    "tight argument (one short paragraph, no bullet lists) that reads the contextual "
-    "cues in the usage, names the genus of the sense and the features that pin it down "
-    "here, and arrives at that sense. Argue forward from the evidence to the sense; keep "
-    "it concise — no padding or restating — and never use the target word to define itself."
+    "(marked with <t> tags). Inside <think> tags, write a brief, tight argument (one "
+    "short paragraph, no bullet lists) that reads the contextual cues and works out what "
+    "the target word means here. Reason forward from the context only — you are given a "
+    "single usage and no other sense, so do not classify by genus or contrast against "
+    "another sense. Then, after </think>, give a single concise dictionary definition of "
+    "the target word as used here — and nothing else. Keep it concise and never use the "
+    "target word to define itself. Format: <think>...</think>\ndefinition"
 )
 
 
-def build_direct_prompt(rec: dict) -> list[dict]:
-    user = (
-        f"Target word: {rec['lemma']} ({rec['pos']})\n\n"
-        f"Usage: {rec['usage']['marked']}\n\n"
-        f"Sense: {rec['definition']}\n\n"
-        "Briefly argue from the contextual cues why the target word carries this sense, "
-        "and close by stating the sense."
+def _direct_user(lemma: str, pos: str, marked: str) -> str:
+    return (
+        f"Target word: {lemma} ({pos})\n\n"
+        f"Usage: {marked}\n\n"
+        "Argue from the contextual cues to the sense the target word carries here, then "
+        "give the definition."
     )
+
+
+def _direct_shot(lemma, pos, marked, think, definition):
+    """One few-shot (user, assistant) demonstration pair for the direct mode."""
     return [
-        {"role": "system", "content": DIRECT_SYSTEM_PROMPT},
-        {"role": "user", "content": user},
+        {"role": "user", "content": _direct_user(lemma, pos, marked)},
+        {"role": "assistant", "content": f"<think>\n{think}\n</think>\n{definition}"},
     ]
 
 
-def assemble_direct_answer(rec: dict) -> str:
-    return f"<answer>\n{rec['definition']}\n</answer>"
+DIRECT_FEWSHOT = [
+    _direct_shot(
+        "bank", "noun",
+        "They dragged the canoe up onto the <t> bank </t> and made camp for the night.",
+        "The cues set a riverside scene: a canoe dragged up out of the water and a camp "
+        "made beside it. The word picks out the ground along the side of the river — the "
+        "land that slopes up from the water and that you climb onto when leaving it.",
+        "the sloping ground bordering a river or other body of water"),
+    _direct_shot(
+        "decline", "verb",
+        "Sales <t> declined </t> sharply in the months after the factory closed.",
+        "'Sales' as the subject and 'sharply' as the manner make the word a movement of a "
+        "measurable quantity over the months after the closure, and the context points it "
+        "downward — there are fewer and fewer sales. So here it means to go down in amount.",
+        "to go down or decrease in amount, quality, or value"),
+    _direct_shot(
+        "keen", "adjective",
+        "She had a <t> keen </t> eye for the smallest flaw in the cut of a diamond.",
+        "Attached to an 'eye' that catches the smallest flaw, the word describes how sharply "
+        "the person perceives — the ability to notice fine detail that others would miss.",
+        "quick to notice or understand; sharply perceptive"),
+]
 
 
-# builder, prompt fn, answer fn per mode
+def build_direct_prompt(rec: dict, shots=()) -> list[dict]:
+    msgs = [{"role": "system", "content": DIRECT_SYSTEM_PROMPT}]
+    for shot in shots:
+        msgs.extend(shot)
+    msgs.append({"role": "user", "content": _direct_user(
+        rec["lemma"], rec["pos"], rec["usage"]["marked"])})
+    return msgs
+
+
+# builder, prompt fn, gloss extractor, few-shot exemplars per mode. ChatGPT now
+# generates the whole answer (no gold answer is assembled); the extractor pulls its
+# generated definition back out (shared anchor/positive gloss for triplet) for the BERTScore filter.
 MODES = {
-    "triplet": (build_triplets, build_triplet_prompt, assemble_triplet_answer),
-    "direct": (build_direct, build_direct_prompt, assemble_direct_answer),
+    "triplet": (build_triplets, build_triplet_prompt, sd.extract_shared_gloss, TRIPLET_FEWSHOT),
+    "direct": (build_direct, build_direct_prompt, sd.extract_direct_gloss, DIRECT_FEWSHOT),
 }
 
 
-def annotate(records: list[dict], model: str) -> None:
-    """Call ChatGPT to fill each record's reasoning trace (in place).
+def annotate(records: list[dict], model: str, extract_gloss) -> None:
+    """Call ChatGPT to generate each record's full reasoning + answer (in place).
 
-    Each record must already carry ``prompt`` and ``sft_answer``; this fills
-    ``argument`` and the assembled ``sft_target``.
+    Each record must already carry ``prompt``. This fills ``sft_target`` with the
+    raw completion (`<think>…</think>` + the generated definition/glosses) and
+    ``gen_gloss`` with the definition extracted back out of it (the shared
+    anchor/positive gloss for triplet, the single definition for direct) — what the BERTScore filter then
+    scores against the gold WordNet definition. Empty completions, and ones with no
+    extractable gloss, leave ``gen_gloss`` empty and are dropped after the loop.
     """
     from openai import OpenAI  # lazy import
 
@@ -307,12 +469,9 @@ def annotate(records: list[dict], model: str) -> None:
                 raise
             kwargs.pop("temperature")
             resp = client.chat.completions.create(**kwargs)
-        msg = resp.choices[0].message.content
-        argument = (msg or "").strip()
-        rec["argument"] = argument
-        if not argument:
-            continue  # refusal / empty completion; dropped after the loop
-        rec["sft_target"] = f"<think>\n{argument}\n</think>\n{rec['sft_answer']}"
+        completion = (resp.choices[0].message.content or "").strip()
+        rec["sft_target"] = completion
+        rec["gen_gloss"] = extract_gloss(completion) if completion else ""
         if i % 25 == 0:
             print(f"  annotated {i}/{len(records)}")
 
@@ -322,17 +481,17 @@ DEF_KEY = {"triplet": "definition_same", "direct": "definition"}
 
 
 def filter_by_bertscore(records, def_key, min_score, metric="f1", model_type=None):
-    """Drop traces whose argument is semantically far from the gold definition.
+    """Drop records whose generated definition is semantically far from the gold.
 
-    Scores each record's reasoning ``argument`` against the sense definition it is
-    supposed to arrive at (BERTScore). Off-topic, wrong-sense, or punted traces
-    land far from the gold gloss and fall below ``min_score``. Scores are
-    baseline-rescaled (~0 for unrelated text, up to ~1) so the threshold is
-    interpretable across runs; a starting value around 0.15 is reasonable.
+    Scores each record's ChatGPT-generated definition ``gen_gloss`` (the Positive
+    anchor/positive gloss, for triplet) against the gold WordNet definition it should match
+    (BERTScore). Off-topic or wrong-sense glosses land far from the gold and fall
+    below ``min_score``. Scores are baseline-rescaled (~0 for unrelated text, up to
+    ~1) so the threshold is interpretable across runs; ~0.15 is a reasonable start.
     """
     from bert_score import score  # lazy import; needs the `bert-score` package
 
-    cands = [r["argument"] for r in records]
+    cands = [r["gen_gloss"] for r in records]
     refs = [r[def_key] for r in records]
     kwargs = {"lang": "en", "rescale_with_baseline": True, "verbose": True}
     if model_type:  # baseline files only ship for the default models -> skip rescale
@@ -362,16 +521,28 @@ def main():
     parser.add_argument("--lexicon", default="oewn:2024")
     parser.add_argument("--cache-dir", type=Path, default=Path(".cache/semcor"))
     parser.add_argument("--keep-zip", action="store_true", help="keep the downloaded zip")
-    parser.add_argument("--max-per-lemma", type=int, default=4)
+    parser.add_argument("--max-per-lemma", type=int, default=1,
+                        help="examples kept per (lemma, pos); default 1 = one example per word")
+    parser.add_argument("--num-shots", type=int, default=3,
+                        help="few-shot exemplars prepended to each annotation prompt "
+                        "(0-3; clamped to the 3 hand-written ones per mode)")
     parser.add_argument("--max-examples", type=int, default=0, help="0 = no cap")
+    parser.add_argument("--hard-negatives", action="store_true",
+                        help="(triplet) mine hard negatives: pair each sense with its most "
+                        "definition-similar other sense instead of a random one, for a harder, "
+                        "fine-grained dataset. Needs torch + roberta-large (lazy-loaded).")
+    parser.add_argument("--min-sense-sim", type=float, default=0.0,
+                        help="(triplet, with --hard-negatives) drop triplets whose hardest-negative "
+                        "gloss similarity is below this (roberta-large BERTScore-F1, ~0..1). 0 = keep all.")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--out", type=Path, default=None,
                         help="output path (single mode only; default data/semcor_distill_<mode>.jsonl)")
     parser.add_argument("--annotate", action="store_true", help="call ChatGPT for traces")
-    parser.add_argument("--model", default="gpt-4o", help="OpenAI model for --annotate")
+    parser.add_argument("--model", default="gpt-5-nano", help="OpenAI model for --annotate")
     parser.add_argument("--min-bertscore", type=float, default=0.0,
-                        help="with --annotate, drop traces whose BERTScore vs. the gold "
-                        "definition is below this (baseline-rescaled; try ~0.15). 0 = off.")
+                        help="with --annotate, drop records whose generated definition's "
+                        "BERTScore vs. the gold definition is below this (baseline-rescaled; "
+                        "try ~0.15). 0 = off.")
     parser.add_argument("--bertscore-metric", choices=["f1", "recall", "precision"],
                         default="f1", help="which BERTScore component to threshold; "
                         "'recall' rewards covering the gloss and is lenient on the "
@@ -411,24 +582,37 @@ def main():
     if args.out and len(modes) > 1:
         raise SystemExit("--out only applies to a single --mode (not 'both').")
 
+    sim = None
+    if args.hard_negatives and "triplet" in modes:
+        print("[triplet] loading roberta-large for hard-negative mining ...")
+        sim = GlossSimilarity()
+
     for mode in modes:
-        builder, prompt_fn, answer_fn = MODES[mode]
-        records = builder(groups, args.max_per_lemma, rng)
+        builder, prompt_fn, extract_gloss, fewshot = MODES[mode]
+        shots = fewshot[: max(0, args.num_shots)]
+        if mode == "triplet":
+            records = build_triplets(groups, args.max_per_lemma, rng, sim, args.min_sense_sim)
+        else:
+            records = builder(groups, args.max_per_lemma, rng)
         rng.shuffle(records)
         if args.max_examples:
             records = records[: args.max_examples]
         for rec in records:
-            rec["prompt"] = prompt_fn(rec)
-            rec["sft_answer"] = answer_fn(rec)
-        print(f"[{mode}] built {len(records)} records.")
+            rec["prompt"] = prompt_fn(rec, shots)
+        msg = f"[{mode}] built {len(records)} records ({len(shots)}-shot prompts)."
+        if mode == "triplet" and sim is not None and records:
+            sims = sorted(r["sense_sim"] for r in records)
+            mid = sims[len(sims) // 2]
+            msg += f" hard-neg sense_sim: min={sims[0]:.3f} median={mid:.3f} max={sims[-1]:.3f}"
+        print(msg)
 
         if args.annotate:
             print(f"[{mode}] annotating with {args.model} ...")
-            annotate(records, args.model)
+            annotate(records, args.model, extract_gloss)
             before = len(records)
-            records = [r for r in records if r.get("argument")]
+            records = [r for r in records if r.get("gen_gloss")]
             if len(records) < before:
-                print(f"  dropped {before - len(records)} empty/refused traces.")
+                print(f"  dropped {before - len(records)} empty/refused/unparseable traces.")
             if args.min_bertscore > 0 and records:
                 records = filter_by_bertscore(
                     records, DEF_KEY[mode], args.min_bertscore,

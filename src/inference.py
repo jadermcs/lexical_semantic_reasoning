@@ -3,7 +3,6 @@ import json
 from pathlib import Path
 
 import torch
-from peft import PeftModel
 from tqdm import tqdm
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
@@ -53,7 +52,6 @@ def _f1(y_true: list[int], y_pred: list[int]) -> float:
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--model", type=str, default="Qwen/Qwen3-1.7B")
-    parser.add_argument("--lora", type=str, default="qwen-wic-grpo/checkpoint-1000")
     parser.add_argument("--dataset", type=str, default="mcl-wic")
     parser.add_argument("--sft", default=False, action="store_true")
     parser.add_argument("--batch_size", type=int, default=16)
@@ -67,8 +65,7 @@ def main():
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
-    base_model = AutoModelForCausalLM.from_pretrained(args.model, device_map="auto")
-    model = PeftModel.from_pretrained(base_model, args.lora)
+    model = AutoModelForCausalLM.from_pretrained(args.model, device_map="auto")
     model.eval()
 
     dataset_test = load_data(args.dataset, split=args.split)

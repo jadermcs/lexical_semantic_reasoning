@@ -1,15 +1,15 @@
 """Evaluate a sense-modeling checkpoint on the held-out WordNet test split.
 
 Generates a gloss per test usage and reports corpus BLEU against the WordNet
-gold definition. For ``--mode triplet`` only the anchor gloss (line 1) is scored,
-giving a per-usage quantity comparable to ``--mode direct``.
+gold definition. For ``--mode triplet`` the single shared (anchor/positive) gloss
+is scored, giving a per-usage quantity comparable to ``--mode direct``.
 
 Examples
 --------
   # config 1 (SFT direct)
-  uv run python src/eval_sense.py --mode direct  --lora qwen-sense-sft-direct
+  uv run python src/eval_sense.py --mode direct  --model ./qwen-sense-sft-direct
   # config 4 (GRPO triplet)
-  uv run python src/eval_sense.py --mode triplet --lora qwen-sense-grpo-triplet
+  uv run python src/eval_sense.py --mode triplet --model ./qwen-sense-grpo-triplet
   # zero-shot base-model baseline
   uv run python src/eval_sense.py --mode direct
 """
@@ -19,7 +19,6 @@ import json
 from pathlib import Path
 
 import torch
-from peft import PeftModel
 from tqdm import tqdm
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
@@ -36,12 +35,15 @@ def build_prompt(rec, tokenizer, mode):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--model", default="Qwen/Qwen3-1.7B")
-    ap.add_argument("--lora", default=None, help="adapter dir; omit for zero-shot base")
     ap.add_argument("--mode", choices=["direct", "triplet"], required=True)
     ap.add_argument("--split", default="test")
     ap.add_argument("--batch-size", type=int, default=16)
     ap.add_argument("--max-samples", type=int, default=0, help="0 = full split")
     ap.add_argument("--output", default=None)
+    ap.add_argument("--bertscore", action="store_true",
+                    help="also report BERTScore F1 (downloads roberta-large; server-only)")
+    ap.add_argument("--bertscore-model", default=None,
+                    help="override the BERTScore model (default: roberta-large via lang=en)")
     args = ap.parse_args()
 
     tokenizer = AutoTokenizer.from_pretrained(args.model)
@@ -50,8 +52,6 @@ def main():
         tokenizer.pad_token = tokenizer.eos_token
 
     model = AutoModelForCausalLM.from_pretrained(args.model, device_map="auto", dtype=torch.bfloat16)
-    if args.lora:
-        model = PeftModel.from_pretrained(model, args.lora)
     model.eval()
 
     data = sd.load_split(args.mode, args.split)
@@ -82,12 +82,29 @@ def main():
     bleu = sd.corpus_bleu(hyps, refs)
     mean_sim = sum(sd.gloss_similarity(h, r) for h, r in zip(hyps, refs)) / len(hyps)
     empty = sum(1 for h in hyps if not h.strip())
-    print(f"\n[{args.mode}] n={len(hyps)}  BLEU={bleu:.2f}  mean_sim={mean_sim:.3f}  empty={empty}")
+
+    bertscore = None
+    if args.bertscore:
+        from bert_score import score  # lazy import; needs the `bert-score` package
+        kwargs = {"lang": "en", "rescale_with_baseline": True}
+        if args.bertscore_model:  # baseline files only ship for the default models
+            kwargs.update(model_type=args.bertscore_model, rescale_with_baseline=False)
+        _, _, F1 = score(hyps, refs, **kwargs)
+        f1_list = F1.tolist()
+        bertscore = sum(f1_list) / len(f1_list)
+        for rec, f in zip(records, f1_list):
+            rec["bertscore_f1"] = f
+
+    msg = f"\n[{args.mode}] n={len(hyps)}  BLEU={bleu:.2f}  mean_sim={mean_sim:.3f}"
+    if bertscore is not None:
+        msg += f"  BERTScore_F1={bertscore:.3f}"
+    print(f"{msg}  empty={empty}")
 
     out_path = Path(args.output or f"predictions_sense_{args.mode}.json")
     out_path.write_text(json.dumps(
-        {"mode": args.mode, "lora": args.lora, "bleu": bleu, "mean_sim": mean_sim,
-         "n": len(hyps), "predictions": records}, ensure_ascii=False, indent=2))
+        {"mode": args.mode, "model": args.model, "bleu": bleu, "mean_sim": mean_sim,
+         "bertscore_f1": bertscore, "n": len(hyps), "predictions": records},
+        ensure_ascii=False, indent=2))
     print(f"Saved predictions → {out_path}")
 
 

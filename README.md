@@ -9,7 +9,7 @@ distilling reasoning traces, training the four configurations, and evaluating
 them on BLEU.
 
 > **Running things.** Always use `uv` (`uv run python ...`). The heavy training
-> stack (`torch`, `trl`, `peft`, vLLM) runs on the servers; data generation and
+> stack (`torch`, `trl`, vLLM) runs on the servers; data generation and
 > evaluation scaffolding run locally.
 
 ---
@@ -190,8 +190,9 @@ uv run python src/eval_sense.py --mode direct
 ```
 
 Prints e.g. `[direct] n=3853  BLEU=… mean_sim=… empty=…` and saves predictions to
-`predictions_sense_{mode}.json`. Use `--lora ADAPTER_DIR` if you trained LoRA
-adapters, `--split dev` for the dev set, and `--max-samples N` for a quick check.
+`predictions_sense_{mode}.json`. Add `--bertscore` to also report BERTScore F1
+(downloads `roberta-large`; server-only), `--split dev` for the dev set, and
+`--max-samples N` for a quick check.
 
 ---
 

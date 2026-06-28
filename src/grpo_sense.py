@@ -101,40 +101,25 @@ def reward_direct_format(completions, **kwargs):
 
 
 def reward_triplet_fidelity(completions, **kwargs):
-    """Mean similarity of the shared & negative glosses to their gold definitions."""
-    same, diff = kwargs["gloss_same"], kwargs["gloss_diff"]
-    out = []
-    for c, gs, gd in zip(completions, same, diff):
-        scores = [
-            sd.gloss_similarity(sd.extract_shared_gloss(c), gs),
-            sd.gloss_similarity(sd.extract_negative_gloss(c), gd),
-        ]
-        out.append(sum(scores) / 2)
-    return out
+    """Similarity of the shared (anchor/positive) gloss to its gold definition."""
+    same = kwargs["gloss_same"]
+    return [sd.gloss_similarity(sd.extract_shared_gloss(c), gs)
+            for c, gs in zip(completions, same)]
 
 
 def reward_triplet_no_target(completions, **kwargs):
-    """Punish either gloss for defining the target word using the word itself."""
+    """Punish the gloss for defining the target word using the word itself."""
     out = []
     for c, lemma in zip(completions, kwargs["lemma"]):
-        pen = 0.0
-        if _uses_target(sd.extract_shared_gloss(c), lemma):
-            pen += SELF_REF_PENALTY / 2
-        if _uses_target(sd.extract_negative_gloss(c), lemma):
-            pen += SELF_REF_PENALTY / 2
-        out.append(pen)
+        out.append(SELF_REF_PENALTY if _uses_target(sd.extract_shared_gloss(c), lemma) else 0.0)
     return out
 
 
 def reward_triplet_length(completions, **kwargs):
-    """Punish either gloss for running much longer than its gold definition."""
-    same, diff = kwargs["gloss_same"], kwargs["gloss_diff"]
-    out = []
-    for c, gs, gd in zip(completions, same, diff):
-        p = _length_penalty(sd.extract_shared_gloss(c), gs)
-        p += _length_penalty(sd.extract_negative_gloss(c), gd)
-        out.append(p / 2)
-    return out
+    """Punish the gloss for running much longer than its gold definition."""
+    same = kwargs["gloss_same"]
+    return [_length_penalty(sd.extract_shared_gloss(c), gs)
+            for c, gs in zip(completions, same)]
 
 
 def reward_triplet_format(completions, **kwargs):
@@ -143,7 +128,7 @@ def reward_triplet_format(completions, **kwargs):
         r = 0.0
         if re.search(r"<think>.+?</think>", c, re.DOTALL):
             r += 0.1
-        if sd.extract_shared_gloss(c) and sd.extract_negative_gloss(c):
+        if sd.extract_shared_gloss(c):
             r += 0.1
         out.append(r)
     return out
@@ -161,7 +146,7 @@ REWARDS = {
 }
 KEEP_COLS = {
     "direct": ["lemma", "gloss"],
-    "triplet": ["lemma", "gloss_same", "gloss_diff"],
+    "triplet": ["lemma", "gloss_same"],
 }
 # The fidelity reward already scores a completion against its gold gloss(es); the
 # trace saver reuses it to decide which generations are "successful".

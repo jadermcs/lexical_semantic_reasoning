@@ -6,14 +6,14 @@ train/dev/test split (no lemma crosses splits):
 * ``direct``  — given one usage (target marked with <t> tags), generate the
   WordNet gloss for that sense. Single-usage definition modeling.
 * ``triplet`` — given an anchor + positive (same synset) and a negative
-  (different synset of the same lemma), generate the contrastive reasoning and
-  two glosses: the shared anchor/positive sense ("Positive") and the negative
-  sense ("Negative"). Mirrors the (u_a, u_p, u_n) format in
-  ``ch05_implementation_plan.md``.
+  (different synset of the same lemma), generate the contrastive reasoning and a
+  *single* gloss for the sense shared by the anchor and positive. The negative is
+  used only to sharpen the reasoning (the differentia) — no gloss is written for
+  it. Mirrors the (u_a, u_p, u_n) format in ``ch05_implementation_plan.md``.
 
 Gold glosses are WordNet definitions; usages are synset example sentences.
 Evaluation metric is BLEU of the generated gloss against the gold gloss
-(for ``triplet`` we score the shared/positive gloss only).
+(for ``triplet`` this is the shared anchor/positive gloss).
 
 This module imports neither torch nor trl, so the dataset can be built and
 inspected on the laptop; the training scripts import the heavy stack.
@@ -50,10 +50,10 @@ TRIPLET_SYSTEM = (
     "positive share one sense; the negative is a different sense. Inside "
     "<think> tags, state what the word means in each usage, name the "
     "genus the anchor and positive share, and give the differentia that sets them "
-    "apart from the negative. Then, inside <answer> tags, give two concise "
-    "dictionary definitions without using the target word or the sentence to define "
-    "itself: one for the single sense shared by the anchor and positive, and one for the negative. "
-    "Format: <think>...</think><answer>\nPositive: ...\nNegative: ...\n</answer>"
+    "apart from the negative. Then, inside <answer> tags, give one concise "
+    "dictionary definition — for the single sense shared by the anchor and positive — "
+    "without using the target word or the sentence to define itself. Do not define the "
+    "negative sense. Format: <think>...</think><answer>\n...\n</answer>"
 )
 
 
@@ -231,14 +231,13 @@ def direct_messages(rec, with_target=False):
 
 
 def triplet_answer(rec) -> str:
-    return (
-        f"<answer>\nPositive: {rec['gloss_same']}\n"
-        f"Negative: {rec['gloss_diff']}\n</answer>"
-    )
+    return f"<answer>\n{rec['gloss_same']}\n</answer>"
 
 
 def triplet_think(rec) -> str:
     # Templated contrast (Phase-3 warm-start: optimise for format + gloss copy).
+    # The negative gloss is named only to motivate the differentia; it is never
+    # emitted in the answer.
     return (
         f"<think>\nThe anchor and positive usages both mean: {rec['gloss_same']}. "
         f"They share that genus and are used the same way in context. The negative "
@@ -254,7 +253,7 @@ def triplet_messages(rec, with_target=False):
         f"Anchor usage: {rec['anchor']}\n"
         f"Positive usage: {rec['positive']}\n"
         f"Negative usage: {rec['negative']}\n\n"
-        "Give the shared (positive) gloss and the negative gloss."
+        "Give the gloss for the sense shared by the anchor and positive."
     )
     msgs = [
         {"role": "system", "content": TRIPLET_SYSTEM},
@@ -276,35 +275,24 @@ def extract_direct_gloss(text: str) -> str:
     return text.strip().splitlines()[0].strip() if text.strip() else ""
 
 
-def _answer_body(text: str) -> str:
-    m = re.search(r"<answer>(.*?)</answer>", text, re.DOTALL)
-    return m.group(1) if m else text
-
-
-def _extract_labeled_gloss(text: str, label: str) -> str:
-    """Pull the 'Label: ...' line from the <answer> block of a triplet completion.
-
-    Tolerant of the markdown small models like to add — leading bullets/quotes
-    and bold around the label (``**Positive:**``, ``- Negative:``) — so a correct
-    gloss isn't scored 0 (and dropped from distillation) just for being decorated.
-    Stays anchored at line start, so a stray ``Positive:`` mid-reasoning is ignored.
-    """
-    m = re.search(
-        rf"^[\s>\-*_]*{re.escape(label)}[\s*_]*:[\s*_]*(.+?)[\s*_]*$",
-        _answer_body(text),
-        re.IGNORECASE | re.MULTILINE,
-    )
-    return m.group(1).strip() if m else ""
-
-
 def extract_shared_gloss(text: str) -> str:
-    """The shared anchor/positive gloss (the 'Positive:' line)."""
-    return _extract_labeled_gloss(text, "Positive")
+    """The single gloss (sense shared by anchor and positive) from <answer>.
 
-
-def extract_negative_gloss(text: str) -> str:
-    """The negative-sense gloss (the 'Negative:' line)."""
-    return _extract_labeled_gloss(text, "Negative")
+    Requires a closed ``<answer>`` block, then takes its first non-empty line.
+    Tolerant of the markdown small models like to add — leading bullets/quotes
+    and a leftover ``Positive:``/``Definition:`` label — so a correct gloss isn't
+    scored 0 (and dropped from distillation) just for being decorated.
+    """
+    m = re.search(r"<answer>(.*?)</answer>", text, re.DOTALL)
+    if not m:
+        return ""
+    for line in m.group(1).splitlines():
+        line = line.strip(" >-*_\t")
+        if line:
+            return re.sub(
+                r"^(positive|definition)[\s*_]*:[\s*_]*", "", line, flags=re.IGNORECASE
+            ).strip()
+    return ""
 
 
 # --------------------------------------------------------------------------- #
