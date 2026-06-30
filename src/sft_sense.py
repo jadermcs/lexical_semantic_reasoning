@@ -62,8 +62,7 @@ def main():
     training_args = SFTConfig(
         output_dir=output_dir,
         dataset_text_field="text",
-        per_device_train_batch_size=8,
-        gradient_accumulation_steps=4,
+        per_device_train_batch_size=64,
         num_train_epochs=args.epochs,
         warmup_steps=100,
         learning_rate=2e-4,
