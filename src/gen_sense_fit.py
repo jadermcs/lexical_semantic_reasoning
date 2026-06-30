@@ -35,6 +35,7 @@ from pathlib import Path
 
 import wn
 import wn.similarity as sim
+from tqdm import tqdm
 
 from sense_data import lemma_splits
 
@@ -165,7 +166,8 @@ def build(args):
     rng.shuffle(synsets)
 
     rows = []
-    for syn in synsets:
+    bar = tqdm(synsets, desc="building sense-fit rows", unit="syn")
+    for syn in bar:
         lemma = _lemma_in_example(syn.lemmas(), syn.examples()[0])
         # fall back to scanning every example for a surfacing lemma
         usage = None
@@ -206,8 +208,10 @@ def build(args):
                 "synset_id": syn.id,
                 "negative_synset_id": nsyn.id,
             })
+        bar.set_postfix(rows=len(rows))
         if args.max_total and len(rows) >= args.max_total:
             break
+    bar.close()
 
     rng.shuffle(rows)
     if args.max_total:
