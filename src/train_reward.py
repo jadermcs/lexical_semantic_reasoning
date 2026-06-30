@@ -10,10 +10,8 @@ from typing import Iterable
 import torch
 from datasets import Dataset, DatasetDict
 from sentence_transformers import SparseEncoder
-from sentence_transformers.sentence_transformer import losses as st_losses
 from sentence_transformers.sparse_encoder import evaluation, losses, modules
 from sklearn.feature_extraction.text import ENGLISH_STOP_WORDS
-from torch.nn import functional as F
 from torch.optim import AdamW
 from torch.utils.data import DataLoader
 from tqdm import tqdm
@@ -29,27 +27,15 @@ from sense_data import mark_target
 M1 = "<t>"
 M2 = "</t>"
 
+# Side-marker tokens (added to the vocab like the <t> markers). Each anchor usage
+# is prefixed with [QRY] and each gloss with [DOC] so the encoder can tell a
+# word-in-context apart from a definition. Note [QRY] sits *outside* the <t> … </t>
+# span, so target-word pooling drops it from the sparse query embedding — the query
+# asymmetry is the target span itself, so [QRY] is effectively inert; [DOC] is the
+# prefix that actually enters the whole-sentence gloss (document) pooling.
+QRY = "[QRY]"
+DOC = "[DOC]"
 
-class SparseOnlineContrastiveLoss(st_losses.OnlineContrastiveLoss):
-    def __init__(self, model: SparseEncoder) -> None:
-        model.similarity_fn_name = "cosine"
-        super().__init__(model)
-
-    def compute_loss_from_embeddings(
-        self, embeddings: list[torch.Tensor], labels: torch.Tensor, size_average=False
-    ) -> torch.Tensor:
-        distance_matrix = self.distance_metric(embeddings[0], embeddings[1])
-        negs = distance_matrix[labels == 0]
-        poss = distance_matrix[labels == 1]
-
-        # select hard positive and hard negative pairs
-        negative_pairs = negs[negs < (poss.max() if len(poss) > 1 else negs.mean())]
-        positive_pairs = poss[poss > (negs.min() if len(negs) > 1 else poss.mean())]
-
-        positive_loss = positive_pairs.pow(2).sum()
-        negative_loss = F.relu(self.margin - negative_pairs).pow(2).sum()
-        loss = positive_loss + negative_loss
-        return loss
 
 class DenseHiddenStatesTransformer(modules.Transformer):
     """Fill-mask transformer that also exposes the dense hidden states.
@@ -122,8 +108,8 @@ class TargetWordSpladePooling(modules.SpladePooling):
 class BarlowTwinsLoss:
     """Barlow Twins loss on dense target-word representations.
 
-    Decorrelates feature dimensions across the pair of views (sentence1 vs
-    sentence2) while pushing the diagonal of the cross-correlation matrix
+    Decorrelates feature dimensions across the pair of views (anchor vs
+    positive) while pushing the diagonal of the cross-correlation matrix
     to 1. Operates on the pre-unembedding hidden states.
     """
 
@@ -219,9 +205,10 @@ def load_sense_fit(prefix: str):
     """Load the fixed lemma-disjoint sense-fit splits written by gen_sense_fit.py.
 
     Reads ``{prefix}.{train,dev,test}.json``. Each example is
-    ``{word, usage, positive, negative}`` (extra metadata is ignored). The usage
-    is marked with ``<t>`` tags up front so the query side gets target-word
-    pooling; glosses are left unmarked for full-sentence pooling.
+    ``{word, usage, positive, negative}`` (extra metadata is ignored) and becomes
+    an ``{anchor, positive, negative}`` triplet. The anchor usage is marked with
+    ``<t>`` tags (target-word pooling) and prefixed with ``[QRY]``; the positive
+    and negative glosses are prefixed with ``[DOC]`` (full-sentence pooling).
     """
     splits: dict[str, list[dict]] = {}
     for name in ("train", "dev", "test"):
@@ -229,35 +216,25 @@ def load_sense_fit(prefix: str):
             examples = json.load(f)
         splits[name] = [
             {
-                "usage": mark_target(ex["usage"], ex["word"]),
-                "positive": ex["positive"],
-                "negative": ex["negative"],
+                "anchor": f"{QRY} " + mark_target(ex["usage"], ex["word"]),
+                "positive": f"{DOC} " + ex["positive"],
+                "negative": f"{DOC} " + ex["negative"],
             }
             for ex in examples
         ]
     return DatasetDict({k: Dataset.from_list(v) for k, v in splits.items()})
 
 
-def triplets_to_pairs(rows):
-    """Expand each (usage, positive, negative) triplet into two labelled pairs."""
-    sentences1, sentences2, labels = [], [], []
-    for row in rows:
-        sentences1.append(row["usage"])
-        sentences2.append(row["positive"])
-        labels.append(1)
-        sentences1.append(row["usage"])
-        sentences2.append(row["negative"])
-        labels.append(0)
-    return sentences1, sentences2, labels
-
-
 def make_evaluator(dataset, name: str):
-    sentences1, sentences2, labels = triplets_to_pairs(dataset)
-    return evaluation.SparseBinaryClassificationEvaluator(
-        sentences1=sentences1,
-        sentences2=sentences2,
-        labels=labels,
+    # Triplet accuracy: fraction of examples where sim(anchor, positive) beats
+    # sim(anchor, negative). Dot similarity matches MNRL's dot_score on the sparse
+    # SPLADE embeddings.
+    return evaluation.SparseTripletEvaluator(
+        anchors=[row["anchor"] for row in dataset],
+        positives=[row["positive"] for row in dataset],
+        negatives=[row["negative"] for row in dataset],
         name=name,
+        similarity_fn_names=["dot"],
     )
 
 
@@ -280,8 +257,8 @@ def main():
     parser.add_argument("--seq_length", type=int, default=128)
     parser.add_argument("--max_seq_length", type=int, default=64)
     parser.add_argument("--patience", type=int, default=10)
-    parser.add_argument("--loss", type=str, default="angle")
-    parser.add_argument("--temperature", type=float, default=20.0)
+    parser.add_argument("--loss", type=str, default="mnrl",
+                        choices=["mnrl", "triplet"])
     parser.add_argument("--doc_regularization", type=float, default=5e-3)
     parser.add_argument("--query_regularization", type=float, default=5e-3)
     parser.add_argument("--stopword_regularization", type=float, default=5e-4)
@@ -314,18 +291,14 @@ def main():
     )
 
     def collate_fn(batch):
-        # Each (usage, positive, negative) triplet becomes two query/document
-        # pairs: usage vs positive (label 1) and usage vs negative (label 0). The
-        # usage carries <t> markers (target-word pooling); glosses are unmarked
-        # so the same pooling layer falls back to whole-sentence pooling.
-        sentence1_texts, sentence2_texts, labels = triplets_to_pairs(batch)
-        labels = torch.tensor(labels, dtype=torch.float)
-        sentence1_features = model.tokenize(sentence1_texts)  # usages (queries)
-        sentence2_features = model.tokenize(sentence2_texts)  # glosses (documents)
+        # Tokenize the (anchor, positive, negative) triplet as three columns. The
+        # anchor carries [QRY] + <t> markers (target-word pooling); glosses carry
+        # [DOC] (whole-sentence pooling). MNRL builds its own in-batch targets, so
+        # no labels are needed.
         return {
-            "sentence1": sentence1_features,
-            "sentence2": sentence2_features,
-            "label": labels,
+            "anchor": model.tokenize([row["anchor"] for row in batch]),
+            "positive": model.tokenize([row["positive"] for row in batch]),
+            "negative": model.tokenize([row["negative"] for row in batch]),
         }
 
     mlm_transformer = DenseHiddenStatesTransformer(
@@ -338,9 +311,9 @@ def main():
             "output_hidden_states": True,
         },
     )
-    # The marker tokens must exist before we can build the target-word pooling,
-    # so add them to the transformer's tokenizer up front.
-    mlm_transformer.tokenizer.add_tokens([M1, M2])
+    # The marker and side tokens must exist before we can build the target-word
+    # pooling, so add them to the transformer's tokenizer up front.
+    mlm_transformer.tokenizer.add_tokens([M1, M2, QRY, DOC])
     mlm_transformer.auto_model.resize_token_embeddings(len(mlm_transformer.tokenizer))
 
     mlm_transformer.auto_model.tie_weights()
@@ -371,10 +344,14 @@ def main():
         ]
         logging.info(f"Found {len(stop_word_ids)} stop words in the vocabulary.")
 
-    if args.loss == "infonce":
-        inner_loss = SparseOnlineContrastiveLoss(model=model)
-    else:
-        inner_loss = losses.SparseAnglELoss(model, scale=args.temperature)
+    if args.loss == "triplet":
+        # Margin triplet on the single hard negative (no in-batch negatives).
+        inner_loss = losses.SparseTripletLoss(model)
+    else:  # "mnrl" (default)
+        # Contrastive ranking on (anchor, positive, negative): the explicit hard
+        # negative plus every other gloss in the batch as in-batch negatives.
+        # Default scale=1.0 / dot_score, tuned for large sparse SPLADE scores.
+        inner_loss = losses.SparseMultipleNegativesRankingLoss(model)
     # Asymmetric regularization: the document regularizer sparsifies the gloss
     # (document) embeddings, the query regularizer the usage (query) embeddings.
     loss_fn = losses.SpladeLoss(
@@ -471,24 +448,21 @@ def main():
         for i, batch in enumerate(bar):
             update_splade_weights(global_step)
             with torch.amp.autocast(model.device.type, enabled=args.fp16):
-                features1 = {
-                    k: v.to(model.device)
-                    for k, v in batch["sentence1"].items()
-                    if k != "modality"
-                }
-                features2 = {
-                    k: v.to(model.device)
-                    for k, v in batch["sentence2"].items()
-                    if k != "modality"
-                }
-                labels = batch["label"].to(model.device)
-                loss = loss_fn([features1, features2], labels)
+                features = [
+                    {
+                        k: v.to(model.device)
+                        for k, v in batch[col].items()
+                        if k != "modality"
+                    }
+                    for col in ("anchor", "positive", "negative")
+                ]
+                # MNRL builds its own in-batch targets, so labels are unused.
+                loss = loss_fn(features, None)
             loss = sum(loss.values()) / gradient_accumulation_steps
 
             # Check for invalid loss
             if torch.isnan(loss) or torch.isinf(loss):
                 logging.warning(f"Warning: Invalid loss detected: {loss.item()}")
-                logging.warning(f"Labels: {labels}")
                 continue
 
             current_loss = loss.item() * gradient_accumulation_steps
@@ -530,7 +504,7 @@ def main():
 
         wandb.log({"epoch_avg_loss": epoch_avg_loss, "epoch": epoch + 1, **dev_metrics})
 
-        dev_accuracy = dev_metrics.get("sensesimx_cosine_accuracy", 0)
+        dev_accuracy = dev_metrics.get(dev_evaluator.primary_metric, 0)
         if dev_accuracy > best_metric:
             best_metric = dev_accuracy
             epochs_without_improvement = 0
@@ -564,7 +538,7 @@ def main():
     )
     model.tokenizer.max_seq_length = args.seq_length
     model.eval()
-    model.similarity_fn_name = "cosine"
+    model.similarity_fn_name = "dot"
 
     test_metrics = test_evaluator(model)
     logging.info("Final test metrics:")
