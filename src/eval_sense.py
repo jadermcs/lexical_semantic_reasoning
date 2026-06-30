@@ -32,6 +32,23 @@ def build_prompt(rec, tokenizer, mode):
     return tokenizer.apply_chat_template(msgs, tokenize=False, add_generation_prompt=True)
 
 
+def print_examples(records, n=10):
+    """Print a table of the first ``n`` predictions next to their gold gloss."""
+    def trunc(s, w):
+        s = " ".join(s.split())
+        return s if len(s) <= w else s[: w - 1] + "…"
+
+    lemma_w, col_w = 18, 55
+    header = f"{'lemma':<{lemma_w}}  {'gold':<{col_w}}  {'prediction':<{col_w}}"
+    print(f"\nExamples (first {min(n, len(records))}):")
+    print(header)
+    print("-" * len(header))
+    for rec in records[:n]:
+        print(f"{trunc(rec['lemma'], lemma_w):<{lemma_w}}  "
+              f"{trunc(rec['gold'], col_w):<{col_w}}  "
+              f"{trunc(rec['prediction'], col_w):<{col_w}}")
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--model", default="Qwen/Qwen3-1.7B")
@@ -99,6 +116,8 @@ def main():
     if bertscore is not None:
         msg += f"  BERTScore_F1={bertscore:.3f}"
     print(f"{msg}  empty={empty}")
+
+    print_examples(records, n=10)
 
     out_path = Path(args.output or f"predictions_sense_{args.mode}.json")
     out_path.write_text(json.dumps(

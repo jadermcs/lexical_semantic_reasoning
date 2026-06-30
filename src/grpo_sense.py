@@ -3,9 +3,8 @@
   --mode direct   -> config 3: RL on single-usage definition generation
   --mode triplet  -> config 4: RL on anchor/positive/negative contrastive glosses
 
-Verifiable reward = similarity of the generated gloss to the WordNet gold
-definition (token-F1 + BLEU-2, see ``sense_data.gloss_similarity``) plus a small
-format term.
+Verifiable reward = BERTScore semantic similarity of the generated gloss to the
+WordNet gold definition plus a small format term.
 """
 
 import argparse
@@ -17,6 +16,7 @@ from pathlib import Path
 
 import torch
 from datasets import Dataset, DatasetDict
+from sklearn.feature_extraction.text import ENGLISH_STOP_WORDS
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from trl import GRPOConfig, GRPOTrainer
 
@@ -63,6 +63,47 @@ def _uses_target(gloss, lemma):
     return bool(set(sd._tok(gloss)) & _target_variants(lemma))
 
 
+MIN_CONTENT_WORDS = 2    # glosses need at least this many non-stopword tokens
+MIN_CONTENT_PENALTY = -0.5
+
+
+def _content_word_count(gloss):
+    return sum(1 for t in sd._tok(gloss) if t not in ENGLISH_STOP_WORDS)
+
+
+def _min_content_penalty(gloss):
+    """Punish glosses with fewer than MIN_CONTENT_WORDS non-stopword tokens."""
+    return MIN_CONTENT_PENALTY if _content_word_count(gloss) < MIN_CONTENT_WORDS else 0.0
+
+
+# --------------------------------------------------------------------------- #
+# BERTScore fidelity (batched; the model is loaded once and reused)
+# --------------------------------------------------------------------------- #
+_BERTSCORER = None
+
+
+def _get_bertscorer():
+    global _BERTSCORER
+    if _BERTSCORER is None:
+        from bert_score import BERTScorer
+
+        _BERTSCORER = BERTScorer(lang="en", rescale_with_baseline=True)
+    return _BERTSCORER
+
+
+def bertscore_similarity(hyps, refs):
+    """Batched BERTScore F1 in [0,1]; empty hypotheses score 0 without calling the model."""
+    out = [0.0] * len(hyps)
+    idxs = [i for i, h in enumerate(hyps) if h.strip()]
+    if not idxs:
+        return out
+    scorer = _get_bertscorer()
+    _, _, f1 = scorer.score([hyps[i] for i in idxs], [refs[i] for i in idxs])
+    for i, f in zip(idxs, f1.tolist()):
+        out[i] = max(0.0, min(1.0, float(f)))
+    return out
+
+
 LENGTH_TOL = 1.5      # free allowance: up to 1.5x the gold gloss length
 LENGTH_PENALTY = -0.5  # max penalty, reached once the excess equals the allowance
 
@@ -76,7 +117,8 @@ def _length_penalty(hyp, ref):
 
 def reward_direct_fidelity(completions, **kwargs):
     golds = kwargs["gloss"]
-    return [sd.gloss_similarity(sd.extract_direct_gloss(c), g) for c, g in zip(completions, golds)]
+    hyps = [sd.extract_direct_gloss(c) for c in completions]
+    return bertscore_similarity(hyps, golds)
 
 
 def reward_direct_no_target(completions, **kwargs):
@@ -87,6 +129,11 @@ def reward_direct_no_target(completions, **kwargs):
     return out
 
 
+def reward_direct_min_content(completions, **kwargs):
+    """Punish glosses with fewer than MIN_CONTENT_WORDS non-stopword tokens."""
+    return [_min_content_penalty(sd.extract_direct_gloss(c)) for c in completions]
+
+
 def reward_direct_length(completions, **kwargs):
     """Punish glosses much longer than the gold definition."""
     return [
@@ -95,16 +142,40 @@ def reward_direct_length(completions, **kwargs):
     ]
 
 
+def _think_answer_format_reward(completions, extractor):
+    """Reward a present <think> block (0.1) and an extractable gloss (0.1)."""
+    out = []
+    for c in completions:
+        r = 0.0
+        if re.search(r"<think>.+?</think>", c, re.DOTALL):
+            r += 0.1
+        if extractor(c):
+            r += 0.1
+        out.append(r)
+    return out
+
+
 def reward_direct_format(completions, **kwargs):
-    """Reward a single concise line; penalise empty output."""
-    return [0.1 if sd.extract_direct_gloss(c) else 0.0 for c in completions]
+    return _think_answer_format_reward(completions, sd.extract_direct_gloss)
 
 
 def reward_triplet_fidelity(completions, **kwargs):
     """Similarity of the shared (anchor/positive) gloss to its gold definition."""
     same = kwargs["gloss_same"]
-    return [sd.gloss_similarity(sd.extract_shared_gloss(c), gs)
-            for c, gs in zip(completions, same)]
+    hyps = [sd.extract_shared_gloss(c) for c in completions]
+    return bertscore_similarity(hyps, same)
+
+
+def reward_triplet_contrast(completions, **kwargs):
+    """Punish the gloss for being similar to the negative (differentia) sense.
+
+    Complements reward_triplet_fidelity, which already rewards closeness to the
+    positive sense, so together they pull the gloss toward the shared sense and
+    away from the contrastive one.
+    """
+    hyps = [sd.extract_shared_gloss(c) for c in completions]
+    sim_neg = bertscore_similarity(hyps, kwargs["gloss_diff"])
+    return [-s for s in sim_neg]
 
 
 def reward_triplet_no_target(completions, **kwargs):
@@ -115,6 +186,11 @@ def reward_triplet_no_target(completions, **kwargs):
     return out
 
 
+def reward_triplet_min_content(completions, **kwargs):
+    """Punish the gloss for having fewer than MIN_CONTENT_WORDS non-stopword tokens."""
+    return [_min_content_penalty(sd.extract_shared_gloss(c)) for c in completions]
+
+
 def reward_triplet_length(completions, **kwargs):
     """Punish the gloss for running much longer than its gold definition."""
     same = kwargs["gloss_same"]
@@ -123,30 +199,79 @@ def reward_triplet_length(completions, **kwargs):
 
 
 def reward_triplet_format(completions, **kwargs):
+    return _think_answer_format_reward(completions, sd.extract_shared_gloss)
+
+
+def _extract_think(text):
+    m = re.search(r"<think>(.*?)</think>", text, re.DOTALL)
+    return m.group(1).strip() if m else ""
+
+
+THINK_MIN_WORDS = 6      # below this many content words, reasoning is treated as a stub
+THINK_MIN_PENALTY = -0.3
+THINK_DIFFERENTIA_WEIGHT = 0.3
+
+
+def _think_length_penalty(completions):
+    """Punish degenerate reasoning: a present but near-empty <think> block.
+
+    Catches the model collapsing the reasoning step to a stub (e.g. "<think>ok</think>")
+    to farm the format reward's presence bonus without doing any real reasoning.
+    """
     out = []
     for c in completions:
-        r = 0.0
-        if re.search(r"<think>.+?</think>", c, re.DOTALL):
-            r += 0.1
-        if sd.extract_shared_gloss(c):
-            r += 0.1
-        out.append(r)
+        think = _extract_think(c)
+        out.append(THINK_MIN_PENALTY if think and _content_word_count(think) < THINK_MIN_WORDS else 0.0)
+    return out
+
+
+def reward_direct_think_length(completions, **kwargs):
+    return _think_length_penalty(completions)
+
+
+def reward_triplet_think_length(completions, **kwargs):
+    return _think_length_penalty(completions)
+
+
+def reward_triplet_think_differentia(completions, **kwargs):
+    """Reward the <think> block for naming the differentia.
+
+    The differentia is the content distinguishing the negative sense's gold gloss
+    from the shared (anchor/positive) gold gloss. Rewarding its presence in the
+    reasoning pushes the model to actually reason about the anchor/positive vs.
+    negative contrast the prompt asks for, rather than emit templated filler.
+    """
+    out = []
+    for c, gsame, gdiff in zip(completions, kwargs["gloss_same"], kwargs["gloss_diff"]):
+        think = _extract_think(c)
+        if not think:
+            out.append(0.0)
+            continue
+        diff_terms = (set(sd._tok(gdiff)) - set(sd._tok(gsame))) - ENGLISH_STOP_WORDS
+        if not diff_terms:
+            out.append(0.0)
+            continue
+        think_terms = set(sd._tok(think)) - ENGLISH_STOP_WORDS
+        overlap = len(diff_terms & think_terms) / len(diff_terms)
+        out.append(THINK_DIFFERENTIA_WEIGHT * overlap)
     return out
 
 
 REWARDS = {
     "direct": [
         reward_direct_fidelity, reward_direct_no_target,
-        reward_direct_length, reward_direct_format,
+        reward_direct_min_content, reward_direct_length, reward_direct_format,
+        reward_direct_think_length,
     ],
     "triplet": [
-        reward_triplet_fidelity, reward_triplet_no_target,
-        reward_triplet_length, reward_triplet_format,
+        reward_triplet_fidelity, reward_triplet_contrast, reward_triplet_no_target,
+        reward_triplet_min_content, reward_triplet_length, reward_triplet_format,
+        reward_triplet_think_length, reward_triplet_think_differentia,
     ],
 }
 KEEP_COLS = {
     "direct": ["lemma", "gloss"],
-    "triplet": ["lemma", "gloss_same"],
+    "triplet": ["lemma", "gloss_same", "gloss_diff"],
 }
 # The fidelity reward already scores a completion against its gold gloss(es); the
 # trace saver reuses it to decide which generations are "successful".
