@@ -20,6 +20,11 @@ NEGATIVES (do NOT fit the usage):
                   Graded by Wu-Palmer similarity into hard/medium/easy.
   5. antonym    : the gloss of an antonym sense (same domain, opposite meaning).
 
+Rows are partitioned into the lemma-disjoint train/dev/test splits from
+``sense_data.lemma_splits`` (same lexicon/seed as the rest of the pipeline) and
+written as ``{out_dir}/{prefix}.{train,dev,test}.json`` so downstream consumers
+(e.g. ``train_reward.py``) read fixed splits instead of re-splitting on the fly.
+
 Run:  uv run python src/gen_sense_fit.py --max_total 500
 """
 
@@ -30,6 +35,8 @@ from pathlib import Path
 
 import wn
 import wn.similarity as sim
+
+from sense_data import lemma_splits
 
 POS_MAP = {"n": "noun", "v": "verb", "a": "adjective", "s": "adjective", "r": "adverb"}
 
@@ -211,7 +218,10 @@ def build(args):
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--lexicon", default="oewn:2024")
-    p.add_argument("--out", default="data/sense_fit.generated.json")
+    p.add_argument("--out_dir", default="data",
+                   help="directory for the split files")
+    p.add_argument("--prefix", default="sense_fit",
+                   help="basename prefix; writes {prefix}.{train,dev,test}.json")
     p.add_argument("--max_total", type=int, default=500)
     p.add_argument("--max_per_sense", type=int, default=3,
                    help="rows emitted per source synset")
@@ -228,15 +238,33 @@ def main():
 
     rows = build(args)
 
-    out = Path(args.out)
-    out.parent.mkdir(parents=True, exist_ok=True)
-    out.write_text(json.dumps(rows, indent=2, ensure_ascii=False) + "\n")
+    # Partition lemma-disjointly using the canonical pipeline split so a lemma in
+    # dev/test never leaks into the reward model's training set.
+    train_l, dev_l, test_l = lemma_splits(args.lexicon, args.seed)
+    splits = {"train": [], "dev": [], "test": []}
+    for r in rows:
+        word = r["word"].lower()
+        if word in test_l:
+            splits["test"].append(r)
+        elif word in dev_l:
+            splits["dev"].append(r)
+        else:
+            # train lemmas plus any lemma absent from the split pool (safe: an
+            # unknown lemma is by definition not a dev/test lemma).
+            splits["train"].append(r)
+
+    out_dir = Path(args.out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    for name, split_rows in splits.items():
+        out = out_dir / f"{args.prefix}.{name}.json"
+        out.write_text(json.dumps(split_rows, indent=2, ensure_ascii=False) + "\n")
+        print(f"Wrote {len(split_rows)} rows -> {out}")
 
     by_strategy, by_diff = {}, {}
     for r in rows:
         by_strategy[r["strategy"]] = by_strategy.get(r["strategy"], 0) + 1
         by_diff[r["difficulty"]] = by_diff.get(r["difficulty"], 0) + 1
-    print(f"Wrote {len(rows)} rows -> {out}")
+    print(f"\nTotal {len(rows)} rows")
     print("strategy:", by_strategy)
     print("difficulty:", by_diff)
     print("\n--- sample ---")

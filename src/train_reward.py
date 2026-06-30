@@ -4,7 +4,6 @@ import argparse
 import json
 import logging
 import os
-import random
 from string import punctuation
 from typing import Iterable
 
@@ -216,43 +215,26 @@ def loss_forward(
     return losses_dict
 
 
-def split_words(words: Iterable[str], seed: int, dev: float = 0.1, test: float = 0.1):
-    """Word-disjoint split: each lemma lands in exactly one of train/dev/test."""
-    uniq = sorted(set(words))
-    rng = random.Random(seed)
-    rng.shuffle(uniq)
-    n = len(uniq)
-    n_test = int(n * test)
-    n_dev = int(n * dev)
-    test_w = set(uniq[:n_test])
-    dev_w = set(uniq[n_test : n_test + n_dev])
-    train_w = set(uniq[n_test + n_dev :])
-    return train_w, dev_w, test_w
+def load_sense_fit(prefix: str):
+    """Load the fixed lemma-disjoint sense-fit splits written by gen_sense_fit.py.
 
-
-def load_sense_fit(path: str, seed: int):
-    """Load sense-fit triplets and split word-disjointly into train/dev/test.
-
-    Each example is ``{word, usage, positive, negative}`` (extra metadata is
-    ignored). The usage is marked with ``<t>`` tags up front so the query side
-    gets target-word pooling; glosses are left unmarked for full-sentence pooling.
+    Reads ``{prefix}.{train,dev,test}.json``. Each example is
+    ``{word, usage, positive, negative}`` (extra metadata is ignored). The usage
+    is marked with ``<t>`` tags up front so the query side gets target-word
+    pooling; glosses are left unmarked for full-sentence pooling.
     """
-    with open(path) as f:
-        examples = json.load(f)
-    train_w, dev_w, test_w = split_words([ex["word"] for ex in examples], seed)
-    splits: dict[str, list[dict]] = {"train": [], "dev": [], "test": []}
-    for ex in examples:
-        row = {
-            "usage": mark_target(ex["usage"], ex["word"]),
-            "positive": ex["positive"],
-            "negative": ex["negative"],
-        }
-        if ex["word"] in test_w:
-            splits["test"].append(row)
-        elif ex["word"] in dev_w:
-            splits["dev"].append(row)
-        else:
-            splits["train"].append(row)
+    splits: dict[str, list[dict]] = {}
+    for name in ("train", "dev", "test"):
+        with open(f"{prefix}.{name}.json") as f:
+            examples = json.load(f)
+        splits[name] = [
+            {
+                "usage": mark_target(ex["usage"], ex["word"]),
+                "positive": ex["positive"],
+                "negative": ex["negative"],
+            }
+            for ex in examples
+        ]
     return DatasetDict({k: Dataset.from_list(v) for k, v in splits.items()})
 
 
@@ -287,8 +269,9 @@ def main():
     parser.add_argument("--fp16", type=bool, default=True)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument(
-        "--data", type=str, default="data/sense_fit.generated.json",
-        help="Sense-fit triplet file ({word, usage, positive, negative}).",
+        "--data", type=str, default="data/sense_fit",
+        help="Prefix for the fixed sense-fit splits; reads "
+             "{data}.{train,dev,test}.json ({word, usage, positive, negative}).",
     )
     parser.add_argument("--learning_rate", type=float, default=1e-5)
     parser.add_argument("--weight_decay", type=float, default=0.0)
@@ -317,7 +300,7 @@ def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     logging.info(f"Using device: {device}")
 
-    dataset = load_sense_fit(args.data, args.seed)
+    dataset = load_sense_fit(args.data)
     logging.info(
         "Loaded sense-fit triplets: "
         + ", ".join(f"{k}={len(v)}" for k, v in dataset.items())
