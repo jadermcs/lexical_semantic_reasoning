@@ -35,6 +35,9 @@ dependencies = [
     "vllm==0.19.0",
     "flashinfer-python>=0.6.6",
     "sentence-transformers>=5.6.0",
+    # GRPO fidelity reward + eval --bertscore
+    "bert-score>=0.3.13",
+    "scikit-learn>=1.5.0",
 ]
 
 [tool.uv.sources]
