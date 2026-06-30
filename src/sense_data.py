@@ -39,9 +39,12 @@ DATA_DIR = Path("data")
 # --------------------------------------------------------------------------- #
 DIRECT_SYSTEM = (
     "You are an expert lexicographer. You are given a sentence with one target "
-    "word marked by <t> tags. Write a single concise dictionary definition of the "
-    "target word as it is used in that sentence. Give only the definition, and do "
-    "not use the target word itself in it."
+    "word marked by <t> tags. Inside <think> tags, write a brief, tight argument "
+    "(one short paragraph, no bullet lists) that reads the contextual cues and works "
+    "out what the target word means here. Reason forward from the context only. Then, "
+    "after </think>, give a single concise dictionary definition of the target word as "
+    "used here — and nothing else. Keep it concise and never use the target word to "
+    "define itself. Format: <think>...</think>\ndefinition"
 )
 
 TRIPLET_SYSTEM = (
@@ -217,6 +220,11 @@ def load_split(mode: str, split: str, data_dir: Path = DATA_DIR) -> list[dict]:
 # --------------------------------------------------------------------------- #
 # Prompt / target formatting (chat messages)
 # --------------------------------------------------------------------------- #
+def direct_think(rec) -> str:
+    # Templated argument (Phase-3 warm-start: optimise for format + gloss copy).
+    return f"<think>\nIn this usage, {rec['lemma']} means: {rec['gloss']}.\n</think>"
+
+
 def direct_messages(rec, with_target=False):
     msgs = [
         {"role": "system", "content": DIRECT_SYSTEM},
@@ -226,7 +234,7 @@ def direct_messages(rec, with_target=False):
         },
     ]
     if with_target:
-        msgs.append({"role": "assistant", "content": rec["gloss"]})
+        msgs.append({"role": "assistant", "content": f"{direct_think(rec)}\n{rec['gloss']}"})
     return msgs
 
 
