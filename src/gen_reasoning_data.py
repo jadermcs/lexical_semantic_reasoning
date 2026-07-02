@@ -294,29 +294,32 @@ def build_direct(groups, max_per_lemma: int, rng: random.Random):
 
 
 TRIPLET_SYSTEM_PROMPT = (
-    "You are an expert lexicographer. You are given three usages of one target word "
-    "(marked with <t> tags) — an anchor, a positive, and a negative. The anchor and "
-    "positive share one sense; the negative is a different sense of the same word. "
-    "Inside <think> tags, write a brief, tight argument (one short paragraph, no bullet "
-    "lists) that: (1) states what the word means in the anchor, positive, and negative "
-    "usages, read from their context; (2) names the genus the anchor and positive share; "
-    "(3) gives the differentia that sets them apart from the negative. Then, inside "
-    "<answer> tags, give one concise dictionary definition read off that argument: the "
-    "sense shared by the anchor and positive. Do not define the negative sense. Keep it "
-    "concise and never use the target word to define itself. "
-    "Format: <think>...</think><answer>\n...\n</answer>"
+    "You are a lexicographer. You are given one or more POSITIVE usages of a target word "
+    "(marked with <t> ... </t>) that all share the same sense, plus one or more NEGATIVE "
+    "usages where the same word carries a DIFFERENT sense.\n\n"
+    "First think step by step inside <think> ... </think>:\n"
+    "1. State the sense shared by all POSITIVE usages.\n"
+    "2. State the sense of the NEGATIVE usages.\n"
+    "3. Identify the distinguishing feature that separates them.\n"
+    "4. Draft a definition and check it against each negative — it must reject every one. "
+    "Revise if any negative slips through.\n\n"
+    "Then output the final definition inside <answer> ... </answer>. The definition must:\n"
+    "- fit every POSITIVE usage,\n"
+    "- fit NONE of the NEGATIVE usages,\n"
+    "- generalize to unseen usages of the same sense (don't overfit to these exact "
+    "sentences).\n\n"
+    "Do not mention the example sentences or the target word inside <answer>."
 )
 
 
 def _triplet_user(lemma: str, pos: str, anchor: str, positive: str, negative: str) -> str:
     return (
-        f"Target word: {lemma} ({pos})\n\n"
-        f"Anchor usage: {anchor}\n"
-        f"Positive usage: {positive}\n"
-        f"Negative usage: {negative}\n\n"
-        "Argue from the contextual cues what the word means in each usage, the genus the "
-        "anchor and positive share, and the differentia that separates them from the "
-        "negative; then give the gloss for the sense shared by the anchor and positive."
+        f"Target word: {lemma} ({pos})\n"
+        "POSITIVE usages (same sense):\n"
+        f"1. {anchor}\n"
+        f"2. {positive}\n"
+        "NEGATIVE usages (different sense):\n"
+        f"1. {negative}"
     )
 
 
@@ -331,36 +334,42 @@ def _triplet_shot(lemma, pos, anchor, positive, negative, think, pos_gloss):
 
 TRIPLET_FEWSHOT = [
     _triplet_shot(
+        "bank", "noun",
+        "I deposited my paycheck at the <t> bank </t> this morning.",
+        "The <t> bank </t> rejected her mortgage application.",
+        "They sat on the grassy <t> bank </t> of the river.",
+        "The positives both involve money handling — depositing a paycheck, ruling on a "
+        "mortgage — so the shared sense is a financial institution. The negative is a "
+        "physical landform, the sloped ground beside a river. The distinguishing feature "
+        "is institution-that-handles-money vs. piece-of-terrain. A definition anchored on "
+        "\"accepts deposits and lends money\" admits both positives and has no way to "
+        "describe a riverside slope, so the negative is excluded.",
+        "a financial institution that accepts deposits and lends money"),
+    _triplet_shot(
         "crane", "noun",
-        "A <t> crane </t> waded through the shallow marsh, hunting frogs.",
-        "The tall <t> crane </t> stood on one leg at the water's edge.",
-        "The <t> crane </t> hoisted the steel beam to the top of the tower.",
-        "In the anchor and positive the word stands in water — wading a marsh, balanced "
-        "on one leg at the water's edge — so it names a tall long-legged wading bird. The "
-        "negative instead hoists a steel beam up a tower, an inanimate lifting machine. "
-        "They share the genus of a tall, long-necked form, but the differentia is a living "
-        "bird versus a construction machine.",
-        "a tall long-legged long-necked wading bird of marshes and open country"),
+        "A <t> crane </t> lifted the steel beams onto the roof.",
+        "The construction site had three <t> crane </t>s running at once.",
+        "A <t> crane </t> waded through the shallows hunting for fish.",
+        "The positives are about lifting heavy loads on a construction site, so the shared "
+        "sense is a lifting machine. The negative wades through the shallows hunting fish — "
+        "a living bird. The distinguishing feature is inanimate machine vs. animate animal. "
+        "Anchoring the definition on \"machine ... used to lift heavy objects\" covers both "
+        "positives; a bird is neither a machine nor a lifting device, so the negative is "
+        "rejected.",
+        "a tall machine with a projecting arm, used to lift and move heavy objects"),
     _triplet_shot(
-        "charge", "verb",
-        "The cavalry <t> charged </t> across the open field at the enemy line.",
-        "The bull lowered its horns and <t> charged </t> straight at the matador.",
-        "The garage will <t> charge </t> your card once the repair is finished.",
-        "The anchor and positive both show a rapid, aggressive rush forward — cavalry at a "
-        "line, a bull at the matador — so the shared genus is to rush ahead in attack. The "
-        "negative has a garage billing a card, a demand for payment with no motion at all; "
-        "that financial sense is the differentia.",
-        "to rush forward in a violent attack"),
-    _triplet_shot(
-        "mint", "noun",
-        "She tore a few leaves of <t> mint </t> for the tea.",
-        "The garden bed was overrun with <t> mint </t>, its scent sharp in the heat.",
-        "The rare coin had just been struck at the royal <t> mint </t>.",
-        "In the anchor and positive the word is a leafy, aromatic garden plant — leaves "
-        "torn for tea, a sharp scent rising in the heat — so the genus is an aromatic herb. "
-        "The negative is a place where coins are struck, an industrial facility; herb "
-        "versus money-making works is the differentia.",
-        "an aromatic herb whose leaves are used for flavoring"),
+        "head", "noun",
+        "the <t> head </t> of the company",
+        "Apple's <t> head </t>",
+        "the <t> head </t> of the tower",
+        "Both positives pick out the person in charge of an organization — a company, "
+        "Apple. The negative, \"the head of the tower,\" is the topmost physical part of a "
+        "structure, not a person. The distinguishing feature is animate leader-of-a-group "
+        "vs. inanimate uppermost-part-of-an-object. A generic gloss like \"the leading or "
+        "topmost part of something\" would wrongly cover the tower, so I anchor on "
+        "personhood and authority: \"the person who leads an organization\" admits company "
+        "and Apple, and cannot describe a tower's top, so the negative is excluded.",
+        "the person who leads or has authority over an organization or group"),
 ]
 
 

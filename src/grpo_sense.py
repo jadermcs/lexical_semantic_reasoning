@@ -213,15 +213,18 @@ THINK_DIFFERENTIA_WEIGHT = 0.3
 
 
 def _think_length_penalty(completions):
-    """Punish degenerate reasoning: a present but near-empty <think> block.
+    """Punish degenerate reasoning: a missing, truncated, or near-empty <think> block.
 
-    Catches the model collapsing the reasoning step to a stub (e.g. "<think>ok</think>")
-    to farm the format reward's presence bonus without doing any real reasoning.
+    Catches the model collapsing the reasoning step — whether by dropping the
+    block entirely (no penalty elsewhere, so this is the only force keeping it),
+    truncating it past the length budget (no closing tag, so `_extract_think`
+    returns ""), or stubbing it (e.g. "<think>ok</think>") to farm the format
+    reward's presence bonus without doing any real reasoning.
     """
     out = []
     for c in completions:
         think = _extract_think(c)
-        out.append(THINK_MIN_PENALTY if think and _content_word_count(think) < THINK_MIN_WORDS else 0.0)
+        out.append(THINK_MIN_PENALTY if _content_word_count(think) < THINK_MIN_WORDS else 0.0)
     return out
 
 
@@ -364,12 +367,15 @@ def main():
             use_vllm=True, vllm_mode="server",
             vllm_server_host=args.vllm_server_host, vllm_server_port=args.vllm_server_port,
         )
+    else:
+        vllm_kwargs = dict(use_vllm=True, vllm_max_model_length=1024)
 
     output_dir = f"./qwen-sense-grpo-{args.mode}"
     training_args = GRPOConfig(
         output_dir=output_dir,
         num_generations=8,
-        max_completion_length=512,
+        max_completion_length=1024,
+        optim="paged_adamw_8bit",
         temperature=1.0,
         top_p=0.95,
         per_device_train_batch_size=4,
@@ -385,6 +391,8 @@ def main():
         save_steps=100,
         save_total_limit=2,
         logging_steps=10,
+        log_completions=True,
+        num_completions_to_print=8,
         report_to="wandb",
         run_name=f"qwen-sense-grpo-{args.mode}",
         use_liger_kernel=True,

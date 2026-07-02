@@ -62,7 +62,7 @@ def main():
     training_args = SFTConfig(
         output_dir=output_dir,
         dataset_text_field="text",
-        per_device_train_batch_size=64,
+        per_device_train_batch_size=128,
         num_train_epochs=args.epochs,
         warmup_steps=100,
         learning_rate=2e-4,
