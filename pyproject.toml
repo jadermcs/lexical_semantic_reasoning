@@ -3,43 +3,26 @@ name = "generative-lexical-semantics"
 version = "0.1.0"
 description = "Add your description here"
 readme = "README.md"
-requires-python = "==3.13"
-# Single unified env (train + vLLM) shared by both machines, so the trainer
-# (GRPOTrainer) and the rollout server (`trl vllm-serve`) use one dependency set
-# and the train machine gets vLLM's NCCL weight-sync classes natively -- no more
-# train/infer conflict split. Stack is pinned to CUDA 12 (cu126) to match this
-# cluster's toolkit: vLLM 0.19.x is the last CUDA-12 build, and it requires
-# transformers <5 and torch 2.10. (transformers 5.x would force vLLM >=0.20,
-# a CUDA-13 build that needs libcudart.so.13 / a cu130 torch.)
+requires-python = "==3.13.*"
 dependencies = [
-    # shared (datasets, logging, wordnet helpers)
     "datasets>=4.8.0",
     "tqdm>=4.5.0",
     "wandb>=0.23.1",
     "wn>=0.9",
     "rapidfuzz>=3.14.5",
-    # training: GRPO trainer + LoRA
     "accelerate>=1.4.0",
-    # transformers stays <5: vLLM 0.19.x (CUDA-12 build) requires it.
     "transformers>=4.56.2,<5",
     "torch>=2.10.0",
-    # Pin torchvision/torchaudio to the same cu126 build as torch; otherwise they
-    # resolve from PyPI against a different torch ABI -> `torchvision::nms does
-    # not exist` at import. Exact versions are driven by vLLM (torchvision 0.25).
-    # "torchvision>=0.25.0",
-    # "torchaudio>=2.10.0",
     "trl>=1.6.0",
     "liger-kernel>=0.7.0",
-    # rollout / inference: vLLM generation server (`trl vllm-serve`).
-    # <0.20 keeps the CUDA-12 build and stays inside TRL 1.6's supported range.
     "vllm>=0.19.0",
     "flashinfer-python>=0.6.6",
     "sentence-transformers>=5.6.0",
-    # GRPO fidelity reward + eval --bertscore
     "bert-score>=0.3.13",
     "scikit-learn>=1.5.0",
     "bitsandbytes>=0.49.2",
     "rich>=15.0.0",
+    "torchvision>=0.25.0",
 ]
 
 [tool.uv.sources]

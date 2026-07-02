@@ -235,31 +235,6 @@ def reward_direct_think_length(completions, **kwargs):
 def reward_triplet_think_length(completions, **kwargs):
     return _think_length_penalty(completions)
 
-
-def reward_triplet_think_differentia(completions, **kwargs):
-    """Reward the <think> block for naming the differentia.
-
-    The differentia is the content distinguishing the negative sense's gold gloss
-    from the shared (anchor/positive) gold gloss. Rewarding its presence in the
-    reasoning pushes the model to actually reason about the anchor/positive vs.
-    negative contrast the prompt asks for, rather than emit templated filler.
-    """
-    out = []
-    for c, gsame, gdiff in zip(completions, kwargs["gloss_same"], kwargs["gloss_diff"]):
-        think = _extract_think(c)
-        if not think:
-            out.append(0.0)
-            continue
-        diff_terms = (set(sd._tok(gdiff)) - set(sd._tok(gsame))) - ENGLISH_STOP_WORDS
-        if not diff_terms:
-            out.append(0.0)
-            continue
-        think_terms = set(sd._tok(think)) - ENGLISH_STOP_WORDS
-        overlap = len(diff_terms & think_terms) / len(diff_terms)
-        out.append(THINK_DIFFERENTIA_WEIGHT * overlap)
-    return out
-
-
 REWARDS = {
     "direct": [
         reward_direct_fidelity, reward_direct_no_target,
@@ -269,7 +244,7 @@ REWARDS = {
     "triplet": [
         reward_triplet_fidelity, reward_triplet_contrast, reward_triplet_no_target,
         reward_triplet_min_content, reward_triplet_length, reward_triplet_format,
-        reward_triplet_think_length, reward_triplet_think_differentia,
+        reward_triplet_think_length,
     ],
 }
 KEEP_COLS = {

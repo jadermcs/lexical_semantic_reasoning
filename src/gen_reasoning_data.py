@@ -29,7 +29,9 @@ Quality control (annotate-only): empty/refused completions and ones with no
 extractable gloss are always dropped, and `--min-bertscore` drops records whose
 *generated* definition (the shared anchor/positive gloss, for triplet) is semantically far from
 the gold WordNet definition it should match (BERTScore, baseline-rescaled; needs
-the `bert-score` package: `uv add bert-score`).
+the `bert-score` package: `uv add bert-score`). The full, unfiltered set (before the
+BERTScore cut) is always also written to `<out>.unfiltered.jsonl`, so nothing is
+discarded.
 """
 
 import argparse
@@ -622,13 +624,23 @@ def main():
             records = [r for r in records if r.get("gen_gloss")]
             if len(records) < before:
                 print(f"  dropped {before - len(records)} empty/refused/unparseable traces.")
+
+            out = args.out or Path(f"data/semcor_distill_{mode}.jsonl")
+            out.parent.mkdir(parents=True, exist_ok=True)
+            unfiltered_out = out.with_suffix(f".unfiltered{out.suffix}")
+            with unfiltered_out.open("w") as f:
+                for rec in records:
+                    f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+            print(f"[{mode}] wrote {len(records)} unfiltered records to {unfiltered_out}")
+
             if args.min_bertscore > 0 and records:
                 records = filter_by_bertscore(
                     records, DEF_KEY[mode], args.min_bertscore,
                     metric=args.bertscore_metric, model_type=args.bertscore_model)
+        else:
+            out = args.out or Path(f"data/semcor_distill_{mode}.jsonl")
+            out.parent.mkdir(parents=True, exist_ok=True)
 
-        out = args.out or Path(f"data/semcor_distill_{mode}.jsonl")
-        out.parent.mkdir(parents=True, exist_ok=True)
         with out.open("w") as f:
             for rec in records:
                 f.write(json.dumps(rec, ensure_ascii=False) + "\n")
