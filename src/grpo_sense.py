@@ -138,26 +138,30 @@ def _answer_region(text):
     return seg.strip()
 
 
-def reward_direct_fidelity(completions, **kwargs):
-    golds = kwargs["gloss"]
-    hyps = [sd.extract_direct_gloss(c) for c in completions]
-    return bertscore_similarity(hyps, golds)
+def _gold_gloss(kwargs):
+    """Gold gloss of the (shared) sense, whichever column the mode carries it in.
+
+    Direct records store it as `gloss`; triplet records as `gloss_same` (the sense
+    shared by the anchor and positive). One accessor lets the reward fns below stay
+    mode-agnostic.
+    """
+    return kwargs["gloss_same"] if "gloss_same" in kwargs else kwargs["gloss"]
 
 
-def reward_direct_no_target(completions, **kwargs):
+def reward_no_target(completions, **kwargs):
     """Punish glosses that define the target word using the word itself."""
     out = []
     for c, lemma in zip(completions, kwargs["lemma"]):
-        out.append(SELF_REF_PENALTY if _uses_target(sd.extract_direct_gloss(c), lemma) else 0.0)
+        out.append(SELF_REF_PENALTY if _uses_target(sd.extract_shared_gloss(c), lemma) else 0.0)
     return out
 
 
-def reward_direct_min_content(completions, **kwargs):
+def reward_min_content(completions, **kwargs):
     """Punish glosses with fewer than MIN_CONTENT_WORDS non-stopword tokens."""
-    return [_min_content_penalty(sd.extract_direct_gloss(c)) for c in completions]
+    return [_min_content_penalty(sd.extract_shared_gloss(c)) for c in completions]
 
 
-def reward_direct_length(completions, **kwargs):
+def reward_length(completions, **kwargs):
     """Punish a definition region much longer than the gold definition.
 
     Measures the full post-</think> region (not just the extracted first line) so
@@ -165,7 +169,7 @@ def reward_direct_length(completions, **kwargs):
     """
     return [
         _length_penalty(_answer_region(c), g)
-        for c, g in zip(completions, kwargs["gloss"])
+        for c, g in zip(completions, _gold_gloss(kwargs))
     ]
 
 
@@ -182,55 +186,26 @@ def _think_answer_format_reward(completions, extractor):
     return out
 
 
-def reward_direct_format(completions, **kwargs):
-    return _think_answer_format_reward(completions, sd.extract_direct_gloss)
+def reward_format(completions, **kwargs):
+    return _think_answer_format_reward(completions, sd.extract_shared_gloss)
 
 
-def reward_triplet_fidelity(completions, **kwargs):
-    """Similarity of the shared (anchor/positive) gloss to its gold definition."""
-    same = kwargs["gloss_same"]
+def reward_fidelity(completions, **kwargs):
+    """Similarity of the emitted gloss to its gold definition."""
     hyps = [sd.extract_shared_gloss(c) for c in completions]
-    return bertscore_similarity(hyps, same)
+    return bertscore_similarity(hyps, _gold_gloss(kwargs))
 
 
 def reward_triplet_contrast(completions, **kwargs):
     """Punish the gloss for being similar to the negative (differentia) sense.
 
-    Complements reward_triplet_fidelity, which already rewards closeness to the
+    Complements reward_fidelity, which already rewards closeness to the
     positive sense, so together they pull the gloss toward the shared sense and
     away from the contrastive one.
     """
     hyps = [sd.extract_shared_gloss(c) for c in completions]
     sim_neg = bertscore_similarity(hyps, kwargs["gloss_diff"])
     return [-s for s in sim_neg]
-
-
-def reward_triplet_no_target(completions, **kwargs):
-    """Punish the gloss for defining the target word using the word itself."""
-    out = []
-    for c, lemma in zip(completions, kwargs["lemma"]):
-        out.append(SELF_REF_PENALTY if _uses_target(sd.extract_shared_gloss(c), lemma) else 0.0)
-    return out
-
-
-def reward_triplet_min_content(completions, **kwargs):
-    """Punish the gloss for having fewer than MIN_CONTENT_WORDS non-stopword tokens."""
-    return [_min_content_penalty(sd.extract_shared_gloss(c)) for c in completions]
-
-
-def reward_triplet_length(completions, **kwargs):
-    """Punish a definition region much longer than its gold definition.
-
-    Measures the full post-</think> region (not just the extracted first line) so
-    a short first line followed by a long repeated tail is still penalised.
-    """
-    same = kwargs["gloss_same"]
-    return [_length_penalty(_answer_region(c), gs)
-            for c, gs in zip(completions, same)]
-
-
-def reward_triplet_format(completions, **kwargs):
-    return _think_answer_format_reward(completions, sd.extract_shared_gloss)
 
 
 def _extract_think(text):
@@ -259,23 +234,18 @@ def _think_length_penalty(completions):
     return out
 
 
-def reward_direct_think_length(completions, **kwargs):
+def reward_think_length(completions, **kwargs):
     return _think_length_penalty(completions)
 
-
-def reward_triplet_think_length(completions, **kwargs):
-    return _think_length_penalty(completions)
 
 REWARDS = {
     "direct": [
-        reward_direct_fidelity, reward_direct_no_target,
-        reward_direct_min_content, reward_direct_length, reward_direct_format,
-        reward_direct_think_length,
+        reward_fidelity, reward_no_target, reward_min_content,
+        reward_length, reward_format, reward_think_length,
     ],
     "triplet": [
-        reward_triplet_fidelity, reward_triplet_contrast, reward_triplet_no_target,
-        reward_triplet_min_content, reward_triplet_length, reward_triplet_format,
-        reward_triplet_think_length,
+        reward_fidelity, reward_triplet_contrast, reward_no_target,
+        reward_min_content, reward_length, reward_format, reward_think_length,
     ],
 }
 KEEP_COLS = {
@@ -284,7 +254,7 @@ KEEP_COLS = {
 }
 # The fidelity reward already scores a completion against its gold gloss(es); the
 # trace saver reuses it to decide which generations are "successful".
-FIDELITY = {"direct": reward_direct_fidelity, "triplet": reward_triplet_fidelity}
+FIDELITY = {"direct": reward_fidelity, "triplet": reward_fidelity}
 
 
 # --------------------------------------------------------------------------- #
