@@ -9,7 +9,7 @@ Two modes, matching the two sense-modeling ablation configs:
   differs, and *generates* a single gloss for the shared anchor/positive sense
   from the contexts (the gold WordNet definitions are never shown to it; the
   negative is used only to sharpen the reasoning, not glossed). SFT target:
-  `<think>τ</think><answer>d_pos</answer>`.
+  `<think>τ</think>\nd_pos`.
 
 * ``direct`` — a single sense-tagged usage. ChatGPT argues, from the contextual
   cues, what the target word means and *generates* the definition (again without
@@ -305,12 +305,13 @@ TRIPLET_SYSTEM_PROMPT = (
     "3. Identify the distinguishing feature that separates them.\n"
     "4. Draft a definition and check it against each negative — it must reject every one. "
     "Revise if any negative slips through.\n\n"
-    "Then output the final definition inside <answer> ... </answer>. The definition must:\n"
+    "Then, after </think>, output the final definition on its own line and nothing "
+    "else. The definition must:\n"
     "- fit every POSITIVE usage,\n"
     "- fit NONE of the NEGATIVE usages,\n"
     "- generalize to unseen usages of the same sense (don't overfit to these exact "
     "sentences).\n\n"
-    "Do not mention the example sentences or the target word inside <answer>."
+    "Do not mention the example sentences or the target word in the definition."
 )
 
 
@@ -327,10 +328,9 @@ def _triplet_user(lemma: str, pos: str, anchor: str, positive: str, negative: st
 
 def _triplet_shot(lemma, pos, anchor, positive, negative, think, pos_gloss):
     """One few-shot (user, assistant) demonstration pair for the triplet mode."""
-    answer = f"<answer>\n{pos_gloss}\n</answer>"
     return [
         {"role": "user", "content": _triplet_user(lemma, pos, anchor, positive, negative)},
-        {"role": "assistant", "content": f"<think>\n{think}\n</think>{answer}"},
+        {"role": "assistant", "content": f"<think>\n{think}\n</think>\n{pos_gloss}"},
     ]
 
 

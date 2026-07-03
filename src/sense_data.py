@@ -53,10 +53,10 @@ TRIPLET_SYSTEM = (
     "positive share one sense; the negative is a different sense. Inside "
     "<think> tags, state what the word means in each usage, name the "
     "genus the anchor and positive share, and give the differentia that sets them "
-    "apart from the negative. Then, inside <answer> tags, give one concise "
+    "apart from the negative. Then, after </think>, give one concise "
     "dictionary definition — for the single sense shared by the anchor and positive — "
-    "without using the target word or the sentence to define itself. Do not define the "
-    "negative sense. Format: <think>...</think><answer>\n...\n</answer>"
+    "and nothing else, without using the target word or the sentence to define itself. "
+    "Do not define the negative sense. Format: <think>...</think>\ndefinition"
 )
 
 
@@ -238,10 +238,6 @@ def direct_messages(rec, with_target=False):
     return msgs
 
 
-def triplet_answer(rec) -> str:
-    return f"<answer>\n{rec['gloss_same']}\n</answer>"
-
-
 def triplet_think(rec) -> str:
     # Templated contrast (Phase-3 warm-start: optimise for format + gloss copy).
     # The negative gloss is named only to motivate the differentia; it is never
@@ -269,7 +265,7 @@ def triplet_messages(rec, with_target=False):
     ]
     if with_target:
         msgs.append(
-            {"role": "assistant", "content": triplet_think(rec) + triplet_answer(rec)}
+            {"role": "assistant", "content": f"{triplet_think(rec)}\n{rec['gloss_same']}"}
         )
     return msgs
 
@@ -284,17 +280,18 @@ def extract_direct_gloss(text: str) -> str:
 
 
 def extract_shared_gloss(text: str) -> str:
-    """The single gloss (sense shared by anchor and positive) from <answer>.
+    """The single gloss (sense shared by anchor and positive), after ``</think>``.
 
-    Requires a closed ``<answer>`` block, then takes its first non-empty line.
-    Tolerant of the markdown small models like to add — leading bullets/quotes
-    and a leftover ``Positive:``/``Definition:`` label — so a correct gloss isn't
-    scored 0 (and dropped from distillation) just for being decorated.
+    Same format as the direct mode: the first non-empty line after the reasoning
+    block. Tolerant of the markdown small models like to add — leading
+    bullets/quotes and a leftover ``Positive:``/``Definition:`` label — so a
+    correct gloss isn't scored 0 (and dropped from distillation) just for being
+    decorated.
     """
-    m = re.search(r"<answer>(.*?)</answer>", text, re.DOTALL)
-    if not m:
+    seg = text.split("</think>")[-1]
+    if "<think>" in seg:  # unclosed <think>: reasoning ran on, no gloss to score
         return ""
-    for line in m.group(1).splitlines():
+    for line in seg.splitlines():
         line = line.strip(" >-*_\t")
         if line:
             return re.sub(

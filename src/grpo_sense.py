@@ -104,15 +104,38 @@ def bertscore_similarity(hyps, refs):
     return out
 
 
-LENGTH_TOL = 1.5      # free allowance: up to 1.5x the gold gloss length
-LENGTH_PENALTY = -0.5  # max penalty, reached once the excess equals the allowance
+LENGTH_TOL = 1.2      # free allowance: up to 1.2x the gold gloss length
+LENGTH_PENALTY = -1.5  # floor, reached only once the gloss is ~4x the budget
+LENGTH_RAMP = 3.0      # budgets of excess the penalty ramps over before clamping
 
 
 def _length_penalty(hyp, ref):
-    """Penalise glosses longer than the gold definition; in [LENGTH_PENALTY, 0]."""
+    """Penalise glosses longer than the gold definition; in [LENGTH_PENALTY, 0].
+
+    The ramp is deliberately gentle and clamps far out (at ~4x the budget) so the
+    reward stays monotone — strictly shorter is strictly better — across the whole
+    range the model explores. A tight clamp instead flat-lines once a gloss is
+    long, and under GRPO's group normalisation a length reward with no within-group
+    variance yields no advantage, so runaway glosses stop being pushed back.
+    """
     budget = LENGTH_TOL * max(len(sd._tok(ref)), 1)
     excess = max(0, len(sd._tok(hyp)) - budget) / budget
-    return LENGTH_PENALTY * min(1.0, excess)
+    return LENGTH_PENALTY * min(1.0, excess / LENGTH_RAMP)
+
+
+def _answer_region(text):
+    """The whole definition the model emits: all text after </think>, not just the
+    first line that the gloss extractor scores. Shared by both modes, which use the
+    same `<think>...</think>\\ndefinition` format.
+
+    The model reward-hacks by keeping a short first line and then dumping a long
+    tail of repeated `definition: ...` lines; that tail is invisible to the
+    first-line extractor, so length is measured over the entire region instead.
+    """
+    seg = text.split("</think>")[-1]
+    if "<think>" in seg:  # unclosed <think>: there is no real answer region
+        return ""
+    return seg.strip()
 
 
 def reward_direct_fidelity(completions, **kwargs):
@@ -135,9 +158,13 @@ def reward_direct_min_content(completions, **kwargs):
 
 
 def reward_direct_length(completions, **kwargs):
-    """Punish glosses much longer than the gold definition."""
+    """Punish a definition region much longer than the gold definition.
+
+    Measures the full post-</think> region (not just the extracted first line) so
+    a short first line followed by a long repeated tail is still penalised.
+    """
     return [
-        _length_penalty(sd.extract_direct_gloss(c), g)
+        _length_penalty(_answer_region(c), g)
         for c, g in zip(completions, kwargs["gloss"])
     ]
 
@@ -192,9 +219,13 @@ def reward_triplet_min_content(completions, **kwargs):
 
 
 def reward_triplet_length(completions, **kwargs):
-    """Punish the gloss for running much longer than its gold definition."""
+    """Punish a definition region much longer than its gold definition.
+
+    Measures the full post-</think> region (not just the extracted first line) so
+    a short first line followed by a long repeated tail is still penalised.
+    """
     same = kwargs["gloss_same"]
-    return [_length_penalty(sd.extract_shared_gloss(c), gs)
+    return [_length_penalty(_answer_region(c), gs)
             for c, gs in zip(completions, same)]
 
 
@@ -365,7 +396,7 @@ def main():
         save_strategy="steps",
         save_steps=100,
         save_total_limit=2,
-        logging_steps=10,
+        logging_steps=100,
         log_completions=True,
         num_completions_to_print=8,
         report_to="wandb",
