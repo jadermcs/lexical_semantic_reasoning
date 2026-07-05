@@ -1,10 +1,17 @@
 """GRPO for the sense-modeling ablations, warm-started from an SFT checkpoint.
 
-  --mode direct   -> config 3: RL on single-usage definition generation
-  --mode triplet  -> config 4: RL on anchor/positive/negative contrastive glosses
+Train on any subset of tasks at once (multitask) via ``--tasks``:
 
-Verifiable reward = BERTScore semantic similarity of the generated gloss to the
-WordNet gold definition plus a small format term.
+  direct   -> config 3: RL on single-usage definition generation
+  triplet  -> config 4: RL on anchor/positive/negative contrastive glosses
+  wic      -> reason about the gloss of each of two usages, then classify the pair
+              as the same sense or a different sense (verifiable label reward)
+
+Verifiable reward for the gloss tasks = BERTScore semantic similarity of the
+generated gloss to the WordNet gold definition plus a small format term; for wic
+it is the correctness of the same/different verdict plus a reasoning term. When
+more than one task is given, each task's reward functions only score that task's
+completions (see ``_mask_by_task``).
 """
 
 import argparse
@@ -15,7 +22,7 @@ from functools import partial
 from pathlib import Path
 
 import torch
-from datasets import Dataset, DatasetDict
+from datasets import Dataset, concatenate_datasets
 from sklearn.feature_extraction.text import ENGLISH_STOP_WORDS
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from trl import GRPOConfig, GRPOTrainer
@@ -23,13 +30,21 @@ from trl import GRPOConfig, GRPOTrainer
 import sense_data as sd
 
 
+TASKS = ("direct", "triplet", "wic")
+
+# Message builder per task; format_prompt renders the prompt column from it.
+_MSG_FN = {
+    "direct": sd.direct_messages,
+    "triplet": sd.triplet_messages,
+    "wic": sd.wic_messages,
+}
+
+
 # --------------------------------------------------------------------------- #
 # Prompt formatting (keeps gold columns so reward fns can read them via kwargs)
 # --------------------------------------------------------------------------- #
-def format_prompt(rec, tokenizer, mode):
-    msgs = (sd.direct_messages if mode == "direct" else sd.triplet_messages)(
-        rec, with_target=False
-    )
+def format_prompt(rec, tokenizer, task):
+    msgs = _MSG_FN[task](rec, with_target=False)
     return {"prompt": tokenizer.apply_chat_template(msgs, tokenize=False, add_generation_prompt=True)}
 
 
@@ -238,6 +253,48 @@ def reward_think_length(completions, **kwargs):
     return _think_length_penalty(completions)
 
 
+# --------------------------------------------------------------------------- #
+# WiC (word-in-context): verifiable same/different-sense classification
+# --------------------------------------------------------------------------- #
+WIC_CORRECT = 1.0
+WIC_WRONG = -1.0
+WIC_GLOSS_WEIGHT = 0.5  # weight on "did the reasoning describe each usage's gloss?"
+
+
+def reward_wic_accuracy(completions, **kwargs):
+    """+1 for the right same/different verdict, -1 for the wrong one, 0 if absent.
+
+    This is the verifiable signal for wic: the gold label is known, so the reward
+    is exact rather than a similarity estimate.
+    """
+    out = []
+    for c, label in zip(completions, kwargs["label"]):
+        pred = sd.extract_wic_label(c)
+        if not pred:
+            out.append(0.0)
+        else:
+            out.append(WIC_CORRECT if pred == label else WIC_WRONG)
+    return out
+
+
+def reward_wic_format(completions, **kwargs):
+    """Reward a present <think> block (0.1) and an extractable verdict (0.1)."""
+    return _think_answer_format_reward(completions, sd.extract_wic_label)
+
+
+def reward_wic_gloss_reasoning(completions, **kwargs):
+    """Reward the <think> for describing each usage's gold gloss.
+
+    Pushes the model to actually reason about what the word means in each sentence
+    (the task's premise) before deciding, rather than guessing the label. Scored as
+    the mean BERTScore of the reasoning block against both gold glosses.
+    """
+    thinks = [_extract_think(c) for c in completions]
+    sim1 = bertscore_similarity(thinks, kwargs["gloss1"])
+    sim2 = bertscore_similarity(thinks, kwargs["gloss2"])
+    return [WIC_GLOSS_WEIGHT * 0.5 * (a + b) for a, b in zip(sim1, sim2)]
+
+
 REWARDS = {
     "direct": [
         reward_fidelity, reward_no_target, reward_min_content,
@@ -247,14 +304,56 @@ REWARDS = {
         reward_fidelity, reward_triplet_contrast, reward_no_target,
         reward_min_content, reward_length, reward_format, reward_think_length,
     ],
+    "wic": [
+        reward_wic_accuracy, reward_wic_format, reward_wic_gloss_reasoning,
+        reward_think_length,
+    ],
 }
 KEEP_COLS = {
     "direct": ["lemma", "gloss"],
     "triplet": ["lemma", "gloss_same", "gloss_diff"],
+    "wic": ["lemma", "label", "gloss1", "gloss2"],
 }
 # The fidelity reward already scores a completion against its gold gloss(es); the
-# trace saver reuses it to decide which generations are "successful".
-FIDELITY = {"direct": reward_fidelity, "triplet": reward_fidelity}
+# trace saver reuses it to decide which generations are "successful". For wic,
+# "successful" means the verdict is correct, so accuracy plays the fidelity role.
+FIDELITY = {
+    "direct": reward_fidelity,
+    "triplet": reward_fidelity,
+    "wic": reward_wic_accuracy,
+}
+
+
+# --------------------------------------------------------------------------- #
+# Multitask: run a task's reward fn only on that task's completions
+# --------------------------------------------------------------------------- #
+def _mask_by_task(task, fn):
+    """Wrap a reward fn so it scores only rows whose ``task`` column matches.
+
+    Under GRPO each prompt's ``num_generations`` completions form one group and
+    all share a task, so the other tasks' reward fns return all-zero for the group
+    — a constant reward yields zero advantage after group normalisation, leaving
+    training untouched. Non-matching rows carry padded ("") gold columns from the
+    schema union, so they must be filtered out before the wrapped fn reads them.
+    """
+    def wrapped(completions, **kwargs):
+        tasks = kwargs["task"]
+        idxs = [i for i, t in enumerate(tasks) if t == task]
+        out = [0.0] * len(completions)
+        if not idxs:
+            return out
+        sub_completions = [completions[i] for i in idxs]
+        sub_kwargs = {
+            k: ([v[i] for i in idxs] if isinstance(v, list) and len(v) == len(completions) else v)
+            for k, v in kwargs.items()
+        }
+        for i, s in zip(idxs, fn(sub_completions, **sub_kwargs)):
+            out[i] = s
+        return out
+
+    # GRPOTrainer logs/derives metric names from the fn name; keep them unique.
+    wrapped.__name__ = f"{task}_{getattr(fn, '__name__', 'reward')}"
+    return wrapped
 
 
 # --------------------------------------------------------------------------- #
@@ -297,19 +396,55 @@ def make_trace_saver(mode, path, threshold):
     return save_successful_traces
 
 
-def _load_or_build(mode):
+def _load_split(task, split):
+    """Load one task/split, building all datasets on first use if missing."""
     try:
-        train, dev = sd.load_split(mode, "train"), sd.load_split(mode, "dev")
+        return sd.load_split(task, split)
     except FileNotFoundError:
         sd.save_dataset(sd.build_dataset())
-        train, dev = sd.load_split(mode, "train"), sd.load_split(mode, "dev")
-    return DatasetDict({"train": Dataset.from_list(train), "dev": Dataset.from_list(dev)})
+        return sd.load_split(task, split)
+
+
+def _task_dataset(task, split, tokenizer, dev_cap=None):
+    """Rendered prompts + kept gold columns + a ``task`` tag for one task/split."""
+    recs = _load_split(task, split)
+    ds = Dataset.from_list(recs)
+    if dev_cap is not None:
+        ds = ds.shuffle(seed=42).select(range(min(dev_cap, len(ds))))
+    fmt = partial(format_prompt, tokenizer=tokenizer, task=task)
+    drop = [c for c in ds.column_names if c not in KEEP_COLS[task]]
+    ds = ds.map(fmt, remove_columns=drop)
+    return ds.add_column("task", [task] * len(ds))
+
+
+def _combine(tasks, split, tokenizer, dev_cap=None):
+    """Concatenate per-task datasets, padding each to the shared column union.
+
+    Different tasks keep different gold columns; ``concatenate_datasets`` needs a
+    single schema, so missing columns are filled with "" (all kept columns are
+    strings). ``_mask_by_task`` filters these padded rows back out per reward fn.
+    """
+    parts = [_task_dataset(t, split, tokenizer, dev_cap) for t in tasks]
+    all_cols = sorted({c for p in parts for c in p.column_names})
+    padded = []
+    for p in parts:
+        for c in all_cols:
+            if c not in p.column_names:
+                p = p.add_column(c, [""] * len(p))
+        padded.append(p.select_columns(all_cols))
+    return concatenate_datasets(padded).shuffle(seed=42)
 
 
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--model", default="Qwen/Qwen3-0.6B")
-    ap.add_argument("--mode", choices=["direct", "triplet"], required=True)
+    ap.add_argument(
+        "--tasks",
+        nargs="+",
+        choices=TASKS,
+        required=True,
+        help="One or more tasks to train on jointly, e.g. --tasks direct triplet wic.",
+    )
     ap.add_argument("--vllm-server-host", default=None)
     ap.add_argument("--vllm-server-port", type=int, default=8000)
     ap.add_argument(
@@ -321,16 +456,15 @@ def main():
     ap.add_argument("--distill-threshold", type=float, default=0.5)
     args = ap.parse_args()
 
-    dataset = _load_or_build(args.mode)
-    dataset["dev"] = dataset["dev"].shuffle(seed=42).select(range(min(200, len(dataset["dev"]))))
+    # De-duplicate while preserving order so the run name is stable.
+    tasks = list(dict.fromkeys(args.tasks))
 
     tokenizer = AutoTokenizer.from_pretrained(args.model, trust_remote_code=True)
     tokenizer.pad_token = tokenizer.eos_token
 
-    fmt = partial(format_prompt, tokenizer=tokenizer, mode=args.mode)
-    drop = [c for c in dataset["train"].column_names if c not in KEEP_COLS[args.mode]]
-    dataset = dataset.map(fmt, remove_columns=drop)
-    print(dataset["train"][0])
+    train_ds = _combine(tasks, "train", tokenizer)
+    dev_ds = _combine(tasks, "dev", tokenizer, dev_cap=200)
+    print(train_ds[0])
 
     model = AutoModelForCausalLM.from_pretrained(
         args.model, device_map="cuda", dtype=torch.bfloat16,
@@ -346,7 +480,8 @@ def main():
     else:
         vllm_kwargs = dict(use_vllm=True, vllm_max_model_length=1024)
 
-    output_dir = f"./qwen-sense-grpo-{args.mode}"
+    run_name = f"qwen-sense-grpo-{'-'.join(tasks)}"
+    output_dir = f"./{run_name}"
     training_args = GRPOConfig(
         output_dir=output_dir,
         num_generations=8,
@@ -370,15 +505,20 @@ def main():
         log_completions=True,
         num_completions_to_print=8,
         report_to="wandb",
-        run_name=f"qwen-sense-grpo-{args.mode}",
+        run_name=run_name,
         use_liger_kernel=True,
         **vllm_kwargs,
     )
-    reward_funcs = list(REWARDS[args.mode])
+
+    # Each task's reward fns (and optional trace saver) are masked to their own
+    # task so they never perturb the other tasks' groups.
+    reward_funcs = []
+    for task in tasks:
+        funcs = list(REWARDS[task])
+        if args.distill_out:
+            funcs.append(make_trace_saver(task, args.distill_out, args.distill_threshold))
+        reward_funcs.extend(_mask_by_task(task, fn) for fn in funcs)
     if args.distill_out:
-        reward_funcs.append(
-            make_trace_saver(args.mode, args.distill_out, args.distill_threshold)
-        )
         print(
             f"Self-distillation: saving completions with fidelity >= "
             f"{args.distill_threshold} to {args.distill_out}.rank*.jsonl"
@@ -389,8 +529,8 @@ def main():
         processing_class=tokenizer,
         reward_funcs=reward_funcs,
         args=training_args,
-        train_dataset=dataset["train"],
-        eval_dataset=dataset["dev"],
+        train_dataset=train_ds,
+        eval_dataset=dev_ds,
     )
 
     last = None

@@ -39,8 +39,8 @@ DATA_DIR = Path("data")
 # --------------------------------------------------------------------------- #
 DIRECT_SYSTEM = (
     "You are an expert lexicographer. You are given a sentence with one target "
-    "word marked by <t> tags. Inside <think> tags, write a brief, tight argument "
-    "(one short paragraph, no bullet lists) that reads the contextual cues and works "
+    "word marked by <t> tags. Inside <think> tags, write an argument "
+    "that reads the contextual cues and works "
     "out what the target word means here. Reason forward from the context only. Then, "
     "after </think>, give a single concise dictionary definition of the target word as "
     "used here — and nothing else. Keep it concise and never use the target word to "
@@ -51,12 +51,22 @@ TRIPLET_SYSTEM = (
     "You are an expert lexicographer. You are given three usages of one target word "
     "(marked with <t> tags) — an anchor, a positive, and a negative. The anchor and "
     "positive share one sense; the negative is a different sense. Inside "
-    "<think> tags, state what the word means in each usage, name the "
-    "genus the anchor and positive share, and give the differentia that sets them "
-    "apart from the negative. Then, after </think>, give one concise "
+    "<think> tags, state what the word means in each usage, compare what sense is shared"
+    " among the positive usages and what sets them apart from the negative. Then, "
+    "after </think>, give one concise "
     "dictionary definition — for the single sense shared by the anchor and positive — "
     "and nothing else, without using the target word or the sentence to define itself. "
     "Do not define the negative sense. Format: <think>...</think>\ndefinition"
+)
+
+WIC_SYSTEM = (
+    "You are an expert lexicographer. You are given two sentences, each using the same "
+    "target word (marked with <t> tags). Inside <think> tags, work out what the target "
+    "word means in each sentence — state the sense (a short gloss) of each usage from "
+    "its context — then compare the two senses. Then, after </think>, answer with "
+    "exactly one word: 'same' if the target word carries the same sense in both "
+    "sentences, or 'different' if it does not — and nothing else. "
+    "Format: <think>...</think>\nsame|different"
 )
 
 
@@ -150,7 +160,7 @@ def build_dataset(lexicon="oewn:2024", max_per_lemma=4, seed=42):
     train_l, dev_l, test_l = _split_lemmas([lem for lem, _ in pool], rng)
     which = {"train": train_l, "dev": dev_l, "test": test_l}
 
-    out = {s: {"direct": [], "triplet": []} for s in which}
+    out = {s: {"direct": [], "triplet": [], "wic": []} for s in which}
     for (lemma, pos), by_syn in pool.items():
         split = next(s for s, ls in which.items() if lemma in ls)
 
@@ -165,6 +175,41 @@ def build_dataset(lexicon="oewn:2024", max_per_lemma=4, seed=42):
                     "synset": syn.id,
                     "usage": mark_target(ex, lemma),
                     "gloss": syn.definition(),
+                }
+            )
+
+        # --- wic: do two usages carry the same sense? (balanced same/different) ---
+        # same-sense pairs come from one synset with >=2 usages; different-sense
+        # pairs pick one usage from each of two distinct synsets of this lemma.
+        same_pairs, diff_pairs = [], []
+        for pairs in by_syn.values():
+            if len(pairs) >= 2:
+                (s1, u1), (s2, u2) = rng.sample(pairs, 2)
+                same_pairs.append((s1, u1, s2, u2))
+        sids = list(by_syn.keys())
+        for i in range(len(sids)):
+            for j in range(i + 1, len(sids)):
+                s1, u1 = rng.choice(by_syn[sids[i]])
+                s2, u2 = rng.choice(by_syn[sids[j]])
+                diff_pairs.append((s1, u1, s2, u2))
+        rng.shuffle(same_pairs)
+        rng.shuffle(diff_pairs)
+        n_same = min(len(same_pairs), (max_per_lemma + 1) // 2)
+        n_diff = min(len(diff_pairs), max_per_lemma - n_same)
+        n_same = min(len(same_pairs), max_per_lemma - n_diff)  # backfill if diff short
+        chosen = [(p, "same") for p in same_pairs[:n_same]] + [
+            (p, "different") for p in diff_pairs[:n_diff]
+        ]
+        for (s1, u1, s2, u2), label in chosen:
+            out[split]["wic"].append(
+                {
+                    "lemma": lemma,
+                    "pos": pos,
+                    "label": label,
+                    "usage1": mark_target(u1, lemma),
+                    "usage2": mark_target(u2, lemma),
+                    "gloss1": s1.definition(),
+                    "gloss2": s2.definition(),
                 }
             )
 
@@ -201,6 +246,7 @@ def build_dataset(lexicon="oewn:2024", max_per_lemma=4, seed=42):
     for s in out:
         rng.shuffle(out[s]["direct"])
         rng.shuffle(out[s]["triplet"])
+        rng.shuffle(out[s]["wic"])
     return out
 
 
@@ -268,6 +314,53 @@ def triplet_messages(rec, with_target=False):
             {"role": "assistant", "content": f"{triplet_think(rec)}\n{rec['gloss_same']}"}
         )
     return msgs
+
+
+def wic_think(rec) -> str:
+    # Templated reasoning (Phase-3 warm-start): name each usage's gloss, then judge.
+    verdict = (
+        "Both usages carry the same sense."
+        if rec["label"] == "same"
+        else "These are two different senses."
+    )
+    return (
+        f"<think>\nIn the first usage, {rec['lemma']} means: {rec['gloss1']}. "
+        f"In the second usage, {rec['lemma']} means: {rec['gloss2']}. "
+        f"{verdict}\n</think>"
+    )
+
+
+def wic_messages(rec, with_target=False):
+    user = (
+        f"Target word: {rec['lemma']} ({rec['pos']})\n\n"
+        f"Sentence 1: {rec['usage1']}\n"
+        f"Sentence 2: {rec['usage2']}\n\n"
+        "Do both sentences use the target word in the same sense? "
+        "Answer 'same' or 'different'."
+    )
+    msgs = [
+        {"role": "system", "content": WIC_SYSTEM},
+        {"role": "user", "content": user},
+    ]
+    if with_target:
+        msgs.append(
+            {"role": "assistant", "content": f"{wic_think(rec)}\n{rec['label']}"}
+        )
+    return msgs
+
+
+def extract_wic_label(text: str) -> str:
+    """Return 'same' or 'different' from the answer region, or '' if unclear.
+
+    Reads the first same/different token after ``</think>`` (case-insensitive). An
+    unclosed <think> means the reasoning ran past the budget with no verdict, so
+    there is nothing to score.
+    """
+    seg = text.split("</think>")[-1]
+    if "<think>" in seg:  # unclosed <think>: reasoning ran on, no verdict
+        return ""
+    m = re.search(r"\b(same|different)\b", seg, flags=re.IGNORECASE)
+    return m.group(1).lower() if m else ""
 
 
 def extract_direct_gloss(text: str) -> str:
@@ -393,12 +486,15 @@ def main():
     # report stats + verify lemma-disjointness
     lemma_sets = {}
     for split, modes in data.items():
-        n_d, n_t = len(modes["direct"]), len(modes["triplet"])
-        lemmas = {r["lemma"] for r in modes["direct"]} | {
-            r["lemma"] for r in modes["triplet"]
+        n_d, n_t, n_w = len(modes["direct"]), len(modes["triplet"]), len(modes["wic"])
+        lemmas = {
+            r["lemma"] for recs in modes.values() for r in recs
         }
         lemma_sets[split] = lemmas
-        print(f"{split:5s}  direct={n_d:6d}  triplet={n_t:6d}  lemmas={len(lemmas)}")
+        print(
+            f"{split:5s}  direct={n_d:6d}  triplet={n_t:6d}  wic={n_w:6d}  "
+            f"lemmas={len(lemmas)}"
+        )
     a, b, c = lemma_sets.values()
     print(
         "lemma overlap across splits:",
