@@ -97,8 +97,7 @@ TRIPLET_SYSTEM = (
 WIC_SYSTEM = (
     "You are an expert lexicographer. You are given two sentences, each using the same "
     "target word (marked with <t> tags). Inside <think> tags, work out what the target "
-    "word means in each sentence — state the sense (a short gloss) of each usage from "
-    "its context — then compare the two senses. Then, after </think>, answer with "
+    "word means in each sentence then compare the two senses. Then, after </think>, answer with "
     "exactly one word: 'same' if the target word carries the same sense in both "
     "sentences, or 'different' if it does not — and nothing else. "
     "Format: <think>...</think>\nsame|different"
@@ -204,23 +203,38 @@ def build_dataset(lexicon="oewn:2024", max_per_lemma=4, seed=42):
     train_l, dev_l, test_l = _split_lemmas([lem for lem, _ in pool], rng)
     which = {"train": train_l, "dev": dev_l, "test": test_l}
 
-    out = {s: {"direct": [], "triplet": [], "wic": []} for s in which}
+    out = {s: {"direct": [], "triplet": [], "wic": [], "supersense": []} for s in which}
     for (lemma, pos), by_syn in pool.items():
         split = next(s for s, ls in which.items() if lemma in ls)
 
-        # --- direct: one record per usage ---
+        # --- direct: one record per usage (supersense reuses the same usages) ---
         usages = [(s, ex) for pairs in by_syn.values() for (s, ex) in pairs]
         rng.shuffle(usages)
         for syn, ex in usages[:max_per_lemma]:
+            marked = mark_target(ex, lemma)
             out[split]["direct"].append(
                 {
                     "lemma": lemma,
                     "pos": pos,
                     "synset": syn.id,
-                    "usage": mark_target(ex, lemma),
+                    "usage": marked,
                     "gloss": syn.definition(),
                 }
             )
+            # --- supersense: classify the sense's WordNet lexicographer file ---
+            # (nouns/verbs only; the label is the suffix, e.g. "animal").
+            lexfile = syn.lexfile()
+            if pos in SUPERSENSES and lexfile:
+                out[split]["supersense"].append(
+                    {
+                        "lemma": lemma,
+                        "pos": pos,
+                        "synset": syn.id,
+                        "usage": marked,
+                        "gloss": syn.definition(),
+                        "supersense": lexfile.split(".", 1)[1],
+                    }
+                )
 
         # --- wic: do two usages carry the same sense? (balanced same/different) ---
         # same-sense pairs come from one synset with >=2 usages; different-sense
@@ -290,6 +304,7 @@ def build_dataset(lexicon="oewn:2024", max_per_lemma=4, seed=42):
     for s in out:
         rng.shuffle(out[s]["direct"])
         rng.shuffle(out[s]["triplet"])
+        rng.shuffle(out[s]["supersense"])
         out[s]["wic"] = _balance_wic(out[s]["wic"], rng)
     return out
 
@@ -452,6 +467,50 @@ def extract_wic_label(text: str) -> str:
     return m.group(1).lower() if m else ""
 
 
+def supersense_think(rec) -> str:
+    # Templated reasoning (Phase-3 warm-start): name the gloss, then the category.
+    return (
+        f"<think>\nIn this usage, {rec['lemma']} means: {rec['gloss']}. "
+        f"That sense belongs to the '{rec['supersense']}' category.\n</think>"
+    )
+
+
+def supersense_messages(rec, with_target=False):
+    cands = ", ".join(SUPERSENSES[rec["pos"]])
+    user = (
+        f"Word: {rec['lemma']} ({rec['pos']})\n"
+        f"Sentence: {rec['usage']}\n"
+        f"Categories: {cands}\n"
+        "Which category is the target word's sense? Answer with one category name."
+    )
+    msgs = [
+        {"role": "system", "content": SUPERSENSE_SYSTEM},
+        {"role": "user", "content": user},
+    ]
+    if with_target:
+        msgs.append(
+            {"role": "assistant", "content": f"{supersense_think(rec)}\n{rec['supersense']}"}
+        )
+    return msgs
+
+
+def extract_supersense(text: str, pos: str) -> str:
+    """Return the predicted supersense suffix from the answer region, or '' if none.
+
+    POS-aware: only the candidate categories for ``pos`` are matched, so a suffix
+    that names two POS's categories (e.g. "body", "cognition") is resolved against
+    the record's own POS, and the canonical label ("Tops") is recovered.
+    """
+    seg = text.split("</think>")[-1]
+    if "<think>" in seg:  # unclosed <think>: reasoning ran on, no answer to score
+        return ""
+    rex = _SUPERSENSE_RE.get(pos)
+    if rex is None:
+        return ""
+    m = rex.search(seg)
+    return _SUPERSENSE_CANON[pos][m.group(0).lower()] if m else ""
+
+
 def extract_direct_gloss(text: str) -> str:
     text = text.split("</think>")[-1]
     # An unclosed <think> (reasoning ran past the length budget) leaves no gloss;
@@ -576,13 +635,14 @@ def main():
     lemma_sets = {}
     for split, modes in data.items():
         n_d, n_t, n_w = len(modes["direct"]), len(modes["triplet"]), len(modes["wic"])
+        n_s = len(modes["supersense"])
         lemmas = {
             r["lemma"] for recs in modes.values() for r in recs
         }
         lemma_sets[split] = lemmas
         print(
             f"{split:5s}  direct={n_d:6d}  triplet={n_t:6d}  wic={n_w:6d}  "
-            f"lemmas={len(lemmas)}"
+            f"supersense={n_s:6d}  lemmas={len(lemmas)}"
         )
     a, b, c = lemma_sets.values()
     print(

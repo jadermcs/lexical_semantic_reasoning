@@ -30,13 +30,14 @@ from trl import GRPOConfig, GRPOTrainer
 import sense_data as sd
 
 
-TASKS = ("direct", "triplet", "wic")
+TASKS = ("direct", "triplet", "wic", "supersense")
 
 # Message builder per task; format_prompt renders the prompt column from it.
 _MSG_FN = {
     "direct": sd.direct_messages,
     "triplet": sd.triplet_messages,
     "wic": sd.wic_messages,
+    "supersense": sd.supersense_messages,
 }
 
 
@@ -281,6 +282,46 @@ def reward_wic_format(completions, **kwargs):
     return _think_answer_format_reward(completions, sd.extract_wic_label)
 
 
+# --------------------------------------------------------------------------- #
+# Supersense: verifiable WordNet lexicographer-file classification
+# --------------------------------------------------------------------------- #
+SUPERSENSE_CORRECT = 1.0
+SUPERSENSE_WRONG = -1.0
+
+
+def reward_supersense_accuracy(completions, **kwargs):
+    """+1 for the right supersense, -1 for a wrong one, 0 if none is emitted.
+
+    Verifiable signal: the gold lexicographer file is known, so the reward is
+    exact. Extraction is POS-aware (see ``sd.extract_supersense``).
+    """
+    out = []
+    for c, label, pos in zip(completions, kwargs["supersense"], kwargs["pos"]):
+        pred = sd.extract_supersense(c, pos)
+        if not pred:
+            out.append(0.0)
+        else:
+            out.append(SUPERSENSE_CORRECT if pred == label else SUPERSENSE_WRONG)
+    return out
+
+
+def reward_supersense_format(completions, **kwargs):
+    """Reward a present <think> block (0.1) and an extractable category (0.1).
+
+    Unlike the other format rewards, the extractor is POS-aware, so it cannot use
+    the shared ``_think_answer_format_reward`` (which passes a single-arg extractor).
+    """
+    out = []
+    for c, pos in zip(completions, kwargs["pos"]):
+        r = 0.0
+        if re.search(r"<think>.+?</think>", c, re.DOTALL):
+            r += 0.1
+        if sd.extract_supersense(c, pos):
+            r += 0.1
+        out.append(r)
+    return out
+
+
 REWARDS = {
     "direct": [
         reward_fidelity, reward_no_target, reward_min_content,
@@ -293,20 +334,27 @@ REWARDS = {
     "wic": [
         reward_wic_accuracy, reward_wic_format, reward_think_length,
     ],
+    "supersense": [
+        reward_supersense_accuracy, reward_supersense_format, reward_think_length,
+    ],
 }
 KEEP_COLS = {
     "direct": ["lemma", "gloss"],
     "triplet": ["lemma", "gloss_same", "gloss_diff"],
     # MCL-WiC carries no glosses; only the verifiable same/different label is scored.
     "wic": ["lemma", "label"],
+    # pos selects the candidate label space for extraction; supersense is the gold label.
+    "supersense": ["lemma", "pos", "supersense"],
 }
 # The fidelity reward already scores a completion against its gold gloss(es); the
-# trace saver reuses it to decide which generations are "successful". For wic,
-# "successful" means the verdict is correct, so accuracy plays the fidelity role.
+# trace saver reuses it to decide which generations are "successful". For wic and
+# supersense, "successful" means the verifiable label is correct, so accuracy plays
+# the fidelity role.
 FIDELITY = {
     "direct": reward_fidelity,
     "triplet": reward_fidelity,
     "wic": reward_wic_accuracy,
+    "supersense": reward_supersense_accuracy,
 }
 
 
