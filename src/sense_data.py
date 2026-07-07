@@ -32,6 +32,41 @@ from rapidfuzz import fuzz, process
 
 POS_MAP = {"n": "noun", "v": "verb", "a": "adjective", "s": "adjective", "r": "adverb"}
 
+# WordNet lexicographer files ("supersenses") for the ``supersense`` task, grouped
+# by POS. A usage's gold label is its synset's ``lexfile()``. Only nouns and verbs
+# are covered — the adjective/adverb lexfiles are syntactic (all/pert/ppl, all),
+# not semantic categories. Because the POS is given, the task and prompt use the
+# *suffix* only (e.g. "animal" for "noun.animal"), which keeps the candidate list
+# short, and constraining candidates to the record's POS keeps the classification
+# tractable (26 noun / 15 verb classes).
+SUPERSENSES = {
+    "noun": [
+        "Tops", "act", "animal", "artifact", "attribute", "body", "cognition",
+        "communication", "event", "feeling", "food", "group", "location",
+        "motive", "object", "person", "phenomenon", "plant", "possession",
+        "process", "quantity", "relation", "shape", "state", "substance", "time",
+    ],
+    "verb": [
+        "body", "change", "cognition", "communication", "competition",
+        "consumption", "contact", "creation", "emotion", "motion", "perception",
+        "possession", "social", "stative", "weather",
+    ],
+}
+# Per-POS extraction helpers: a case-insensitive regex over that POS's suffixes
+# (longest-first so e.g. "communication" wins over any prefix), plus a
+# lower-cased -> canonical map to recover the exact label ("Tops").
+_SUPERSENSE_CANON = {
+    pos: {c.lower(): c for c in cands} for pos, cands in SUPERSENSES.items()
+}
+_SUPERSENSE_RE = {
+    pos: re.compile(
+        r"(?i)\b(?:"
+        + "|".join(re.escape(c) for c in sorted(cands, key=len, reverse=True))
+        + r")\b"
+    )
+    for pos, cands in SUPERSENSES.items()
+}
+
 DATA_DIR = Path("data")
 
 # --------------------------------------------------------------------------- #
@@ -67,6 +102,15 @@ WIC_SYSTEM = (
     "exactly one word: 'same' if the target word carries the same sense in both "
     "sentences, or 'different' if it does not — and nothing else. "
     "Format: <think>...</think>\nsame|different"
+)
+
+SUPERSENSE_SYSTEM = (
+    "You are an expert lexicographer. You are given a sentence with one target word "
+    "marked by <t> tags, and a list of candidate WordNet semantic categories "
+    "(supersenses). Inside <think> tags, work out what the target word means here from "
+    "the context, then decide which category that sense best fits. Then, after "
+    "</think>, answer with exactly one category name from the list — and nothing else. "
+    "Format: <think>...</think>\ncategory"
 )
 
 
