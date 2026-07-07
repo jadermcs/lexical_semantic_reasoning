@@ -38,10 +38,16 @@ POS_MAP = {"n": "noun", "v": "verb", "a": "adjective", "s": "adjective", "r": "a
 # not semantic categories. Because the POS is given, the task and prompt use the
 # *suffix* only (e.g. "animal" for "noun.animal"), which keeps the candidate list
 # short, and constraining candidates to the record's POS keeps the classification
-# tractable (26 noun / 15 verb classes).
+# tractable (25 noun / 15 verb classes).
+#
+# ``noun.Tops`` is deliberately excluded: it is not a semantic category but the
+# taxonomy's unique beginners (entity, whole, life, process, state…), so as a
+# prompt label it carries no meaning to reason toward and its glosses overlap the
+# real categories it sits above (e.g. "state"/"process" are also supersenses).
+# Synsets filed under it are dropped from the task (see ``build_dataset``).
 SUPERSENSES = {
     "noun": [
-        "Tops", "act", "animal", "artifact", "attribute", "body", "cognition",
+        "act", "animal", "artifact", "attribute", "body", "cognition",
         "communication", "event", "feeling", "food", "group", "location",
         "motive", "object", "person", "phenomenon", "plant", "possession",
         "process", "quantity", "relation", "shape", "state", "substance", "time",
@@ -54,7 +60,8 @@ SUPERSENSES = {
 }
 # Per-POS extraction helpers: a case-insensitive regex over that POS's suffixes
 # (longest-first so e.g. "communication" wins over any prefix), plus a
-# lower-cased -> canonical map to recover the exact label ("Tops").
+# lower-cased -> canonical map. The remaining labels are all lowercase, so the
+# map is an identity pass today; it stays to normalise casing robustly.
 _SUPERSENSE_CANON = {
     pos: {c.lower(): c for c in cands} for pos, cands in SUPERSENSES.items()
 }
@@ -222,9 +229,12 @@ def build_dataset(lexicon="oewn:2024", max_per_lemma=4, seed=42):
                 }
             )
             # --- supersense: classify the sense's WordNet lexicographer file ---
-            # (nouns/verbs only; the label is the suffix, e.g. "animal").
+            # (nouns/verbs only; the label is the suffix, e.g. "animal"). Skip
+            # suffixes not in the candidate list (noun.Tops) so every gold label
+            # is one the prompt actually offers.
             lexfile = syn.lexfile()
-            if pos in SUPERSENSES and lexfile:
+            suffix = lexfile.split(".", 1)[1] if lexfile else None
+            if pos in SUPERSENSES and suffix in _SUPERSENSE_CANON[pos]:
                 out[split]["supersense"].append(
                     {
                         "lemma": lemma,
@@ -232,7 +242,7 @@ def build_dataset(lexicon="oewn:2024", max_per_lemma=4, seed=42):
                         "synset": syn.id,
                         "usage": marked,
                         "gloss": syn.definition(),
-                        "supersense": lexfile.split(".", 1)[1],
+                        "supersense": suffix,
                     }
                 )
 
@@ -499,7 +509,7 @@ def extract_supersense(text: str, pos: str) -> str:
 
     POS-aware: only the candidate categories for ``pos`` are matched, so a suffix
     that names two POS's categories (e.g. "body", "cognition") is resolved against
-    the record's own POS, and the canonical label ("Tops") is recovered.
+    the record's own POS, and the match is normalised to its canonical casing.
     """
     seg = text.split("</think>")[-1]
     if "<think>" in seg:  # unclosed <think>: reasoning ran on, no answer to score

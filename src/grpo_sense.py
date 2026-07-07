@@ -287,21 +287,80 @@ def reward_wic_format(completions, **kwargs):
 # --------------------------------------------------------------------------- #
 SUPERSENSE_CORRECT = 1.0
 SUPERSENSE_WRONG = -1.0
+# Soft credit for an off-vocabulary answer, mapped to its nearest candidate.
+# Kept below |1| so an exact candidate is always the higher-reward move (when
+# right) and the riskier one (when wrong) — no incentive to hedge with OOV text.
+# Also kept below the default --distill-threshold (0.5) so soft (mis-formatted)
+# hits never leak into the self-distillation set; only exact answers do.
+SUPERSENSE_SOFT_CORRECT = 0.4
+SUPERSENSE_SOFT_WRONG = -0.4
+
+
+# Sentence-embedding nearest-candidate mapping for the soft tier. Lives here (not
+# in sense_data, which stays torch-free) and loads on CPU to avoid competing with
+# the policy/vLLM for VRAM — it only ever encodes a handful of short strings.
+_ENCODER = None
+_CAND_EMB = {}
+
+
+def _get_encoder():
+    global _ENCODER
+    if _ENCODER is None:
+        from sentence_transformers import SentenceTransformer
+
+        _ENCODER = SentenceTransformer("all-MiniLM-L6-v2", device="cpu")
+    return _ENCODER
+
+
+def _candidate_embeddings(pos):
+    """Normalized embeddings of ``pos``'s candidate names, computed once."""
+    if pos not in _CAND_EMB:
+        cands = sd.SUPERSENSES[pos]
+        emb = _get_encoder().encode(
+            cands, convert_to_tensor=True, normalize_embeddings=True
+        )
+        _CAND_EMB[pos] = (cands, emb)
+    return _CAND_EMB[pos]
+
+
+def _nearest_candidates(regions, poss):
+    """The semantically nearest candidate name for each (answer region, pos)."""
+    q = _get_encoder().encode(regions, convert_to_tensor=True, normalize_embeddings=True)
+    out = []
+    for i, pos in enumerate(poss):
+        cands, emb = _candidate_embeddings(pos)
+        out.append(cands[int((emb @ q[i]).argmax())])  # cosine: both normalized
+    return out
 
 
 def reward_supersense_accuracy(completions, **kwargs):
-    """+1 for the right supersense, -1 for a wrong one, 0 if none is emitted.
+    """Graded reward over the closed candidate set.
 
-    Verifiable signal: the gold lexicographer file is known, so the reward is
-    exact. Extraction is POS-aware (see ``sd.extract_supersense``).
+    An exact candidate scores +1/-1 as before (verifiable: the gold lexicographer
+    file is known). An answer that names no candidate but still says something
+    ("biological growth" for gold "change") is mapped to its nearest candidate by
+    sentence-embedding similarity and given the smaller +/-0.4; a blank or
+    unclosed <think> stays 0.
+
+    The soft tier matters under GRPO: when no completion in a group emits an exact
+    label, an all-zero group has no advantage and teaches nothing, so the policy
+    is never pulled from its free-form paraphrase toward the exact label word.
     """
-    out = []
-    for c, label, pos in zip(completions, kwargs["supersense"], kwargs["pos"]):
+    labels, poss = kwargs["supersense"], kwargs["pos"]
+    out = [0.0] * len(completions)
+    soft_idx, soft_regions, soft_pos = [], [], []
+    for i, (c, label, pos) in enumerate(zip(completions, labels, poss)):
         pred = sd.extract_supersense(c, pos)
-        if not pred:
-            out.append(0.0)
-        else:
-            out.append(SUPERSENSE_CORRECT if pred == label else SUPERSENSE_WRONG)
+        if pred:
+            out[i] = SUPERSENSE_CORRECT if pred == label else SUPERSENSE_WRONG
+        elif _answer_region(c):  # said something, but no exact candidate in it
+            soft_idx.append(i)
+            soft_regions.append(_answer_region(c))
+            soft_pos.append(pos)
+        # else: blank / unclosed -> stays 0.0
+    if soft_idx:
+        for i, near in zip(soft_idx, _nearest_candidates(soft_regions, soft_pos)):
+            out[i] = SUPERSENSE_SOFT_CORRECT if near == labels[i] else SUPERSENSE_SOFT_WRONG
     return out
 
 
