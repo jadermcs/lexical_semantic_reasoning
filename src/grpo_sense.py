@@ -299,6 +299,58 @@ SUPERSENSE_SOFT_WRONG = -0.4
 # Sentence-embedding nearest-candidate mapping for the soft tier. Lives here (not
 # in sense_data, which stays torch-free) and loads on CPU to avoid competing with
 # the policy/vLLM for VRAM — it only ever encodes a handful of short strings.
+#
+# The candidate *names* alone ("change", "creation") embed too abstractly to
+# place an off-vocab paraphrase near the right one, so each is anchored by its
+# standard WordNet lexicographer-file description (e.g. "biological growth" then
+# lands on "change" rather than "creation"). The returned label is still the bare
+# suffix; only the embedding text is enriched.
+_SUPERSENSE_DESC = {
+    "noun": {
+        "act": "nouns denoting acts or actions",
+        "animal": "nouns denoting animals",
+        "artifact": "nouns denoting man-made objects",
+        "attribute": "nouns denoting attributes of people and objects",
+        "body": "nouns denoting body parts",
+        "cognition": "nouns denoting cognitive processes and contents",
+        "communication": "nouns denoting communicative processes and contents",
+        "event": "nouns denoting natural events",
+        "feeling": "nouns denoting feelings and emotions",
+        "food": "nouns denoting foods and drinks",
+        "group": "nouns denoting groupings of people or objects",
+        "location": "nouns denoting spatial position",
+        "motive": "nouns denoting goals",
+        "object": "nouns denoting natural objects (not man-made)",
+        "person": "nouns denoting people",
+        "phenomenon": "nouns denoting natural phenomena",
+        "plant": "nouns denoting plants",
+        "possession": "nouns denoting possession and transfer of possession",
+        "process": "nouns denoting natural processes",
+        "quantity": "nouns denoting quantities and units of measure",
+        "relation": "nouns denoting relations between people or things or ideas",
+        "shape": "nouns denoting two and three dimensional shapes",
+        "state": "nouns denoting stable states of affairs",
+        "substance": "nouns denoting substances",
+        "time": "nouns denoting time and temporal relations",
+    },
+    "verb": {
+        "body": "verbs of grooming, dressing and bodily care",
+        "change": "verbs of size, temperature change, intensifying",
+        "cognition": "verbs of thinking, judging, analyzing, doubting",
+        "communication": "verbs of telling, asking, ordering, singing",
+        "competition": "verbs of fighting, athletic activities",
+        "consumption": "verbs of eating and drinking",
+        "contact": "verbs of touching, hitting, tying, digging",
+        "creation": "verbs of sewing, baking, painting, performing",
+        "emotion": "verbs of feeling",
+        "motion": "verbs of walking, flying, swimming",
+        "perception": "verbs of seeing, hearing, feeling",
+        "possession": "verbs of buying, selling, owning",
+        "social": "verbs of political and social activities and events",
+        "stative": "verbs of being, having, spatial relations",
+        "weather": "verbs of raining, snowing, thawing, thundering",
+    },
+}
 _ENCODER = None
 _CAND_EMB = {}
 
@@ -313,11 +365,12 @@ def _get_encoder():
 
 
 def _candidate_embeddings(pos):
-    """Normalized embeddings of ``pos``'s candidate names, computed once."""
+    """Normalized embeddings of ``pos``'s candidates (via description), once."""
     if pos not in _CAND_EMB:
         cands = sd.SUPERSENSES[pos]
+        texts = [_SUPERSENSE_DESC[pos][c] for c in cands]
         emb = _get_encoder().encode(
-            cands, convert_to_tensor=True, normalize_embeddings=True
+            texts, convert_to_tensor=True, normalize_embeddings=True
         )
         _CAND_EMB[pos] = (cands, emb)
     return _CAND_EMB[pos]
