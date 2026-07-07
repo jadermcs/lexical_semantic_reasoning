@@ -246,8 +246,29 @@ def build_dataset(lexicon="oewn:2024", max_per_lemma=4, seed=42):
     for s in out:
         rng.shuffle(out[s]["direct"])
         rng.shuffle(out[s]["triplet"])
-        rng.shuffle(out[s]["wic"])
+        out[s]["wic"] = _balance_wic(out[s]["wic"], rng)
     return out
+
+
+def _balance_wic(recs: list[dict], rng: random.Random) -> list[dict]:
+    """Downsample the majority label so 'same'/'different' are equal in size.
+
+    The generator yields far more different-sense pairs than same-sense ones — any
+    two synsets form a different pair, but a same pair needs a single synset with
+    >=2 usages — leaving the raw set ~69% 'different'. With that prior a model can
+    score well on the wic accuracy reward by leaning on the majority class and
+    ignoring the sentences, so the reward stops reflecting real sense
+    discrimination. Equalising the classes removes that shortcut. Shuffle first so
+    the truncation isn't biased toward whichever lemmas were emitted earliest.
+    """
+    rng.shuffle(recs)
+    by: dict[str, list[dict]] = {"same": [], "different": []}
+    for r in recs:
+        by[r["label"]].append(r)
+    n = min(len(by["same"]), len(by["different"]))
+    balanced = by["same"][:n] + by["different"][:n]
+    rng.shuffle(balanced)
+    return balanced
 
 
 def save_dataset(data, data_dir: Path = DATA_DIR):
@@ -261,6 +282,30 @@ def save_dataset(data, data_dir: Path = DATA_DIR):
 
 def load_split(mode: str, split: str, data_dir: Path = DATA_DIR) -> list[dict]:
     return json.loads((data_dir / f"sense_{mode}.{split}.json").read_text())
+
+
+def load_mclwic(split: str, data_dir: Path = DATA_DIR) -> list[dict]:
+    """Load the MCL-WiC benchmark split as internal wic records.
+
+    MCL-WiC is a gold word-in-context dataset: two sentences, the target word's
+    surface form in each, and a same/different label (1 = same sense, 0 =
+    different, per the WiC True/False convention). Unlike the WordNet-built
+    ``sense_wic`` pairs it carries no glosses, so only the verifiable same/different
+    verdict can be scored — there is no gold gloss to reward the reasoning against.
+    The two sentences aren't pre-tagged, so the surface form (``word1``/``word2``)
+    is wrapped with <t> tags here to match the ``wic_messages`` prompt format.
+    """
+    raw = json.loads((data_dir / f"mcl-wic.{split}.json").read_text())
+    return [
+        {
+            "lemma": r["lemma"],
+            "pos": r["pos"],
+            "label": "same" if r["label"] == 1 else "different",
+            "usage1": mark_target(r["sentence1"], r["word1"]),
+            "usage2": mark_target(r["sentence2"], r["word2"]),
+        }
+        for r in raw
+    ]
 
 
 # --------------------------------------------------------------------------- #

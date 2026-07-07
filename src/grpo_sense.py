@@ -258,7 +258,6 @@ def reward_think_length(completions, **kwargs):
 # --------------------------------------------------------------------------- #
 WIC_CORRECT = 1.0
 WIC_WRONG = -1.0
-WIC_GLOSS_WEIGHT = 0.5  # weight on "did the reasoning describe each usage's gloss?"
 
 
 def reward_wic_accuracy(completions, **kwargs):
@@ -282,19 +281,6 @@ def reward_wic_format(completions, **kwargs):
     return _think_answer_format_reward(completions, sd.extract_wic_label)
 
 
-def reward_wic_gloss_reasoning(completions, **kwargs):
-    """Reward the <think> for describing each usage's gold gloss.
-
-    Pushes the model to actually reason about what the word means in each sentence
-    (the task's premise) before deciding, rather than guessing the label. Scored as
-    the mean BERTScore of the reasoning block against both gold glosses.
-    """
-    thinks = [_extract_think(c) for c in completions]
-    sim1 = bertscore_similarity(thinks, kwargs["gloss1"])
-    sim2 = bertscore_similarity(thinks, kwargs["gloss2"])
-    return [WIC_GLOSS_WEIGHT * 0.5 * (a + b) for a, b in zip(sim1, sim2)]
-
-
 REWARDS = {
     "direct": [
         reward_fidelity, reward_no_target, reward_min_content,
@@ -305,14 +291,14 @@ REWARDS = {
         reward_min_content, reward_length, reward_format, reward_think_length,
     ],
     "wic": [
-        reward_wic_accuracy, reward_wic_format, reward_wic_gloss_reasoning,
-        reward_think_length,
+        reward_wic_accuracy, reward_wic_format, reward_think_length,
     ],
 }
 KEEP_COLS = {
     "direct": ["lemma", "gloss"],
     "triplet": ["lemma", "gloss_same", "gloss_diff"],
-    "wic": ["lemma", "label", "gloss1", "gloss2"],
+    # MCL-WiC carries no glosses; only the verifiable same/different label is scored.
+    "wic": ["lemma", "label"],
 }
 # The fidelity reward already scores a completion against its gold gloss(es); the
 # trace saver reuses it to decide which generations are "successful". For wic,
@@ -397,7 +383,14 @@ def make_trace_saver(mode, path, threshold):
 
 
 def _load_split(task, split):
-    """Load one task/split, building all datasets on first use if missing."""
+    """Load one task/split, building all datasets on first use if missing.
+
+    ``wic`` trains on the gold MCL-WiC benchmark (verifiable same/different label,
+    no glosses); the WordNet-built ``direct``/``triplet`` splits are generated on
+    first use if absent.
+    """
+    if task == "wic":
+        return sd.load_mclwic(split)
     try:
         return sd.load_split(task, split)
     except FileNotFoundError:
