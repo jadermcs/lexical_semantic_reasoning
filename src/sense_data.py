@@ -377,6 +377,62 @@ def load_mclwic(split: str, data_dir: Path = DATA_DIR) -> list[dict]:
     ]
 
 
+def _wic_glm_reasoning(rec: dict) -> str:
+    """The teacher trace whose own sampled vote matches the majority prediction.
+
+    ``call_api.py`` records one reasoning per self-consistency sample alongside its
+    JSON answer. Picking the trace that voted with the majority keeps the distilled
+    <think> block consistent with the verdict we train toward. Returns '' if none
+    matches (or the reasoning is empty).
+    """
+    pred = bool(rec["prediction"])
+    for ans, rea in zip(rec.get("answers", []), rec.get("reasonings", [])):
+        try:
+            same = bool(json.loads(ans)["same_sense"])
+        except (json.JSONDecodeError, KeyError, TypeError):
+            continue
+        if same == pred and rea and rea.strip():
+            return rea.strip()
+    return ""
+
+
+def load_wic_glm(path: str | Path) -> list[dict]:
+    """Load GLM-5.2 WiC predictions (from ``call_api.py``) as wic SFT records.
+
+    Distillation source: each record carries the teacher's chain-of-thought
+    (``reasonings``) and a self-consistency vote (``prediction``). Only pairs the
+    teacher got right (vote == gold ``label``) are kept, so no confidently-wrong
+    reasoning is distilled; the verdict trained toward is the gold label and the
+    picked trace is the sample whose own vote agrees with it (see
+    ``_wic_glm_reasoning``). The picked reasoning already carries the <t> tags GLM
+    was shown, and the prompt sentences are re-marked from the lemma (the raw file
+    drops the surface forms). The trace becomes the ``think`` field consumed by
+    ``wic_think``. Records with an errored/absent prediction or no usable trace are
+    skipped.
+    """
+    raw = json.loads(Path(path).read_text())
+    out = []
+    for r in raw:
+        if r.get("prediction") is None or r.get("label") is None:
+            continue
+        if bool(r["prediction"]) != bool(r["label"]):  # teacher-correct only
+            continue
+        think = _wic_glm_reasoning(r)
+        if not think:
+            continue
+        out.append(
+            {
+                "lemma": r["lemma"],
+                "pos": r["pos"],
+                "label": "same" if r["label"] == 1 else "different",
+                "usage1": mark_target(r["sentence1"], r["lemma"]),
+                "usage2": mark_target(r["sentence2"], r["lemma"]),
+                "think": think,
+            }
+        )
+    return out
+
+
 # --------------------------------------------------------------------------- #
 # Prompt / target formatting (chat messages)
 # --------------------------------------------------------------------------- #
@@ -431,6 +487,10 @@ def triplet_messages(rec, with_target=False):
 
 
 def wic_think(rec) -> str:
+    # A supplied teacher trace (``think``, from GLM distillation) is used verbatim;
+    # otherwise the templated warm-start reasoning is built from the gold glosses.
+    if rec.get("think"):
+        return f"<think>\n{rec['think']}\n</think>"
     # Templated reasoning (Phase-3 warm-start): name each usage's gloss, then judge.
     verdict = (
         "Both usages carry the same sense."

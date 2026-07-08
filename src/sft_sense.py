@@ -2,10 +2,13 @@
 
   --mode direct   -> config 1: single-usage definition generation
   --mode triplet  -> config 2: anchor/positive/negative contrastive glosses
+  --mode wic      -> word-in-context same/different, distilled from GLM-5.2 traces
+                     (--wic-data data/wic_glm-5.2_test.json)
 
 """
 
 import argparse
+import random
 from functools import partial
 from pathlib import Path
 
@@ -16,15 +19,27 @@ from trl import SFTConfig, SFTTrainer
 
 import sense_data as sd
 
+_MESSAGES = {
+    "direct": sd.direct_messages,
+    "triplet": sd.triplet_messages,
+    "wic": sd.wic_messages,
+}
+
 
 def format_example(rec, tokenizer, mode):
-    msgs = (sd.direct_messages if mode == "direct" else sd.triplet_messages)(
-        rec, with_target=True
-    )
+    msgs = _MESSAGES[mode](rec, with_target=True)
     return {"text": tokenizer.apply_chat_template(msgs, tokenize=False, add_generation_prompt=False)}
 
 
-def _load_or_build(mode):
+def _load_or_build(mode, wic_data=None, dev_frac=0.05, seed=42):
+    # wic distills from a single GLM predictions file (no prebuilt train/dev
+    # splits), so carve a small held-out dev set off a deterministic shuffle.
+    if mode == "wic":
+        recs = sd.load_wic_glm(wic_data)
+        random.Random(seed).shuffle(recs)
+        n_dev = max(1, int(len(recs) * dev_frac))
+        dev, train = recs[:n_dev], recs[n_dev:]
+        return DatasetDict({"train": Dataset.from_list(train), "dev": Dataset.from_list(dev)})
     try:
         train = sd.load_split(mode, "train")
         dev = sd.load_split(mode, "dev")
@@ -38,11 +53,13 @@ def _load_or_build(mode):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--model", default="Qwen/Qwen3-0.6B")
-    ap.add_argument("--mode", choices=["direct", "triplet"], required=True)
+    ap.add_argument("--mode", choices=["direct", "triplet", "wic"], required=True)
     ap.add_argument("--epochs", type=int, default=2)
+    ap.add_argument("--wic-data", default="data/wic_glm-5.2_test.json",
+                    help="GLM-5.2 WiC predictions to distill (mode=wic only)")
     args = ap.parse_args()
 
-    dataset = _load_or_build(args.mode)
+    dataset = _load_or_build(args.mode, wic_data=args.wic_data)
     print(f"[{args.mode}] train={len(dataset['train'])} dev={len(dataset['dev'])}")
 
     tokenizer = AutoTokenizer.from_pretrained(args.model, trust_remote_code=True)
@@ -65,7 +82,7 @@ def main():
         per_device_train_batch_size=128,
         num_train_epochs=args.epochs,
         warmup_steps=100,
-        learning_rate=2e-4,
+        learning_rate=1e-5,
         lr_scheduler_type="cosine",
         bf16=True,
         eval_strategy="steps",

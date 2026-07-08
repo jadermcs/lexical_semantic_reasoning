@@ -25,11 +25,34 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 import sense_data as sd
 
 
+_MESSAGES = {
+    "direct": sd.direct_messages,
+    "triplet": sd.triplet_messages,
+    "wic": sd.wic_messages,
+}
+
+
 def build_prompt(rec, tokenizer, mode):
-    msgs = (sd.direct_messages if mode == "direct" else sd.triplet_messages)(
-        rec, with_target=False
-    )
+    msgs = _MESSAGES[mode](rec, with_target=False)
     return tokenizer.apply_chat_template(msgs, tokenize=False, add_generation_prompt=True)
+
+
+def _wic_metrics(preds, golds):
+    """Accuracy + same/different P/R/F1 over parsed verdicts; '' preds are unscored."""
+    scored = [(p, g) for p, g in zip(preds, golds) if p]
+    n = len(scored)
+    correct = sum(p == g for p, g in scored)
+    tp = sum(1 for p, g in scored if p == "same" and g == "same")
+    fp = sum(1 for p, g in scored if p == "same" and g == "different")
+    fn = sum(1 for p, g in scored if p == "different" and g == "same")
+    prec = tp / (tp + fp) if tp + fp else 0.0
+    rec = tp / (tp + fn) if tp + fn else 0.0
+    f1 = 2 * prec * rec / (prec + rec) if prec + rec else 0.0
+    return {
+        "n": len(preds), "n_scored": n, "empty": len(preds) - n,
+        "accuracy": correct / n if n else 0.0,
+        "precision": prec, "recall": rec, "f1": f1,
+    }
 
 
 def print_examples(records, n=10):
@@ -52,7 +75,7 @@ def print_examples(records, n=10):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--model", default="Qwen/Qwen3-1.7B")
-    ap.add_argument("--mode", choices=["direct", "triplet"], required=True)
+    ap.add_argument("--mode", choices=["direct", "triplet", "wic"], required=True)
     ap.add_argument("--split", default="test")
     ap.add_argument("--batch-size", type=int, default=16)
     ap.add_argument("--max-samples", type=int, default=0, help="0 = full split")
@@ -71,7 +94,15 @@ def main():
     model = AutoModelForCausalLM.from_pretrained(args.model, device_map="auto", dtype=torch.bfloat16)
     model.eval()
 
-    data = sd.load_split(args.mode, args.split)
+    if args.mode == "wic":
+        # wic evaluates against the gold MCL-WiC benchmark. The GLM SFT source is
+        # MCL-WiC *test*, so scoring on --split test overlaps training pairs.
+        if args.split == "test":
+            print("WARNING: mode=wic on --split test overlaps the GLM SFT source "
+                  "(wic_glm-5.2_test.json is MCL-WiC test); use --split dev or train.")
+        data = sd.load_mclwic(args.split)
+    else:
+        data = sd.load_split(args.mode, args.split)
     if args.max_samples:
         data = data[: args.max_samples]
     gold_key = "gloss" if args.mode == "direct" else "gloss_same"
@@ -90,11 +121,32 @@ def main():
         input_len = inputs["input_ids"].shape[1]
         for rec, out in zip(batch, outputs):
             decoded = tokenizer.decode(out[input_len:], skip_special_tokens=True)
-            hyp = extract(decoded)
+            if args.mode == "wic":
+                hyp = sd.extract_wic_label(decoded)
+                gold = rec["label"]
+            else:
+                hyp = extract(decoded)
+                gold = rec[gold_key]
             hyps.append(hyp)
-            refs.append(rec[gold_key])
-            records.append({"lemma": rec["lemma"], "gold": rec[gold_key],
+            refs.append(gold)
+            records.append({"lemma": rec["lemma"], "gold": gold,
                             "prediction": hyp, "raw_output": decoded})
+
+    if args.mode == "wic":
+        metrics = _wic_metrics(hyps, refs)
+        print(f"\n[wic] n={metrics['n']}  acc={metrics['accuracy']:.3f}  "
+              f"f1={metrics['f1']:.3f}  P={metrics['precision']:.3f}  "
+              f"R={metrics['recall']:.3f}  empty={metrics['empty']}")
+        print("\nExamples (first 10):")
+        print(f"{'lemma':<18}  {'gold':<10}  {'prediction':<10}")
+        for rec in records[:10]:
+            print(f"{rec['lemma']:<18}  {rec['gold']:<10}  {(rec['prediction'] or '—'):<10}")
+        out_path = Path(args.output or f"predictions_sense_wic_{args.split}.json")
+        out_path.write_text(json.dumps(
+            {"mode": "wic", "model": args.model, "split": args.split,
+             **metrics, "predictions": records}, ensure_ascii=False, indent=2))
+        print(f"Saved predictions → {out_path}")
+        return
 
     bleu = sd.corpus_bleu(hyps, refs)
     mean_sim = sum(sd.gloss_similarity(h, r) for h, r in zip(hyps, refs)) / len(hyps)
