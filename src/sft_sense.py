@@ -1,9 +1,9 @@
 """SFT warm-start for the sense-modeling ablations.
 
-  --mode direct   -> config 1: single-usage definition generation
-  --mode triplet  -> config 2: anchor/positive/negative contrastive glosses
-  --mode wic      -> word-in-context same/different, distilled from GLM-5.2 traces
-                     (--wic-data data/wic_glm-5.2_test.json)
+--mode direct   -> config 1: single-usage definition generation
+--mode triplet  -> config 2: anchor/positive/negative contrastive glosses
+--mode wic      -> word-in-context same/different, distilled from GLM-5.2 traces
+                   (--wic-data data/wic_glm-5.2_test.json)
 
 """
 
@@ -28,7 +28,11 @@ _MESSAGES = {
 
 def format_example(rec, tokenizer, mode):
     msgs = _MESSAGES[mode](rec, with_target=True)
-    return {"text": tokenizer.apply_chat_template(msgs, tokenize=False, add_generation_prompt=False)}
+    return {
+        "text": tokenizer.apply_chat_template(
+            msgs, tokenize=False, add_generation_prompt=False
+        )
+    }
 
 
 @torch.no_grad()
@@ -47,13 +51,18 @@ def _make_entropy_scorer(model, tokenizer, mode="wic", max_cont_tokens=2048):
     def scorer(rec, cands):
         prompt_ids = tokenizer.apply_chat_template(
             _MESSAGES[mode](rec, with_target=False),
-            tokenize=True, add_generation_prompt=True, return_tensors="pt",
+            tokenize=True,
+            add_generation_prompt=True,
+            return_tensors="pt",
         ).to(model.device)
         scores = []
         for c in cands:
             cont = tokenizer(
-                f"<think>\n{c['think']}\n</think>", return_tensors="pt",
-                add_special_tokens=False, truncation=True, max_length=max_cont_tokens,
+                f"<think>\n{c['think']}\n</think>",
+                return_tensors="pt",
+                add_special_tokens=False,
+                truncation=True,
+                max_length=max_cont_tokens,
             ).input_ids.to(model.device)
             ids = torch.cat([prompt_ids, cont], dim=1)
             logits = model(ids).logits[0]  # [T, V]
@@ -68,7 +77,9 @@ def _make_entropy_scorer(model, tokenizer, mode="wic", max_cont_tokens=2048):
     return scorer
 
 
-def _load_or_build(mode, wic_data=None, strategy="first", scorer=None, dev_frac=0.05, seed=42):
+def _load_or_build(
+    mode, wic_data=None, strategy="first", scorer=None, dev_frac=0.05, seed=42
+):
     # wic distills from a single GLM predictions file (no prebuilt train/dev
     # splits), so carve a small held-out dev set off a deterministic shuffle.
     if mode == "wic":
@@ -76,7 +87,9 @@ def _load_or_build(mode, wic_data=None, strategy="first", scorer=None, dev_frac=
         random.Random(seed).shuffle(recs)
         n_dev = max(1, int(len(recs) * dev_frac))
         dev, train = recs[:n_dev], recs[n_dev:]
-        return DatasetDict({"train": Dataset.from_list(train), "dev": Dataset.from_list(dev)})
+        return DatasetDict(
+            {"train": Dataset.from_list(train), "dev": Dataset.from_list(dev)}
+        )
     try:
         train = sd.load_split(mode, "train")
         dev = sd.load_split(mode, "dev")
@@ -84,7 +97,9 @@ def _load_or_build(mode, wic_data=None, strategy="first", scorer=None, dev_frac=
         print("Splits not found; building them via sense_data ...")
         sd.save_dataset(sd.build_dataset())
         train, dev = sd.load_split(mode, "train"), sd.load_split(mode, "dev")
-    return DatasetDict({"train": Dataset.from_list(train), "dev": Dataset.from_list(dev)})
+    return DatasetDict(
+        {"train": Dataset.from_list(train), "dev": Dataset.from_list(dev)}
+    )
 
 
 def main():
@@ -92,13 +107,15 @@ def main():
     ap.add_argument("--model", default="Qwen/Qwen3-0.6B")
     ap.add_argument("--mode", choices=["direct", "triplet", "wic"], required=True)
     ap.add_argument("--epochs", type=int, default=2)
-    ap.add_argument("--wic-data", default="data/wic_glm-5.2_test.json",
-                    help="GLM-5.2 WiC predictions to distill (mode=wic only)")
-    ap.add_argument("--reasoning-select", choices=["first", "longest", "entropy"],
-                    default="first",
-                    help="Which distilled teacher trace to keep per pair (mode=wic "
-                         "only): first majority-voting sample, longest CoT, or the "
-                         "highest model predictive entropy")
+    ap.add_argument("--wic-data", type=str)
+    ap.add_argument(
+        "--reasoning-select",
+        choices=["first", "longest", "entropy"],
+        default="first",
+        help="Which distilled teacher trace to keep per pair (mode=wic "
+        "only): first majority-voting sample, longest CoT, or the "
+        "highest model predictive entropy",
+    )
     args = ap.parse_args()
 
     tokenizer = AutoTokenizer.from_pretrained(args.model, trust_remote_code=True)
@@ -107,8 +124,11 @@ def main():
     # Load the model before building the dataset: the entropy reasoning-select
     # strategy scores candidate traces with a forward pass, so it needs the model.
     model = AutoModelForCausalLM.from_pretrained(
-        args.model, device_map="cuda", dtype=torch.bfloat16,
-        trust_remote_code=True, attn_implementation="sdpa",
+        args.model,
+        device_map="cuda",
+        dtype=torch.bfloat16,
+        trust_remote_code=True,
+        attn_implementation="sdpa",
     )
 
     scorer = None
@@ -116,11 +136,15 @@ def main():
         scorer = _make_entropy_scorer(model, tokenizer, mode=args.mode)
 
     dataset = _load_or_build(
-        args.mode, wic_data=args.wic_data,
-        strategy=args.reasoning_select, scorer=scorer,
+        args.mode,
+        wic_data=args.wic_data,
+        strategy=args.reasoning_select,
+        scorer=scorer,
     )
-    print(f"[{args.mode}] train={len(dataset['train'])} dev={len(dataset['dev'])} "
-          f"reasoning-select={args.reasoning_select}")
+    print(
+        f"[{args.mode}] train={len(dataset['train'])} dev={len(dataset['dev'])} "
+        f"reasoning-select={args.reasoning_select}"
+    )
 
     fmt = partial(format_example, tokenizer=tokenizer, mode=args.mode)
     cols = dataset["train"].column_names
@@ -134,8 +158,8 @@ def main():
     training_args = SFTConfig(
         output_dir=output_dir,
         dataset_text_field="text",
-        per_device_train_batch_size=32,
         num_train_epochs=args.epochs,
+        per_device_train_batch_size=32,
         warmup_steps=100,
         learning_rate=1e-4,
         lr_scheduler_type="cosine",
@@ -149,8 +173,11 @@ def main():
         run_name=f"qwen-sense-sft-{tag}",
     )
     trainer = SFTTrainer(
-        model=model, processing_class=tokenizer,
-        train_dataset=dataset["train"], eval_dataset=dataset["dev"], args=training_args,
+        model=model,
+        processing_class=tokenizer,
+        train_dataset=dataset["train"],
+        eval_dataset=dataset["dev"],
+        args=training_args,
     )
 
     last = None
