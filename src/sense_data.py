@@ -104,10 +104,12 @@ TRIPLET_SYSTEM = (
 WIC_SYSTEM = (
     "You are an expert lexicographer. You are given two sentences, each using the same "
     "target word (marked with <t> tags). Inside <think> tags, work out what the target "
-    "word means in each sentence then compare the two senses. Then, after </think>, answer with "
-    "exactly one word: 'same' if the target word carries the same sense in both "
-    "sentences, or 'different' if it does not — and nothing else. "
-    "Format: <think>...</think>\nsame|different"
+    "word means in each sentence then compare the two senses. Then, after </think>, "
+    "answer with a single JSON object and nothing else, with exactly these keys: "
+    '"sense1" (string, the gloss of the target in sentence 1), "sense2" (string, the '
+    'gloss of the target in sentence 2), and "same_sense" (boolean, true if the two '
+    "uses share the same sense). "
+    'Format: <think>...</think>\n{"sense1": ..., "sense2": ..., "same_sense": ...}'
 )
 
 SUPERSENSE_SYSTEM = (
@@ -377,38 +379,74 @@ def load_mclwic(split: str, data_dir: Path = DATA_DIR) -> list[dict]:
     ]
 
 
-def _wic_glm_reasoning(rec: dict) -> str:
-    """The teacher trace whose own sampled vote matches the majority prediction.
+def _wic_candidates(rec: dict) -> list[dict]:
+    """Teacher samples whose own vote matches the majority prediction.
 
     ``call_api.py`` records one reasoning per self-consistency sample alongside its
-    JSON answer. Picking the trace that voted with the majority keeps the distilled
-    <think> block consistent with the verdict we train toward. Returns '' if none
-    matches (or the reasoning is empty).
+    JSON answer (``{"sense1", "sense2", "same_sense"}``). Keeping only samples that
+    voted with the majority makes the distilled <think> block consistent with the
+    verdict we train toward. Each candidate carries the trimmed reasoning trace plus
+    the two sense glosses from that same sample's answer, so the JSON training target
+    can be reconstructed. Samples with an unparseable answer or an empty trace are
+    dropped; the returned list preserves sample order.
     """
     pred = bool(rec["prediction"])
+    cands = []
     for ans, rea in zip(rec.get("answers", []), rec.get("reasonings", [])):
         try:
-            same = bool(json.loads(ans)["same_sense"])
+            obj = json.loads(ans)
+            same = bool(obj["same_sense"])
         except (json.JSONDecodeError, KeyError, TypeError):
             continue
-        if same == pred and rea and rea.strip():
-            return rea.strip()
-    return ""
+        if same != pred or not (rea and rea.strip()):
+            continue
+        cands.append(
+            {
+                "think": rea.strip(),
+                "sense1": str(obj.get("sense1", "")).strip(),
+                "sense2": str(obj.get("sense2", "")).strip(),
+            }
+        )
+    return cands
 
 
-def load_wic_glm(path: str | Path) -> list[dict]:
+def _select_wic_candidate(cands, rec, strategy="first", scorer=None):
+    """Pick one teacher sample from ``cands`` under the chosen ablation strategy.
+
+    ``first``   keep the original behaviour: the earliest majority-voting sample.
+    ``longest`` the sample with the longest reasoning trace (most CoT).
+    ``entropy`` the sample the model is most uncertain about: ``scorer(rec, cands)``
+                returns a per-candidate score (the model's mean predictive entropy
+                over the trace) and the argmax wins. The scorer is supplied by the
+                caller (``sft_sense``) since it needs the loaded model/tokenizer.
+    """
+    if strategy == "first":
+        return cands[0]
+    if strategy == "longest":
+        return max(cands, key=lambda c: len(c["think"]))
+    if strategy == "entropy":
+        if scorer is None:
+            raise ValueError("strategy='entropy' requires a scorer (pass one from sft_sense)")
+        scores = scorer(rec, cands)
+        return cands[max(range(len(cands)), key=scores.__getitem__)]
+    raise ValueError(f"unknown reasoning-select strategy: {strategy!r}")
+
+
+def load_wic_glm(path: str | Path, strategy: str = "first", scorer=None) -> list[dict]:
     """Load GLM-5.2 WiC predictions (from ``call_api.py``) as wic SFT records.
 
     Distillation source: each record carries the teacher's chain-of-thought
     (``reasonings``) and a self-consistency vote (``prediction``). Only pairs the
     teacher got right (vote == gold ``label``) are kept, so no confidently-wrong
-    reasoning is distilled; the verdict trained toward is the gold label and the
-    picked trace is the sample whose own vote agrees with it (see
-    ``_wic_glm_reasoning``). The picked reasoning already carries the <t> tags GLM
-    was shown, and the prompt sentences are re-marked from the lemma (the raw file
-    drops the surface forms). The trace becomes the ``think`` field consumed by
-    ``wic_think``. Records with an errored/absent prediction or no usable trace are
-    skipped.
+    reasoning is distilled; the verdict trained toward is the gold label. Among the
+    samples whose own vote agrees with the majority (see ``_wic_candidates``) one is
+    picked per ``strategy`` (``first``/``longest``/``entropy`` — see
+    ``_select_wic_candidate``; ``entropy`` needs ``scorer``). The picked trace
+    becomes the ``think`` field and its two sense glosses become ``sense1``/``sense2``
+    for the JSON target (see ``wic_answer``). The trace already carries the <t> tags
+    GLM was shown, and the prompt sentences are re-marked from the lemma (the raw file
+    drops the surface forms). Records with an errored/absent prediction or no usable
+    trace are skipped.
     """
     raw = json.loads(Path(path).read_text())
     out = []
@@ -417,9 +455,10 @@ def load_wic_glm(path: str | Path) -> list[dict]:
             continue
         if bool(r["prediction"]) != bool(r["label"]):  # teacher-correct only
             continue
-        think = _wic_glm_reasoning(r)
-        if not think:
+        cands = _wic_candidates(r)
+        if not cands:
             continue
+        chosen = _select_wic_candidate(cands, r, strategy=strategy, scorer=scorer)
         out.append(
             {
                 "lemma": r["lemma"],
@@ -427,7 +466,9 @@ def load_wic_glm(path: str | Path) -> list[dict]:
                 "label": "same" if r["label"] == 1 else "different",
                 "usage1": mark_target(r["sentence1"], r["lemma"]),
                 "usage2": mark_target(r["sentence2"], r["lemma"]),
-                "think": think,
+                "think": chosen["think"],
+                "sense1": chosen["sense1"],
+                "sense2": chosen["sense2"],
             }
         )
     return out
@@ -504,13 +545,29 @@ def wic_think(rec) -> str:
     )
 
 
+def wic_answer(rec) -> str:
+    """JSON verdict mirroring the GLM teacher: sense gloss per usage + same_sense.
+
+    Distilled records carry the teacher's ``sense1``/``sense2``; templated
+    warm-start records fall back to the gold ``gloss1``/``gloss2``.
+    """
+    return json.dumps(
+        {
+            "sense1": rec.get("sense1") or rec.get("gloss1", ""),
+            "sense2": rec.get("sense2") or rec.get("gloss2", ""),
+            "same_sense": rec["label"] == "same",
+        }
+    )
+
+
 def wic_messages(rec, with_target=False):
     user = (
         f"Target word: {rec['lemma']} ({rec['pos']})\n\n"
         f"Sentence 1: {rec['usage1']}\n"
         f"Sentence 2: {rec['usage2']}\n\n"
-        "Do both sentences use the target word in the same sense? "
-        "Answer 'same' or 'different'."
+        "Do both sentences use the target word in the same sense? Respond with a "
+        'single JSON object with keys "sense1", "sense2" (the gloss of the target '
+        'in each sentence) and "same_sense" (boolean).'
     )
     msgs = [
         {"role": "system", "content": WIC_SYSTEM},
@@ -518,7 +575,7 @@ def wic_messages(rec, with_target=False):
     ]
     if with_target:
         msgs.append(
-            {"role": "assistant", "content": f"{wic_think(rec)}\n{rec['label']}"}
+            {"role": "assistant", "content": f"{wic_think(rec)}\n{wic_answer(rec)}"}
         )
     return msgs
 
@@ -526,13 +583,20 @@ def wic_messages(rec, with_target=False):
 def extract_wic_label(text: str) -> str:
     """Return 'same' or 'different' from the answer region, or '' if unclear.
 
-    Reads the first same/different token after ``</think>`` (case-insensitive). An
-    unclosed <think> means the reasoning ran past the budget with no verdict, so
-    there is nothing to score.
+    The answer region is everything after ``</think>``. Prefer the JSON verdict
+    (``{"same_sense": bool}``); fall back to a bare same/different token for
+    backward compatibility. An unclosed <think> means the reasoning ran past the
+    budget with no verdict, so there is nothing to score.
     """
     seg = text.split("</think>")[-1]
     if "<think>" in seg:  # unclosed <think>: reasoning ran on, no verdict
         return ""
+    m = re.search(r"\{.*\}", seg, flags=re.DOTALL)
+    if m:
+        try:
+            return "same" if bool(json.loads(m.group(0))["same_sense"]) else "different"
+        except (json.JSONDecodeError, KeyError, TypeError):
+            pass
     m = re.search(r"\b(same|different)\b", seg, flags=re.IGNORECASE)
     return m.group(1).lower() if m else ""
 
