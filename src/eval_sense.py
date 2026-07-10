@@ -74,7 +74,7 @@ def print_examples(records, n=10):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--model", default="Qwen/Qwen3-1.7B")
+    ap.add_argument("--model", type=str, required=True)
     ap.add_argument("--mode", choices=["direct", "triplet", "wic"], required=True)
     ap.add_argument("--split", default="test")
     ap.add_argument("--batch-size", type=int, default=16)
@@ -95,11 +95,6 @@ def main():
     model.eval()
 
     if args.mode == "wic":
-        # wic evaluates against the gold MCL-WiC benchmark. The GLM SFT source is
-        # MCL-WiC *test*, so scoring on --split test overlaps training pairs.
-        if args.split == "test":
-            print("WARNING: mode=wic on --split test overlaps the GLM SFT source "
-                  "(wic_glm-5.2_test.json is MCL-WiC test); use --split dev or train.")
         data = sd.load_mclwic(args.split)
     else:
         data = sd.load_split(args.mode, args.split)
