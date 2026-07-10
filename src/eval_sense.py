@@ -39,19 +39,23 @@ def build_prompt(rec, tokenizer, mode):
 
 def _wic_metrics(preds, golds):
     """Accuracy + same/different P/R/F1 over parsed verdicts; '' preds are unscored."""
+    from sklearn.metrics import accuracy_score, precision_recall_fscore_support
+
     scored = [(p, g) for p, g in zip(preds, golds) if p]
     n = len(scored)
-    correct = sum(p == g for p, g in scored)
-    tp = sum(1 for p, g in scored if p == "same" and g == "same")
-    fp = sum(1 for p, g in scored if p == "same" and g == "different")
-    fn = sum(1 for p, g in scored if p == "different" and g == "same")
-    prec = tp / (tp + fp) if tp + fp else 0.0
-    rec = tp / (tp + fn) if tp + fn else 0.0
-    f1 = 2 * prec * rec / (prec + rec) if prec + rec else 0.0
+    y_pred = [p for p, _ in scored]
+    y_true = [g for _, g in scored]
+    if n:
+        prec, rec, f1, _ = precision_recall_fscore_support(
+            y_true, y_pred, average="binary", pos_label="same", zero_division=0,
+        )
+        acc = accuracy_score(y_true, y_pred)
+    else:
+        prec = rec = f1 = acc = 0.0
     return {
         "n": len(preds), "n_scored": n, "empty": len(preds) - n,
-        "accuracy": correct / n if n else 0.0,
-        "precision": prec, "recall": rec, "f1": f1,
+        "accuracy": float(acc),
+        "precision": float(prec), "recall": float(rec), "f1": float(f1),
     }
 
 
@@ -110,7 +114,7 @@ def main():
         inputs = tokenizer(texts, return_tensors="pt", padding=True, truncation=True).to(model.device)
         with torch.no_grad():
             outputs = model.generate(
-                **inputs, max_new_tokens=512, do_sample=False,
+                **inputs, max_new_tokens=1024, do_sample=False,
                 pad_token_id=tokenizer.pad_token_id,
             )
         input_len = inputs["input_ids"].shape[1]
