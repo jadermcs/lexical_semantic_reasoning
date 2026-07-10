@@ -39,19 +39,23 @@ def build_prompt(rec, tokenizer, mode):
 
 def _wic_metrics(preds, golds):
     """Accuracy + same/different P/R/F1 over parsed verdicts; '' preds are unscored."""
+    from sklearn.metrics import accuracy_score, precision_recall_fscore_support
+
     scored = [(p, g) for p, g in zip(preds, golds) if p]
     n = len(scored)
-    correct = sum(p == g for p, g in scored)
-    tp = sum(1 for p, g in scored if p == "same" and g == "same")
-    fp = sum(1 for p, g in scored if p == "same" and g == "different")
-    fn = sum(1 for p, g in scored if p == "different" and g == "same")
-    prec = tp / (tp + fp) if tp + fp else 0.0
-    rec = tp / (tp + fn) if tp + fn else 0.0
-    f1 = 2 * prec * rec / (prec + rec) if prec + rec else 0.0
+    y_pred = [p for p, _ in scored]
+    y_true = [g for _, g in scored]
+    if n:
+        prec, rec, f1, _ = precision_recall_fscore_support(
+            y_true, y_pred, average="binary", pos_label="same", zero_division=0,
+        )
+        acc = accuracy_score(y_true, y_pred)
+    else:
+        prec = rec = f1 = acc = 0.0
     return {
         "n": len(preds), "n_scored": n, "empty": len(preds) - n,
-        "accuracy": correct / n if n else 0.0,
-        "precision": prec, "recall": rec, "f1": f1,
+        "accuracy": float(acc),
+        "precision": float(prec), "recall": float(rec), "f1": float(f1),
     }
 
 
@@ -74,7 +78,7 @@ def print_examples(records, n=10):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--model", default="Qwen/Qwen3-1.7B")
+    ap.add_argument("--model", type=str, required=True)
     ap.add_argument("--mode", choices=["direct", "triplet", "wic"], required=True)
     ap.add_argument("--split", default="test")
     ap.add_argument("--batch-size", type=int, default=16)
@@ -95,11 +99,6 @@ def main():
     model.eval()
 
     if args.mode == "wic":
-        # wic evaluates against the gold MCL-WiC benchmark. The GLM SFT source is
-        # MCL-WiC *test*, so scoring on --split test overlaps training pairs.
-        if args.split == "test":
-            print("WARNING: mode=wic on --split test overlaps the GLM SFT source "
-                  "(wic_glm-5.2_test.json is MCL-WiC test); use --split dev or train.")
         data = sd.load_mclwic(args.split)
     else:
         data = sd.load_split(args.mode, args.split)
@@ -115,7 +114,7 @@ def main():
         inputs = tokenizer(texts, return_tensors="pt", padding=True, truncation=True).to(model.device)
         with torch.no_grad():
             outputs = model.generate(
-                **inputs, max_new_tokens=512, do_sample=False,
+                **inputs, max_new_tokens=1024, do_sample=False,
                 pad_token_id=tokenizer.pad_token_id,
             )
         input_len = inputs["input_ids"].shape[1]
