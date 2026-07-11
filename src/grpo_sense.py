@@ -137,7 +137,7 @@ def main():
             vllm_server_host=args.vllm_server_host, vllm_server_port=args.vllm_server_port,
         )
     else:
-        vllm_kwargs = dict(use_vllm=True, vllm_max_model_length=1024)
+        vllm_kwargs = dict()
 
     run_name = f"qwen-sense-grpo-{'-'.join(tasks)}"
     output_dir = f"./{run_name}"
