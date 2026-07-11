@@ -106,7 +106,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--model", default="Qwen/Qwen3-0.6B")
     ap.add_argument("--mode", choices=["direct", "triplet", "wic"], required=True)
-    ap.add_argument("--epochs", type=int, default=2)
+    ap.add_argument("--epochs", type=int, default=5)
     ap.add_argument("--wic-data", type=str)
     ap.add_argument(
         "--reasoning-select",

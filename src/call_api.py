@@ -1,0 +1,295 @@
+import argparse
+import json
+import os
+import sys
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from pathlib import Path
+
+from openai import OpenAI
+
+# ── Config ────────────────────────────────────────────────────────────────────
+
+DEFAULT_MODEL_ID = "deepseek/deepseek-v4-flash"
+BASE_URL = "https://openrouter.ai/api/v1"
+SAMPLES = 3  # self-consistency: k samples per pair, majority vote
+MAX_WORKERS = 8  # concurrent pairs in flight
+MAX_RETRIES = 4  # per-call retries on transient errors
+
+SYSTEM_PROMPT = """\
+You are a linguistic analysis assistant. You decide whether a target word \
+is used with the same sense in two sentences. The target word is wrapped in \
+<t>...</t> in each sentence. First, briefly describe the sense of the target \
+in each sentence, then return the final decision.
+
+Respond with a single JSON object and nothing else, with exactly these keys:
+  "sense1":     string, the sense of the target in sentence 1
+  "sense2":     string, the sense of the target in sentence 2
+  "same_sense": boolean, true if the two uses share the same sense
+"""
+
+USER_TEMPLATE = """\
+Lemma: {lemma}
+POS: {pos}
+
+Sentence 1: "{sentence1}"
+Sentence 2: "{sentence2}"
+
+Are the two <t>...</t> uses the same sense?
+"""
+
+
+def _safe_mark(word: str, sentence: str) -> str:
+    idx = sentence.find(word)
+    if idx < 0:
+        idx = sentence.lower().find(word.lower())
+        if idx < 0:
+            return sentence
+        word = sentence[idx : idx + len(word)]
+    return sentence[:idx] + "<t>" + word + "</t>" + sentence[idx + len(word) :]
+
+
+def build_messages(
+    lemma: str,
+    pos: str,
+    word1: str,
+    sentence1: str,
+    word2: str,
+    sentence2: str,
+) -> list[dict]:
+    return [
+        {"role": "system", "content": SYSTEM_PROMPT},
+        {
+            "role": "user",
+            "content": USER_TEMPLATE.format(
+                lemma=lemma,
+                pos=pos,
+                sentence1=_safe_mark(word1, sentence1),
+                sentence2=_safe_mark(word2, sentence2),
+            ),
+        },
+    ]
+
+
+def _sample(
+    client: OpenAI, model_id: str, messages: list[dict]
+) -> tuple[str, str | None]:
+    """One chat completion → (content, reasoning), with retries on transient errors."""
+    last_err: Exception | None = None
+    for attempt in range(MAX_RETRIES):
+        try:
+            resp = client.chat.completions.create(
+                model=model_id,
+                messages=messages,
+                response_format={"type": "json_object"},
+            )
+            msg = resp.choices[0].message
+            reasoning = getattr(msg, "reasoning_content", None) or getattr(
+                msg, "reasoning", None
+            )
+            return msg.content or "", reasoning
+        except Exception as e:  # network / rate-limit / server errors
+            last_err = e
+            time.sleep(2**attempt)
+    raise last_err  # exhausted retries
+
+
+def _vote(contents: list[str]) -> tuple[bool | None, float, list[bool | None]]:
+    votes: list[bool | None] = []
+    for content in contents:
+        try:
+            v = bool(json.loads(content)["same_sense"])
+        except (json.JSONDecodeError, KeyError, TypeError):
+            v = None
+        votes.append(v)
+    valid = [v for v in votes if v is not None]
+    if not valid:
+        return None, 0.0, votes
+    trues = sum(valid)
+    pred = trues > len(valid) / 2
+    if trues * 2 == len(valid):  # tie → no prediction
+        return None, 0.5, votes
+    confidence = max(trues, len(valid) - trues) / len(valid)
+    return pred, confidence, votes
+
+
+def _metrics(results: list[dict]) -> dict:
+    scored = [r for r in results if r["prediction"] is not None and r["label"] is not None]
+    n = len(scored)
+    correct = sum(int(r["prediction"]) == int(r["label"]) for r in scored)
+    tp = sum(1 for r in scored if r["prediction"] and r["label"] == 1)
+    fp = sum(1 for r in scored if r["prediction"] and r["label"] == 0)
+    tn = sum(1 for r in scored if not r["prediction"] and r["label"] == 0)
+    fn = sum(1 for r in scored if not r["prediction"] and r["label"] == 1)
+    prec = tp / (tp + fp) if tp + fp else 0.0
+    rec = tp / (tp + fn) if tp + fn else 0.0
+    f1 = 2 * prec * rec / (prec + rec) if prec + rec else 0.0
+
+    by_pos: dict[str, dict] = {}
+    for r in scored:
+        pos = r.get("pos", "?")
+        d = by_pos.setdefault(pos, {"n": 0, "correct": 0})
+        d["n"] += 1
+        d["correct"] += int(int(r["prediction"]) == int(r["label"]))
+    for d in by_pos.values():
+        d["accuracy"] = d["correct"] / d["n"]
+
+    return {
+        "n_scored": n,
+        "n_skipped": len(results) - n,
+        "accuracy": correct / n if n else 0.0,
+        "precision": prec,
+        "recall": rec,
+        "f1": f1,
+        "confusion": {"tp": tp, "fp": fp, "tn": tn, "fn": fn},
+        "by_pos": by_pos,
+    }
+
+
+def _paths(name: str) -> dict:
+    return {
+        "results": Path(f"predictions_{name}.jsonl"),
+        "metrics": Path(f"predictions_{name}_metrics.json"),
+    }
+
+
+def _make_client() -> OpenAI:
+    api_key = os.environ.get("OPENROUTER_API_KEY")
+    if not api_key:
+        print("Set OPENROUTER_API_KEY for the OpenRouter endpoint.", file=sys.stderr)
+        sys.exit(1)
+    return OpenAI(api_key=api_key, base_url=BASE_URL)
+
+
+def _evaluate_pair(client: OpenAI, model_id: str, item: dict) -> dict:
+    base = {
+        "lemma": item["lemma"],
+        "pos": item["pos"],
+        "sentence1": item["sentence1"],
+        "sentence2": item["sentence2"],
+        "label": item["label"],
+    }
+    messages = build_messages(
+        item["lemma"],
+        item["pos"],
+        item["word1"],
+        item["sentence1"],
+        item["word2"],
+        item["sentence2"],
+    )
+    try:
+        samples = [_sample(client, model_id, messages) for _ in range(SAMPLES)]
+    except Exception as e:
+        return {**base, "prediction": None, "error": str(e)}
+    contents = [c for c, _ in samples]
+    reasonings = [r for _, r in samples]
+    prediction, confidence, votes = _vote(contents)
+    return {
+        **base,
+        "prediction": prediction,
+        "confidence": confidence,
+        "votes": votes,
+        "answers": contents,
+        "reasonings": reasonings,
+    }
+
+
+def _pair_key(item: dict) -> tuple:
+    return (item["lemma"], item["pos"], item["sentence1"], item["sentence2"])
+
+
+def _load_resume(resume_path: str) -> dict[tuple, dict]:
+    """Map completed pairs (no error) from a previous results JSONL by pair key."""
+    done: dict[tuple, dict] = {}
+    for line in Path(resume_path).read_text().splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        r = json.loads(line)
+        if "error" not in r:
+            done[_pair_key(r)] = r
+    print(f"Resuming: {len(done)} completed pairs loaded from {resume_path}", file=sys.stderr)
+    return done
+
+
+def run(
+    input_path: str,
+    model_id: str = DEFAULT_MODEL_ID,
+    resume_path: str | None = None,
+) -> None:
+    path = Path(input_path)
+    model_slug = model_id.replace("/", "_")
+    p = _paths(f"{path.stem}_{model_slug}")
+    data = json.loads(path.read_text())
+    print(f"{len(data)} pairs → {model_id} @ {BASE_URL}", file=sys.stderr)
+
+    # Read any resume file before opening the output for writing, since the
+    # two may be the same path and opening in "w" mode truncates it.
+    resume = _load_resume(resume_path) if resume_path else {}
+
+    client = _make_client()
+    results: list[dict] = []
+    out = p["results"].open("w")
+
+    def _write(r: dict) -> None:
+        out.write(json.dumps(r) + "\n")
+        out.flush()  # one line per pair, streamed — nothing buffered in memory
+        results.append(r)
+
+    interrupted = False
+    pool = ThreadPoolExecutor(max_workers=MAX_WORKERS)
+    try:
+        futures = {}
+        for item in data:
+            cached = resume.get(_pair_key(item))
+            if cached is not None:
+                _write(cached)
+            else:
+                futures[pool.submit(_evaluate_pair, client, model_id, dict(item))] = item
+        skipped = len(results)
+        if skipped:
+            print(f"  {skipped} pairs already done, {len(futures)} to go", file=sys.stderr)
+        done = skipped
+        for fut in as_completed(futures):
+            _write(fut.result())
+            done += 1
+            if done % 25 == 0 or done == len(data):
+                print(f"  {done}/{len(data)}", file=sys.stderr)
+                p["metrics"].write_text(json.dumps(_metrics(results), indent=2))
+    except KeyboardInterrupt:
+        interrupted = True
+        print("\nInterrupted — saving partial results …", file=sys.stderr)
+    finally:
+        pool.shutdown(wait=False, cancel_futures=True)
+        out.close()
+
+    metrics = _metrics(results)
+    p["metrics"].write_text(json.dumps(metrics, indent=2))
+    print(f"Wrote {len(results)} results to {p['results']}", file=sys.stderr)
+    print(json.dumps(metrics, indent=2), file=sys.stderr)
+    if interrupted:
+        sys.exit(130)
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "-f",
+        "--file",
+        required=True,
+        help="Path to the input JSON file of WiC pairs.",
+    )
+    parser.add_argument(
+        "-m",
+        "--model",
+        default=DEFAULT_MODEL_ID,
+        help=f"Model id to query (default: {DEFAULT_MODEL_ID}).",
+    )
+    parser.add_argument(
+        "-r",
+        "--resume",
+        help="Path to a previous (partial) results JSONL to continue from; "
+        "already-completed pairs are skipped.",
+    )
+    args = parser.parse_args()
+    run(args.file, args.model, args.resume)

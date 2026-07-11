@@ -26,6 +26,15 @@ dependencies = [
     "torchaudio>=2.11.0",
 ]
 
+[dependency-groups]
+dev = ["pytest>=8.0"]
+
+[tool.pytest.ini_options]
+# The training scripts import their siblings as top-level modules (``import
+# sense_data``), so tests resolve them the same way.
+pythonpath = ["src"]
+testpaths = ["tests"]
+
 [tool.uv.sources]
 # Pull torch (and friends) from the CUDA 12.6 wheel index instead of PyPI, so
 # their CUDA builds stay ABI-compatible with each other.

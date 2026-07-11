@@ -580,23 +580,49 @@ def wic_messages(rec, with_target=False):
     return msgs
 
 
+WIC_ANSWER_KEYS = {"sense1", "sense2", "same_sense"}
+
+
+def parse_wic_answer(text: str) -> dict | None:
+    """The JSON object in the answer region, or None if there isn't a parseable one.
+
+    The answer region is everything after ``</think>``; an unclosed <think> means
+    the reasoning ran past the budget with no answer at all. Only the object's
+    *syntax* is checked here — whether it carries the right keys, and whether
+    ``same_sense`` is a real boolean, is judged by the callers (``extract_wic_label``
+    is lenient about it; ``grpo_sense.reward_wic_json`` scores it).
+    """
+    seg = text.split("</think>")[-1]
+    if "<think>" in seg:  # unclosed <think>: reasoning ran on, no answer
+        return None
+    m = re.search(r"\{.*\}", seg, flags=re.DOTALL)
+    if not m:
+        return None
+    try:
+        obj = json.loads(m.group(0))
+    except json.JSONDecodeError:
+        return None
+    return obj if isinstance(obj, dict) else None
+
+
 def extract_wic_label(text: str) -> str:
     """Return 'same' or 'different' from the answer region, or '' if unclear.
 
-    The answer region is everything after ``</think>``. Prefer the JSON verdict
-    (``{"same_sense": bool}``); fall back to a bare same/different token for
-    backward compatibility. An unclosed <think> means the reasoning ran past the
-    budget with no verdict, so there is nothing to score.
+    Prefer the JSON verdict (``{"same_sense": ...}``, coerced with ``bool`` so a
+    stringly-typed "true" still yields a verdict); fall back to a bare
+    same/different token for backward compatibility. Deliberately lenient: the
+    accuracy reward should score a *decision* wherever the model expressed one, and
+    the format/JSON rewards are what pay for expressing it in the required shape.
     """
-    seg = text.split("</think>")[-1]
-    if "<think>" in seg:  # unclosed <think>: reasoning ran on, no verdict
-        return ""
-    m = re.search(r"\{.*\}", seg, flags=re.DOTALL)
-    if m:
+    obj = parse_wic_answer(text)
+    if obj is not None:
         try:
-            return "same" if bool(json.loads(m.group(0))["same_sense"]) else "different"
-        except (json.JSONDecodeError, KeyError, TypeError):
+            return "same" if bool(obj["same_sense"]) else "different"
+        except (KeyError, TypeError):
             pass
+    seg = text.split("</think>")[-1]
+    if "<think>" in seg:
+        return ""
     m = re.search(r"\b(same|different)\b", seg, flags=re.IGNORECASE)
     return m.group(1).lower() if m else ""
 
