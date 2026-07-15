@@ -11,4 +11,5 @@ export TORCHDYNAMO_DISABLE=1
 # export HF_HOME=/scratch/$USER/.cache/huggingface
 
 uv sync                        # idempotent; resolves from the shared uv.lock
-uv run src/grpo_sense.py --mode direct --vllm-server-host isp-cap-n10 --vllm-server-port 8000
+uv run src/grpo_sense.py --model ./qwen-sense-sft-wic-longest \
+    --vllm-server-host isp-cap-n10 --vllm-server-port 8000

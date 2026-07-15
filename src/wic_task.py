@@ -25,9 +25,9 @@ import sense_data as sd
 
 DATA_DIR = Path("data")
 
-# Columns GRPO's reward fns read (see grpo_sense.KEEP_COLS["wic"]) plus the two
-# usages the prompt is rendered from. The rendered system/user prompt is stored
-# alongside them for inspection only.
+# Columns GRPO's reward fns read (see sense_rewards.KEEP_COLS) plus the two usages
+# the prompt is rendered from. The rendered system/user prompt is stored alongside
+# them for inspection only.
 RECORD_COLS = ["lemma", "pos", "label", "usage1", "usage2"]
 
 

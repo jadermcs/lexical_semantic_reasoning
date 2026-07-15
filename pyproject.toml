@@ -8,18 +8,15 @@ dependencies = [
     "datasets>=4.8.0",
     "tqdm>=4.5.0",
     "wandb>=0.23.1",
-    "wn>=0.9",
     "rapidfuzz>=3.14.5",
     "accelerate>=1.4.0",
     "transformers>=5.0.0",
     "torch>=2.10.0",
     "trl[vllm]>=1.6.0",
     "liger-kernel>=0.7.0",
-    "sentence-transformers>=5.6.0",
-    "bert-score>=0.3.13",
     "scikit-learn>=1.5.0",
     "bitsandbytes>=0.49.2",
-    "rich>=15.0.0",
+    "openai>=1.0.0",
 ]
 
 [dependency-groups]

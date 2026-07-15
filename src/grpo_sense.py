@@ -1,16 +1,14 @@
-"""GRPO for the sense-modeling ablations, warm-started from an SFT checkpoint.
+"""GRPO on the WiC task, warm-started from an SFT checkpoint.
 
-Train on any subset of tasks at once (multitask) via ``--tasks``:
+The policy reasons about the gloss of each of two usages, then classifies the pair
+as the same sense or a different sense. The label is gold (MCL-WiC), so the reward
+is verifiable — see ``sense_rewards``, which is importable without the training
+stack and unit-tested in ``tests/test_sense_rewards.py``.
 
-  direct   -> config 3: RL on single-usage definition generation
-  triplet  -> config 4: RL on anchor/positive/negative contrastive glosses
-  wic      -> reason about the gloss of each of two usages, then classify the pair
-              as the same sense or a different sense (verifiable label reward)
+The examples rolled out against are read from ``data/wic_task.<split>.jsonl`` (built
+on first use by ``wic_task.py``), so they can be inspected before a run.
 
-The reward functions themselves live in ``sense_rewards`` (importable without the
-training stack, and unit-tested in ``tests/test_sense_rewards.py``). When more than
-one task is given, each task's reward functions only score that task's completions
-(see ``sense_rewards.mask_by_task``).
+    uv run python src/grpo_sense.py --model ./qwen-sense-sft-wic-longest
 """
 
 import argparse
@@ -18,111 +16,48 @@ from functools import partial
 from pathlib import Path
 
 import torch
-from datasets import Dataset, concatenate_datasets
+from datasets import Dataset
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from trl import GRPOConfig, GRPOTrainer
 
 import sense_data as sd
 import wic_task
-from sense_rewards import KEEP_COLS, REWARDS, make_trace_saver, mask_by_task
+from sense_rewards import KEEP_COLS, REWARDS, make_trace_saver
 
 
-TASKS = ("direct", "triplet", "wic", "supersense")
-
-# Message builder per task; format_prompt renders the prompt column from it.
-_MSG_FN = {
-    "direct": sd.direct_messages,
-    "triplet": sd.triplet_messages,
-    "wic": sd.wic_messages,
-    "supersense": sd.supersense_messages,
-}
-
-
-# --------------------------------------------------------------------------- #
-# Prompt formatting (keeps gold columns so reward fns can read them via kwargs)
-# --------------------------------------------------------------------------- #
-def format_prompt(rec, tokenizer, task):
-    msgs = _MSG_FN[task](rec, with_target=False)
+def format_prompt(rec, tokenizer):
+    """Render the prompt column; gold columns are kept so reward fns see them as kwargs."""
+    msgs = sd.wic_messages(rec, with_target=False)
     return {"prompt": tokenizer.apply_chat_template(msgs, tokenize=False, add_generation_prompt=True)}
 
 
-def _load_split(task, split):
-    """Load one task/split, building all datasets on first use if missing.
-
-    ``wic`` trains on the gold MCL-WiC benchmark (verifiable same/different label,
-    no glosses), read from the dumped ``data/wic_task.<split>.jsonl`` so the
-    examples rolled out against can be inspected before the run (see
-    ``wic_task.py``); the WordNet-built ``direct``/``triplet`` splits are generated
-    on first use if absent.
-    """
-    if task == "wic":
-        return wic_task.load(split)
-    try:
-        return sd.load_split(task, split)
-    except FileNotFoundError:
-        sd.save_dataset(sd.build_dataset())
-        return sd.load_split(task, split)
-
-
-def _task_dataset(task, split, tokenizer, dev_cap=None):
-    """Rendered prompts + kept gold columns + a ``task`` tag for one task/split."""
-    recs = _load_split(task, split)
-    ds = Dataset.from_list(recs)
-    if dev_cap is not None:
-        ds = ds.shuffle(seed=42).select(range(min(dev_cap, len(ds))))
-    fmt = partial(format_prompt, tokenizer=tokenizer, task=task)
-    drop = [c for c in ds.column_names if c not in KEEP_COLS[task]]
-    ds = ds.map(fmt, remove_columns=drop)
-    return ds.add_column("task", [task] * len(ds))
-
-
-def _combine(tasks, split, tokenizer, dev_cap=None):
-    """Concatenate per-task datasets, padding each to the shared column union.
-
-    Different tasks keep different gold columns; ``concatenate_datasets`` needs a
-    single schema, so missing columns are filled with "" (all kept columns are
-    strings). ``mask_by_task`` filters these padded rows back out per reward fn.
-    """
-    parts = [_task_dataset(t, split, tokenizer, dev_cap) for t in tasks]
-    all_cols = sorted({c for p in parts for c in p.column_names})
-    padded = []
-    for p in parts:
-        for c in all_cols:
-            if c not in p.column_names:
-                p = p.add_column(c, [""] * len(p))
-        padded.append(p.select_columns(all_cols))
-    return concatenate_datasets(padded).shuffle(seed=42)
+def build_dataset(split, tokenizer, cap=None):
+    ds = Dataset.from_list(wic_task.load(split))
+    if cap is not None:
+        ds = ds.shuffle(seed=42).select(range(min(cap, len(ds))))
+    drop = [c for c in ds.column_names if c not in KEEP_COLS]
+    return ds.map(partial(format_prompt, tokenizer=tokenizer), remove_columns=drop)
 
 
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--model", default="Qwen/Qwen3-0.6B")
-    ap.add_argument(
-        "--tasks",
-        nargs="+",
-        choices=TASKS,
-        required=True,
-        help="One or more tasks to train on jointly, e.g. --tasks direct triplet wic.",
-    )
     ap.add_argument("--vllm-server-host", default=None)
     ap.add_argument("--vllm-server-port", type=int, default=8000)
     ap.add_argument(
         "--distill-out",
         default=None,
-        help="If set, append completions with fidelity >= --distill-threshold to "
-        "'<path>.rank<N>.jsonl' for self-distillation. Does not affect training.",
+        help="If set, append correct completions to '<path>.rank<N>.jsonl' for "
+        "self-distillation. Does not affect training.",
     )
     ap.add_argument("--distill-threshold", type=float, default=0.5)
     args = ap.parse_args()
 
-    # De-duplicate while preserving order so the run name is stable.
-    tasks = list(dict.fromkeys(args.tasks))
-
     tokenizer = AutoTokenizer.from_pretrained(args.model, trust_remote_code=True)
     tokenizer.pad_token = tokenizer.eos_token
 
-    train_ds = _combine(tasks, "train", tokenizer)
-    dev_ds = _combine(tasks, "dev", tokenizer, dev_cap=200)
+    train_ds = build_dataset("train", tokenizer)
+    dev_ds = build_dataset("dev", tokenizer, cap=200)
     print(train_ds[0])
 
     model = AutoModelForCausalLM.from_pretrained(
@@ -136,10 +71,8 @@ def main():
             use_vllm=True, vllm_mode="server",
             vllm_server_host=args.vllm_server_host, vllm_server_port=args.vllm_server_port,
         )
-    else:
-        vllm_kwargs = dict()
 
-    run_name = f"qwen-sense-grpo-{'-'.join(tasks)}"
+    run_name = "qwen-sense-grpo-wic"
     output_dir = f"./{run_name}"
     training_args = GRPOConfig(
         output_dir=output_dir,
@@ -169,17 +102,11 @@ def main():
         **vllm_kwargs,
     )
 
-    # Each task's reward fns (and optional trace saver) are masked to their own
-    # task so they never perturb the other tasks' groups.
-    reward_funcs = []
-    for task in tasks:
-        funcs = list(REWARDS[task])
-        if args.distill_out:
-            funcs.append(make_trace_saver(task, args.distill_out, args.distill_threshold))
-        reward_funcs.extend(mask_by_task(task, fn) for fn in funcs)
+    reward_funcs = list(REWARDS)
     if args.distill_out:
+        reward_funcs.append(make_trace_saver(args.distill_out, args.distill_threshold))
         print(
-            f"Self-distillation: saving completions with fidelity >= "
+            f"Self-distillation: saving completions scoring >= "
             f"{args.distill_threshold} to {args.distill_out}.rank*.jsonl"
         )
 

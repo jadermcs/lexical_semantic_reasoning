@@ -1,198 +1,159 @@
 # lexical_semantic_reasoning
 
-Cluster-grounded definition generation via RLVR. A small policy (Qwen3) is taught
-to generate WordNet-style sense definitions and is then optimised with a
-verifiable, gloss-grounded reward. Methodology: `ch05_implementation_plan.md`.
+Word-in-context (WiC) sense discrimination via RLVR. A small policy (Qwen3) reasons
+about what a target word means in each of two sentences, then decides whether the
+two uses share the same sense. The verdict is a **gold label**, so the RL reward is
+verifiable rather than an estimate.
 
-This README covers the **sense-modeling ablation pipeline**: building data,
-distilling reasoning traces, training the four configurations, and evaluating
-them on BLEU.
+The pipeline, in order:
+
+1. **Distil** reasoning traces from a teacher (`deepseek-v4-flash`, via OpenRouter).
+2. **SFT** warm-start the policy on the traces the teacher got right.
+3. **GRPO** on the verifiable same/different label.
+4. **Self-distillation** — feed the policy's own correct GRPO rollouts back into SFT
+   *(groundwork in place, not yet wired end-to-end — see §5)*.
+
+Evaluation is accuracy / F1 on the held-out MCL-WiC test split.
 
 > **Running things.** Always use `uv` (`uv run python ...`). The heavy training
-> stack (`torch`, `trl`, vLLM) runs on the servers; data generation and
-> evaluation scaffolding run locally.
+> stack (`torch`, `trl`, vLLM) runs on the servers; data prep and the reward unit
+> tests run locally.
 
 ---
 
-## The four ablation configurations
+## The task
 
-| # | Config | Script | Output dir |
-|---|--------|--------|-----------|
-| 1 | SFT — direct (single-usage definition) | `sft_sense.py --mode direct` | `qwen-sense-sft-direct` |
-| 2 | SFT — triplet (anchor/positive/negative) | `sft_sense.py --mode triplet` | `qwen-sense-sft-triplet` |
-| 3 | GRPO — direct, warm-started from #1 | `grpo_sense.py --mode direct` | `qwen-sense-grpo-direct` |
-| 4 | GRPO — triplet, warm-started from #2 | `grpo_sense.py --mode triplet` | `qwen-sense-grpo-triplet` |
+Given two sentences using the same target word (marked with `<t>` tags), the model
+emits its reasoning and then a single JSON verdict:
 
-- **direct** sees one usage and generates its gloss.
-- **triplet** sees an anchor + positive (same sense) and a negative (different
-  sense of the same lemma) and generates the contrastive reasoning + three glosses.
-- All four are evaluated by **BLEU** of the generated gloss vs. the WordNet gold
-  definition (triplet scores the *anchor* gloss only, for a clean per-usage
-  comparison with direct).
+```
+<think>...reasoning about what the word means in each sentence...</think>
+{"sense1": "a financial institution", "sense2": "sloping land beside a river", "same_sense": false}
+```
+
+`sense1`/`sense2` make the model commit to a gloss per usage before judging; only
+`same_sense` is scored for correctness.
 
 ---
 
-## 1. Build the WordNet ablation splits
+## 1. Data
 
-`sense_data.py` builds the train/dev/test data for both task framings from Open
-English WordNet (usages = synset example sentences, gold = synset definitions).
-The split is **lemma-disjoint** (no lemma appears in two splits).
+| File | What it is |
+|------|------------|
+| `data/mcl-wic.{train,dev,test}.json` | The gold MCL-WiC benchmark. Two sentences + a same/different label, no glosses. |
+| `data/mcl_semcor.json` | Teacher predictions from `call_api.py`: per pair, `k` sampled reasoning traces, their JSON answers, and a self-consistency vote. |
+
+`sense_data.py` loads both into one record shape (`lemma`, `pos`, `label`,
+`usage1`, `usage2`) and owns the prompt, so SFT, GRPO and eval all see exactly the
+same format.
+
+**Materialise the RL task** so the examples the policy rolls out against can be
+read before spending a run on them:
 
 ```bash
-uv run python src/sense_data.py
+uv run python src/wic_task.py --splits train dev          # -> data/wic_task.<split>.jsonl
+uv run python src/wic_task.py --splits dev --show 3       # print a few rendered prompts
 ```
 
-Writes `data/sense_{direct,triplet}.{train,dev,test}.json` and prints stats:
+GRPO builds these on first use if the files are missing.
 
-```
-train  direct= 30911  triplet=  5286  lemmas=17001
-dev    direct=  3934  triplet=   638  lemmas=2125
-test   direct=  3853  triplet=   607  lemmas=2125
-lemma overlap across splits: 0 0 0 (must be 0,0,0)
-```
+### (Optional) Re-distil teacher traces
 
-The split is reproducible from `(lexicon, seed=42)` and is reused everywhere via
-`sense_data.lemma_splits()`.
+```bash
+# k-sample self-consistency over the WiC pairs (needs an OpenRouter key)
+uv run python src/call_api.py --model deepseek/deepseek-v4-flash
+
+# score/filter the traces: cheap CPU rules, then a local LLM judge (isolated vLLM env)
+uv run python src/filter_reasoning.py
+```
 
 ---
 
-## 2. (Optional) Distil ChatGPT reasoning traces from SemCor
+## 2. SFT warm-start
 
-`gen_reasoning_data.py` builds reasoning-distillation data for the Phase-3
-warm-start. Usages come from **SemCor** (gold sense-tagged); definitions are
-resolved through `wn` (SemCor WN3.0 sense key → OEWN 2024 synset). ChatGPT writes
-a concise forward-reasoning `<think>` trace; the `<answer>` holds the gold
-gloss(es).
+Trains on the pairs the teacher got **right** (vote == gold label), so no
+confidently-wrong reasoning is distilled. Of the samples that voted with the
+majority, `--reasoning-select` decides which trace to keep — this is the ablation:
 
-```bash
-# build prompts only (no API calls)
-uv run python src/gen_reasoning_data.py --mode both
-
-# build + annotate with a teacher model (needs OPENAI_API_KEY + `openai`)
-uv run python src/gen_reasoning_data.py --mode both --annotate --model gpt-5-nano
-```
-
-Outputs `data/semcor_distill_{direct,triplet}.jsonl`. Each record carries the
-`prompt`, the `sft_answer` block, and (after `--annotate`) the `argument`, the
-assembled `sft_target` = `<think>…</think><answer>…</answer>`, and (when filtering
-is on) the per-record `bertscore`.
-
-### Quality control (annotate-only)
-
-The teacher occasionally refuses or drifts off the target sense; those traces are
-poison for the warm-start. Two guards run under `--annotate`:
-
-- **Empty/refused completions** are always dropped (a `None`/blank completion is
-  skipped, not written).
-- **`--min-bertscore`** drops traces whose reasoning is semantically far from the
-  gold definition it is meant to arrive at. Each `argument` is scored against its
-  gold gloss (`definition` for direct, `definition_same` for triplet) with
-  **BERTScore**, baseline-rescaled so the threshold is interpretable (~0 unrelated
-  → ~1). Default `0.0` = off; `~0.15` is a reasonable start. Needs the
-  `bert-score` package (`uv add bert-score`); the default `roberta-large` model
-  (~1.4 GB) downloads on first use, so run this on a server.
+| `--reasoning-select` | Keeps |
+|----------------------|-------|
+| `first` *(default)* | the earliest majority-voting sample |
+| `longest` | the longest chain of thought |
+| `entropy` | the trace the model is most uncertain about (mean predictive entropy) |
 
 ```bash
-# annotate, then drop traces that wander off the gold sense
-uv run python src/gen_reasoning_data.py --mode both --annotate --model gpt-5-nano \
-    --min-bertscore 0.15
+uv run python src/sft_sense.py --reasoning-select longest
 ```
 
-Every kept record stores its `{precision, recall, f1}` under `bertscore`, so you
-can build the JSONL once with `--min-bertscore 0` and inspect the distribution
-before committing to a threshold.
-
-| Filter flag | Default | Effect |
-|-------------|---------|--------|
-| `--min-bertscore F` | `0.0` (off) | drop traces scoring below `F` vs. the gold gloss |
-| `--bertscore-metric {f1,recall,precision}` | `f1` | which component to threshold; `recall` rewards covering the gloss and is lenient on the argument's extra reasoning |
-| `--bertscore-model NAME` | `roberta-large` (via `lang=en`) | override the scoring model; a custom model skips baseline rescaling |
-
-### Leakage control: `--lemma-split`
-
-Distillation data is *training* data, so it must not contain any dev/test lemma.
-The filter reuses the **same** split as the ablation (`sense_data.lemma_splits`,
-seed 42).
-
-| `--lemma-split` | Keeps | ~records (direct / triplet) | When |
-|-----------------|-------|------------------------------|------|
-| `non-eval` *(default)* | every lemma except dev/test | 38.9k / 9.4k | maximise warm-start data |
-| `train` | strictly the ablation's train lemmas | 24.4k / 8.3k | warm-start universe must equal train |
-| `dev` / `test` | only those eval lemmas | — | inspection / analysis |
-| `all` | no filtering | — | leakage not a concern |
-
-Both `non-eval` and `train` are leakage-safe (verified: 0 dev and 0 test lemmas
-in the output). `non-eval` additionally keeps SemCor lemmas that have no WordNet
-example sentence (never assigned to any split, so they can never appear in eval).
-
-```bash
-# strict train-lemma warm-start
-uv run python src/gen_reasoning_data.py --mode both --lemma-split train --annotate --model gpt-5-nano
-```
-
-Useful flags: `--mode {direct,triplet,both}`, `--max-per-lemma N`,
-`--max-examples N` (cap for a quick sample), `--out PATH` (single mode only). See
-[Quality control](#quality-control-annotate-only) above for the `--annotate`
-filtering flags.
+Writes `./qwen-sense-sft-wic-<strategy>`, resumes from the latest checkpoint in
+that dir, logs to wandb.
 
 ---
 
-## 3. Train the four configurations
+## 3. GRPO
+
+Warm-start from the SFT checkpoint and optimise the verifiable label:
 
 ```bash
-# config 1 — SFT direct
-uv run python src/sft_sense.py --mode direct
+uv run python src/grpo_sense.py --model ./qwen-sense-sft-wic-longest
 
-# config 2 — SFT triplet
-uv run python src/sft_sense.py --mode triplet
-
-# config 3 — GRPO direct, warm-started from the SFT checkpoint
-uv run python src/grpo_sense.py --mode direct  --model ./qwen-sense-sft-direct
-
-# config 4 — GRPO triplet, warm-started from the SFT checkpoint
-uv run python src/grpo_sense.py --mode triplet --model ./qwen-sense-sft-triplet
+# RL from base instead of the warm-started model (ablation)
+uv run python src/grpo_sense.py
 ```
 
-GRPO ablation (RL from base instead of the warm-started model) — just omit the
-SFT checkpoint:
+Writes `./qwen-sense-grpo-wic`. vLLM rollout offload via
+`--vllm-server-host/--vllm-server-port` (see `run_train.sh` / `run_infer.sh`).
+`--distill-out PATH` additionally logs the policy's own correct rollouts for
+self-distillation (§5) without affecting training.
 
-```bash
-uv run python src/grpo_sense.py --mode direct      # RL from base
-```
+### Reward
 
-Both scripts auto-build the WordNet splits if `data/sense_*` is missing, resume
-from the latest checkpoint in their output dir, and log to wandb.
+Defined in `sense_rewards.py` (importable without torch/trl, unit-tested in
+`tests/test_sense_rewards.py`):
 
-### GRPO reward
+| Term | Range | What it buys |
+|------|-------|--------------|
+| `reward_wic_accuracy` | ±1.0 | the verdict is right (exact — the gold label is known) |
+| `reward_wic_json` | −0.2 … +0.3 | a parseable JSON object, exactly the three keys, a real boolean verdict |
+| `reward_wic_format` | 0 … +0.2 | a `<think>` block and an extractable verdict |
+| `reward_think_length` | −0.3 … 0 | punishes a stubbed, missing or unclosed `<think>` |
 
-Verifiable reward = **gold-gloss similarity** + a small format term
-(`sense_data.gloss_similarity`, = mean of token-F1 and BLEU-2 — both stay smooth
-on short glosses, unlike BLEU-4). For triplet, fidelity is averaged over the
-three generated glosses against their gold definitions. vLLM rollout offload is
-available via `--vllm-server-host/--vllm-server-port`.
+The shape terms are capped well below the accuracy term, so **being right always
+beats being tidy** — a test pins that invariant.
 
 ---
 
-## 4. Evaluate (BLEU)
-
-`eval_sense.py` greedily generates a gloss per held-out test usage and reports
-corpus BLEU-4 against the WordNet gold (+ mean similarity, + empty-output count).
+## 4. Evaluate
 
 ```bash
-# evaluate each config (point --model at the trained checkpoint)
-uv run python src/eval_sense.py --mode direct  --model ./qwen-sense-sft-direct
-uv run python src/eval_sense.py --mode direct  --model ./qwen-sense-grpo-direct
-uv run python src/eval_sense.py --mode triplet --model ./qwen-sense-sft-triplet
-uv run python src/eval_sense.py --mode triplet --model ./qwen-sense-grpo-triplet
-
-# zero-shot base-model baseline
-uv run python src/eval_sense.py --mode direct
+uv run python src/eval_sense.py --model ./qwen-sense-grpo-wic
+uv run python src/eval_sense.py --model Qwen/Qwen3-0.6B      # zero-shot baseline
 ```
 
-Prints e.g. `[direct] n=3853  BLEU=… mean_sim=… empty=…` and saves predictions to
-`predictions_sense_{mode}.json`. Add `--bertscore` to also report BERTScore F1
-(downloads `roberta-large`; server-only), `--split dev` for the dev set, and
-`--max-samples N` for a quick check.
+Greedy-decodes the test split and reports accuracy + same/different P/R/F1
+(completions with no extractable verdict are counted as `empty` and excluded from
+P/R/F1). Saves `predictions_sense_wic_<split>.json`.
+
+---
+
+## 5. Self-distillation (next)
+
+The collection half exists: `grpo_sense.py --distill-out data/self_distill` appends
+every rollout whose verdict was **correct** to `data/self_distill.rank<N>.jsonl`, one
+file per process rank, as:
+
+```json
+{"score": 1.0, "completion": "<think>…</think>\n{…}", "prompt": "…", "lemma": "bank", "label": "different"}
+```
+
+**Not yet wired:** `sft_sense.py` reads the *teacher* schema
+(`sentence1`/`sentence2`/`reasonings`/`answers`/`prediction`, via
+`sense_data.load_teacher_traces`), which is not the schema above. Closing the loop
+needs a small loader that turns saved rollouts into SFT records — splitting
+`completion` into its `think` block and `sense1`/`sense2` JSON (both parsers already
+exist: `sense_data.parse_wic_answer` and `sense_rewards._extract_think`) and
+recovering `usage1`/`usage2` from the pair. Dedup across ranks, and consider keeping
+only one rollout per pair so easy pairs don't dominate the SFT mix.
 
 ---
 
@@ -200,12 +161,16 @@ Prints e.g. `[direct] n=3853  BLEU=… mean_sim=… empty=…` and saves predict
 
 | File | Role |
 |------|------|
-| `src/sense_data.py` | WordNet lemma-disjoint splits, prompts/targets, BLEU + reward metrics |
-| `src/gen_reasoning_data.py` | SemCor → ChatGPT reasoning-distillation traces (train-filtered) |
-| `src/sft_sense.py` | SFT for `--mode direct\|triplet` (configs 1 & 2) |
-| `src/grpo_sense.py` | GRPO for `--mode direct\|triplet` (configs 3 & 4) |
-| `src/eval_sense.py` | Generate on test split, report BLEU |
-| `ch05_implementation_plan.md` | Methodology / phase plan |
+| `src/sense_data.py` | Record loading (MCL-WiC + teacher traces), the shared prompt, answer parsing |
+| `src/wic_task.py` | Materialise the RL task to `data/wic_task.<split>.jsonl` for inspection |
+| `src/call_api.py` | Teacher self-consistency sampling over the WiC pairs |
+| `src/filter_reasoning.py` | Quality-filter the distilled traces (rules + LLM judge) |
+| `src/sft_sense.py` | SFT warm-start on the distilled traces |
+| `src/grpo_sense.py` | GRPO on the verifiable label |
+| `src/sense_rewards.py` | The reward functions |
+| `src/eval_sense.py` | Test-split generation + accuracy/F1 |
+| `tests/test_sense_rewards.py` | Reward contracts (runs on CPU in a second) |
 
-Data caches: WordNet via `wn` (`~/.wn_data`); SemCor auto-downloads to
-`.cache/semcor/` (gitignored).
+```bash
+uv run pytest        # reward unit tests
+```

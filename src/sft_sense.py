@@ -1,10 +1,10 @@
-"""SFT warm-start for the sense-modeling ablations.
+"""SFT warm-start for the WiC task, distilled from teacher reasoning traces.
 
---mode direct   -> config 1: single-usage definition generation
---mode triplet  -> config 2: anchor/positive/negative contrastive glosses
---mode wic      -> word-in-context same/different, distilled from GLM-5.2 traces
-                   (--wic-data data/wic_glm-5.2_test.json)
+Trains on the pairs a teacher model got right (``sense_data.load_teacher_traces`` over the
+``call_api.py`` output), so the policy learns both the <think> reasoning and the
+JSON answer contract before GRPO tightens the verdict.
 
+    uv run python src/sft_sense.py --reasoning-select longest
 """
 
 import argparse
@@ -19,15 +19,9 @@ from trl import SFTConfig, SFTTrainer
 
 import sense_data as sd
 
-_MESSAGES = {
-    "direct": sd.direct_messages,
-    "triplet": sd.triplet_messages,
-    "wic": sd.wic_messages,
-}
 
-
-def format_example(rec, tokenizer, mode):
-    msgs = _MESSAGES[mode](rec, with_target=True)
+def format_example(rec, tokenizer):
+    msgs = sd.wic_messages(rec, with_target=True)
     return {
         "text": tokenizer.apply_chat_template(
             msgs, tokenize=False, add_generation_prompt=False
@@ -36,7 +30,7 @@ def format_example(rec, tokenizer, mode):
 
 
 @torch.no_grad()
-def _make_entropy_scorer(model, tokenizer, mode="wic", max_cont_tokens=2048):
+def _make_entropy_scorer(model, tokenizer, max_cont_tokens=2048):
     """Score each candidate trace by the model's mean predictive entropy over it.
 
     The trace is scored in context: the wic prompt (no target) is the prefix, the
@@ -50,7 +44,7 @@ def _make_entropy_scorer(model, tokenizer, mode="wic", max_cont_tokens=2048):
 
     def scorer(rec, cands):
         prompt_ids = tokenizer.apply_chat_template(
-            _MESSAGES[mode](rec, with_target=False),
+            sd.wic_messages(rec, with_target=False),
             tokenize=True,
             add_generation_prompt=True,
             return_tensors="pt",
@@ -77,26 +71,17 @@ def _make_entropy_scorer(model, tokenizer, mode="wic", max_cont_tokens=2048):
     return scorer
 
 
-def _load_or_build(
-    mode, wic_data=None, strategy="first", scorer=None, dev_frac=0.05, seed=42
-):
-    # wic distills from a single GLM predictions file (no prebuilt train/dev
-    # splits), so carve a small held-out dev set off a deterministic shuffle.
-    if mode == "wic":
-        recs = sd.load_wic_glm(wic_data, strategy=strategy, scorer=scorer)
-        random.Random(seed).shuffle(recs)
-        n_dev = max(1, int(len(recs) * dev_frac))
-        dev, train = recs[:n_dev], recs[n_dev:]
-        return DatasetDict(
-            {"train": Dataset.from_list(train), "dev": Dataset.from_list(dev)}
-        )
-    try:
-        train = sd.load_split(mode, "train")
-        dev = sd.load_split(mode, "dev")
-    except FileNotFoundError:
-        print("Splits not found; building them via sense_data ...")
-        sd.save_dataset(sd.build_dataset())
-        train, dev = sd.load_split(mode, "train"), sd.load_split(mode, "dev")
+def load_dataset(wic_data, strategy="first", scorer=None, dev_frac=0.05, seed=42):
+    """Distilled traces, split into train/dev.
+
+    The distillation source is a single teacher predictions file (no prebuilt
+    train/dev splits), so a small held-out dev set is carved off a deterministic
+    shuffle.
+    """
+    recs = sd.load_teacher_traces(wic_data, strategy=strategy, scorer=scorer)
+    random.Random(seed).shuffle(recs)
+    n_dev = max(1, int(len(recs) * dev_frac))
+    dev, train = recs[:n_dev], recs[n_dev:]
     return DatasetDict(
         {"train": Dataset.from_list(train), "dev": Dataset.from_list(dev)}
     )
@@ -105,16 +90,18 @@ def _load_or_build(
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--model", default="Qwen/Qwen3-0.6B")
-    ap.add_argument("--mode", choices=["direct", "triplet", "wic"], required=True)
     ap.add_argument("--epochs", type=int, default=5)
-    ap.add_argument("--wic-data", type=str)
+    ap.add_argument(
+        "--wic-data",
+        default="data/mcl_semcor.json",
+        help="Teacher predictions file written by call_api.py.",
+    )
     ap.add_argument(
         "--reasoning-select",
         choices=["first", "longest", "entropy"],
         default="first",
-        help="Which distilled teacher trace to keep per pair (mode=wic "
-        "only): first majority-voting sample, longest CoT, or the "
-        "highest model predictive entropy",
+        help="Which distilled teacher trace to keep per pair: first majority-voting "
+        "sample, longest CoT, or the highest model predictive entropy",
     )
     args = ap.parse_args()
 
@@ -132,28 +119,23 @@ def main():
     )
 
     scorer = None
-    if args.mode == "wic" and args.reasoning_select == "entropy":
-        scorer = _make_entropy_scorer(model, tokenizer, mode=args.mode)
+    if args.reasoning_select == "entropy":
+        scorer = _make_entropy_scorer(model, tokenizer)
 
-    dataset = _load_or_build(
-        args.mode,
-        wic_data=args.wic_data,
-        strategy=args.reasoning_select,
-        scorer=scorer,
-    )
+    dataset = load_dataset(args.wic_data, strategy=args.reasoning_select, scorer=scorer)
     print(
-        f"[{args.mode}] train={len(dataset['train'])} dev={len(dataset['dev'])} "
+        f"[wic] train={len(dataset['train'])} dev={len(dataset['dev'])} "
         f"reasoning-select={args.reasoning_select}"
     )
 
-    fmt = partial(format_example, tokenizer=tokenizer, mode=args.mode)
+    fmt = partial(format_example, tokenizer=tokenizer)
     cols = dataset["train"].column_names
     dataset = dataset.map(fmt, remove_columns=cols)
     print(dataset["train"][0]["text"])
 
-    # Tag wic runs with the ablation so different strategies get separate output
-    # dirs / wandb runs and never resume from each other's checkpoints.
-    tag = args.mode if args.mode != "wic" else f"{args.mode}-{args.reasoning_select}"
+    # Tag runs with the ablation so different strategies get separate output dirs /
+    # wandb runs and never resume from each other's checkpoints.
+    tag = f"wic-{args.reasoning_select}"
     output_dir = f"./qwen-sense-sft-{tag}"
     training_args = SFTConfig(
         output_dir=output_dir,
