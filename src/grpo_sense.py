@@ -19,6 +19,7 @@ import torch
 from datasets import Dataset
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from trl import GRPOConfig, GRPOTrainer
+from trl.rewards import get_repetition_penalty_reward
 
 import sense_data as sd
 import wic_task
@@ -102,7 +103,11 @@ def main():
         **vllm_kwargs,
     )
 
-    reward_funcs = list(REWARDS)
+    # trl ships a token-id-based repetition penalty; use it instead of hand-rolling
+    # one. It guards against the degenerate-repetition reward hacking the
+    # format/length shaping can invite (see reward_wic_json). max_penalty is kept
+    # small so it stays well under the +/-1 accuracy term — being right dominates.
+    reward_funcs = list(REWARDS) + [get_repetition_penalty_reward(ngram_size=3, max_penalty=-0.2)]
     if args.distill_out:
         reward_funcs.append(make_trace_saver(args.distill_out, args.distill_threshold))
         print(
