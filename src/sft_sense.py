@@ -92,6 +92,10 @@ def main():
         save_steps=150,
         save_total_limit=2,
         load_best_model_at_end=True,
+        # Select by greedy-decode proxy (argmax correctness) rather than NLL,
+        # which can rise from overconfidence while decode behavior still improves.
+        metric_for_best_model="eval_mean_token_accuracy",
+        greater_is_better=True,
         report_to="wandb",
         run_name=f"qwen-sense-sft-{tag}-{data_tag}",
     )

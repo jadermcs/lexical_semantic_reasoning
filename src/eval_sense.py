@@ -1,13 +1,16 @@
 """Evaluate a WiC checkpoint on a held-out MCL-WiC split.
 
-Greedily generates a verdict per test pair and reports accuracy plus same/different
-precision/recall/F1. Completions with no extractable verdict are counted as
-``empty`` and left out of the P/R/F1 (they can't be scored as either class).
+Greedily generates a verdict per test pair (vLLM, continuous batching) and
+reports accuracy plus same/different precision/recall/F1. Completions with no
+extractable verdict are counted as ``empty`` and left out of the P/R/F1 (they
+can't be scored as either class).
 
 With ``--force-json`` the answer region is constrained to schema-valid JSON
 (two-phase decode: free reasoning up to ``</think>``, then an xgrammar-guided
-continuation), so every completion parses and ``empty`` drops to 0 —
-including pairs whose reasoning overran the budget, which get force-closed.
+continuation via vLLM structured outputs), so every completion parses and
+``empty`` drops to 0 — including pairs whose reasoning overran the budget,
+which get force-closed. Prefix caching means the phase-2 pass reuses the
+phase-1 KV cache instead of re-prefilling prompt + reasoning.
 
 Predictions are saved in the ``call_api.py`` teacher schema (one greedy sample
 per pair), so the output file can be fed straight to ``sft_sense.py --data``.
@@ -26,10 +29,8 @@ import argparse
 import json
 from pathlib import Path
 
-import torch
-import xgrammar as xgr
-from tqdm import tqdm
-from transformers import AutoModelForCausalLM, AutoTokenizer, LogitsProcessorList
+from vllm import LLM, SamplingParams
+from vllm.sampling_params import StructuredOutputsParams
 
 import sense_data as sd
 
@@ -51,65 +52,38 @@ WIC_JSON_SCHEMA = {
 }
 
 
-def compile_wic_grammar(model, tokenizer):
-    """Compile WIC_JSON_SCHEMA against the tokenizer, once per run.
+def generate_all(llm, texts, force_json=False):
+    """Greedy completions for all prompts; vLLM schedules the batch internally.
 
-    ``vocab_size`` comes from the model config, not the tokenizer: Qwen pads the
-    embedding matrix past the tokenizer vocab, and the grammar bitmask must match
-    the logits width.
+    With ``force_json``, decoding runs in two phases: free reasoning stopped at
+    ``</think>`` (force-closed if the token budget runs out first), then a
+    continuation whose tokens are constrained to schema-valid JSON (xgrammar,
+    via vLLM structured outputs), so every completion ends in a parseable
+    verdict. Prefix caching makes phase 2 a near-pure decode of the answer.
     """
-    info = xgr.TokenizerInfo.from_huggingface(tokenizer, vocab_size=model.config.vocab_size)
-    return xgr.GrammarCompiler(info).compile_json_schema(json.dumps(WIC_JSON_SCHEMA))
-
-
-def generate_batch(model, tokenizer, texts, grammar=None):
-    """Greedy completions for a batch of prompts.
-
-    With a compiled ``grammar``, decoding runs in two phases: free reasoning
-    stopped at ``</think>`` (force-closed if the token budget runs out first),
-    then a continuation whose tokens are constrained to the grammar, so every
-    completion ends in a parseable verdict.
-    """
-    inputs = tokenizer(texts, return_tensors="pt", padding=True, truncation=True).to(model.device)
-    gen_kwargs = dict(do_sample=False, pad_token_id=tokenizer.pad_token_id)
-    input_len = inputs["input_ids"].shape[1]
-
-    if grammar is None:
-        with torch.no_grad():
-            outputs = model.generate(**inputs, max_new_tokens=1024, **gen_kwargs)
-        return [tokenizer.decode(o[input_len:], skip_special_tokens=True) for o in outputs]
+    if not force_json:
+        sp = SamplingParams(temperature=0.0, max_tokens=1024)
+        return [out.outputs[0].text for out in llm.generate(texts, sp)]
 
     # Phase 1: free-form reasoning, halted at the close of the think block.
-    with torch.no_grad():
-        outputs = model.generate(
-            **inputs, max_new_tokens=1024, stop_strings=["</think>"],
-            tokenizer=tokenizer, **gen_kwargs,
-        )
+    sp1 = SamplingParams(
+        temperature=0.0, max_tokens=1024,
+        stop=["</think>"], include_stop_str_in_output=True,
+    )
     thinks = []
-    for out in outputs:
-        think = tokenizer.decode(out[input_len:], skip_special_tokens=True)
+    for out in llm.generate(texts, sp1):
+        think = out.outputs[0].text
         if "</think>" not in think:  # budget ran out mid-reasoning: force-close
             think += "\n</think>"
         thinks.append(think.rstrip() + "\n")
 
     # Phase 2: constrained continuation — only tokens forming schema-valid JSON.
-    # The xgrammar processor is stateful (one matcher per row), so build a fresh
-    # one for every generate call; the compiled grammar itself is reused.
-    inputs2 = tokenizer(
-        [p + t for p, t in zip(texts, thinks)],
-        return_tensors="pt", padding=True, truncation=True,
-    ).to(model.device)
-    with torch.no_grad():
-        outputs2 = model.generate(
-            **inputs2, max_new_tokens=512,
-            logits_processor=LogitsProcessorList([xgr.contrib.hf.LogitsProcessor(grammar)]),
-            **gen_kwargs,
-        )
-    input_len2 = inputs2["input_ids"].shape[1]
-    return [
-        think + tokenizer.decode(o[input_len2:], skip_special_tokens=True)
-        for think, o in zip(thinks, outputs2)
-    ]
+    sp2 = SamplingParams(
+        temperature=0.0, max_tokens=512,
+        structured_outputs=StructuredOutputsParams(json=WIC_JSON_SCHEMA),
+    )
+    outs2 = llm.generate([p + t for p, t in zip(texts, thinks)], sp2)
+    return [think + out.outputs[0].text for think, out in zip(thinks, outs2)]
 
 
 def wic_metrics(preds, golds):
@@ -138,47 +112,48 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--model", type=str, required=True)
     ap.add_argument("--split", default="test")
-    ap.add_argument("--batch-size", type=int, default=16)
     ap.add_argument("--max-samples", type=int, default=0, help="0 = full split")
     ap.add_argument("--force-json", action="store_true",
                     help="constrain the answer region to schema-valid JSON (xgrammar)")
+    # Short prompts + 1024 think + 512 answer fit well under 4096; a tight
+    # max_model_len keeps the KV cache small. 0.85 leaves headroom for the
+    # structured-output logit buffers on a desktop card (see filter_reasoning).
+    ap.add_argument("--max-model-len", type=int, default=4096)
+    ap.add_argument("--gpu-memory-utilization", type=float, default=0.85)
     ap.add_argument("--output", default=None)
     args = ap.parse_args()
 
-    tokenizer = AutoTokenizer.from_pretrained(args.model)
-    tokenizer.padding_side = "left"
-    if tokenizer.pad_token is None:
-        tokenizer.pad_token = tokenizer.eos_token
-
-    model = AutoModelForCausalLM.from_pretrained(args.model, device_map="auto", dtype=torch.bfloat16)
-    model.eval()
+    llm = LLM(
+        model=args.model,
+        max_model_len=args.max_model_len,
+        gpu_memory_utilization=args.gpu_memory_utilization,
+        enable_prefix_caching=True,  # phase 2 of --force-json reuses phase-1 KV
+    )
+    tokenizer = llm.get_tokenizer()
 
     data = sd.load_mclwic(args.split)
     if args.max_samples:
         data = data[: args.max_samples]
 
-    grammar = compile_wic_grammar(model, tokenizer) if args.force_json else None
+    texts = [build_prompt(r, tokenizer) for r in data]
+    decoded_all = generate_all(llm, texts, force_json=args.force_json)
 
     hyps, refs, records = [], [], []
-    for i in tqdm(range(0, len(data), args.batch_size)):
-        batch = data[i : i + args.batch_size]
-        texts = [build_prompt(r, tokenizer) for r in batch]
-        decoded_batch = generate_batch(model, tokenizer, texts, grammar)
-        for rec, decoded in zip(batch, decoded_batch):
-            hyp, gold = sd.extract_wic_label(decoded), rec["label"]
-            hyps.append(hyp)
-            refs.append(gold)
-            # Teacher-predictions schema (call_api.py), single greedy sample —
-            # the output file feeds sft_sense.py --data via load_teacher_traces.
-            think, closed, _ = decoded.partition("</think>")
-            answer = sd.parse_wic_answer(decoded)
-            records.append({
-                "lemma": rec["lemma"], "pos": rec["pos"],
-                "sentence1": rec["sentence1"], "sentence2": rec["sentence2"],
-                "label": gold, "prediction": hyp,
-                "answers": [json.dumps(answer, ensure_ascii=False)] if answer is not None else [],
-                "reasonings": [think.replace("<think>", "").strip()] if closed else [],
-            })
+    for rec, decoded in zip(data, decoded_all):
+        hyp, gold = sd.extract_wic_label(decoded), rec["label"]
+        hyps.append(hyp)
+        refs.append(gold)
+        # Teacher-predictions schema (call_api.py), single greedy sample —
+        # the output file feeds sft_sense.py --data via load_teacher_traces.
+        think, closed, _ = decoded.partition("</think>")
+        answer = sd.parse_wic_answer(decoded)
+        records.append({
+            "lemma": rec["lemma"], "pos": rec["pos"],
+            "sentence1": rec["sentence1"], "sentence2": rec["sentence2"],
+            "label": gold, "prediction": hyp,
+            "answers": [json.dumps(answer, ensure_ascii=False)] if answer is not None else [],
+            "reasonings": [think.replace("<think>", "").strip()] if closed else [],
+        })
 
     metrics = wic_metrics(hyps, refs)
     print(f"\n[wic] n={metrics['n']}  acc={metrics['accuracy']:.3f}  "

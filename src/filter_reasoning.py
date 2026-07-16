@@ -279,7 +279,8 @@ def main() -> int:
     )
     ap.add_argument(
         "--strict-gloss",
-        action="store_true",
+        type=bool,
+        default=True,
         help="also reject same-label slots whose two glosses are not verbatim "
         "identical (skews towards different-label data; off by default, the "
         "judge's 'consistent' axis makes the call instead)",
