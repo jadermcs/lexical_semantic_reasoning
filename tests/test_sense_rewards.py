@@ -82,6 +82,49 @@ class TestWicJson:
         assert R.reward_wic_json([completion]) == [0.0]
 
 
+class TestWicConsistency:
+    def test_different_glosses_with_same_verdict_is_penalised(self):
+        c = wrap(GOOD_THINK, json.dumps(
+            {"sense1": "a financial institution", "sense2": "sloping land", "same_sense": True}
+        ))
+        assert R.reward_wic_consistency([c]) == [R.WIC_INCONSISTENT]
+
+    def test_identical_glosses_with_different_verdict_is_penalised(self):
+        c = wrap(GOOD_THINK, json.dumps(
+            {"sense1": "a financial institution", "sense2": "a financial institution", "same_sense": False}
+        ))
+        assert R.reward_wic_consistency([c]) == [R.WIC_INCONSISTENT]
+
+    @pytest.mark.parametrize("verdict, sense2", [(False, "sloping land"), (True, "a financial institution")])
+    def test_coherent_answers_are_not_penalised(self, verdict, sense2):
+        c = wrap(GOOD_THINK, json.dumps(
+            {"sense1": "a financial institution", "sense2": sense2, "same_sense": verdict}
+        ))
+        assert R.reward_wic_consistency([c]) == [0.0]
+
+    def test_gloss_equality_ignores_case_and_punctuation(self):
+        # "Sloping land." and "sloping land" are the same gloss; punishing the
+        # match would teach the model to game equality with cosmetic edits.
+        c = wrap(GOOD_THINK, json.dumps(
+            {"sense1": "Sloping land.", "sense2": "sloping land", "same_sense": True}
+        ))
+        assert R.reward_wic_consistency([c]) == [0.0]
+
+    @pytest.mark.parametrize(
+        "answer",
+        [
+            "The two uses are different.",                                    # no JSON
+            '{"sense1": "a", "sense2": "b", "same_sense": "true"}',           # non-boolean verdict
+            '{"sense1": "", "sense2": "b", "same_sense": false}',             # empty gloss
+            '{"sense2": "b", "same_sense": false}',                           # missing gloss
+        ],
+    )
+    def test_unscorable_answers_are_neutral(self, answer):
+        # reward_wic_json already charges for shape failures; double-charging here
+        # would swamp the accuracy signal.
+        assert R.reward_wic_consistency([wrap(GOOD_THINK, answer)]) == [0.0]
+
+
 # --------------------------------------------------------------------------- #
 # Verdict accuracy + format
 # --------------------------------------------------------------------------- #
@@ -150,6 +193,7 @@ def test_every_reward_is_registered():
         R.reward_wic_accuracy,
         R.reward_wic_format,
         R.reward_wic_json,
+        R.reward_wic_consistency,
         R.reward_think_length,
     ]
     assert R.KEEP_COLS == ["lemma", "label"]

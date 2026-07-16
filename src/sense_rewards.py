@@ -9,11 +9,12 @@ The reward has two halves:
 * **Correctness** — ``reward_wic_accuracy``. The gold same/different label is
   known, so this is exact rather than a similarity estimate. It dominates
   (+/-1.0) everything else.
-* **Shape** — ``reward_wic_format``, ``reward_wic_json`` and
-  ``reward_think_length`` pay for the reasoning block and the JSON answer contract
+* **Shape** — ``reward_wic_format``, ``reward_wic_json``, ``reward_wic_consistency``
+  and ``reward_think_length`` pay for the reasoning block and the JSON answer contract
   the prompt asks for, and punish the ways models degenerate out of it (a stubbed
-  <think>, a prose answer, an unclosed reasoning block). Their combined ceiling
-  stays well under the accuracy term, so being right always beats being tidy.
+  <think>, a prose answer, an unclosed reasoning block, a gloss pair that contradicts
+  the same_sense verdict). Their combined ceiling stays well under the accuracy term,
+  so being right always beats being tidy.
 """
 
 import json
@@ -147,7 +148,45 @@ def reward_wic_json(completions, **kwargs):
     return out
 
 
-REWARDS = [reward_wic_accuracy, reward_wic_format, reward_wic_json, reward_think_length]
+# The answer states the verdict twice: once as the sense1/sense2 gloss pair and
+# once as the boolean. An answer whose glosses contradict its verdict (identical
+# glosses with same_sense=false, or differing glosses with same_sense=true) got
+# the JSON shape right while being internally incoherent — punish it.
+WIC_INCONSISTENT = -0.3
+
+
+def reward_wic_consistency(completions, **kwargs):
+    """Punish a same_sense verdict that contradicts the emitted glosses.
+
+    The SFT target (see ``sd.wic_answer``) writes the *same* gloss string into
+    sense1 and sense2 when the senses match, and different glosses when they
+    don't — so gloss equality (compared token-wise, ignoring case/punctuation)
+    must agree with the boolean. Anything unparseable, missing a piece, or with a
+    non-boolean verdict scores 0: ``reward_wic_json`` already charges for those,
+    and double-charging would drown the accuracy signal.
+    """
+    out = []
+    for c in completions:
+        r = 0.0
+        obj = sd.parse_wic_answer(c)
+        if obj is not None:
+            s1, s2, verdict = obj.get("sense1"), obj.get("sense2"), obj.get("same_sense")
+            if isinstance(s1, str) and isinstance(s2, str) and isinstance(verdict, bool) \
+                    and s1.strip() and s2.strip():
+                glosses_same = sd._tok(s1) == sd._tok(s2)
+                if glosses_same != verdict:
+                    r = WIC_INCONSISTENT
+        out.append(r)
+    return out
+
+
+REWARDS = [
+    reward_wic_accuracy,
+    reward_wic_format,
+    reward_wic_json,
+    reward_wic_consistency,
+    reward_think_length,
+]
 
 # Gold columns the reward fns (and the trace saver) read off the dataset.
 KEEP_COLS = ["lemma", "label"]
