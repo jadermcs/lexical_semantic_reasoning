@@ -9,6 +9,9 @@ With ``--force-json`` the answer region is constrained to schema-valid JSON
 continuation), so every completion parses and ``empty`` drops to 0 —
 including pairs whose reasoning overran the budget, which get force-closed.
 
+Predictions are saved in the ``call_api.py`` teacher schema (one greedy sample
+per pair), so the output file can be fed straight to ``sft_sense.py --data``.
+
 Examples
 --------
   # a trained checkpoint
@@ -165,8 +168,17 @@ def main():
             hyp, gold = sd.extract_wic_label(decoded), rec["label"]
             hyps.append(hyp)
             refs.append(gold)
-            records.append({"lemma": rec["lemma"], "gold": gold,
-                            "prediction": hyp, "raw_output": decoded})
+            # Teacher-predictions schema (call_api.py), single greedy sample —
+            # the output file feeds sft_sense.py --data via load_teacher_traces.
+            think, closed, _ = decoded.partition("</think>")
+            answer = sd.parse_wic_answer(decoded)
+            records.append({
+                "lemma": rec["lemma"], "pos": rec["pos"],
+                "sentence1": rec["sentence1"], "sentence2": rec["sentence2"],
+                "label": gold, "prediction": hyp,
+                "answers": [json.dumps(answer, ensure_ascii=False)] if answer is not None else [],
+                "reasonings": [think.replace("<think>", "").strip()] if closed else [],
+            })
 
     metrics = wic_metrics(hyps, refs)
     print(f"\n[wic] n={metrics['n']}  acc={metrics['accuracy']:.3f}  "
@@ -177,12 +189,12 @@ def main():
     print(f"{'lemma':<18}  {'gold':<10}  {'prediction':<10}")
     for rec in records[:10]:
         pred = "—" if rec["prediction"] is None else str(rec["prediction"])
-        print(f"{rec['lemma']:<18}  {str(rec['gold']):<10}  {pred:<10}")
+        print(f"{rec['lemma']:<18}  {str(rec['label']):<10}  {pred:<10}")
 
+    # Bare list in the call_api.py teacher schema — directly consumable by
+    # sft_sense.py --data. Metrics are printed above, not saved.
     out_path = Path(args.output or f"predictions_sense_wic_{args.split}.json")
-    out_path.write_text(json.dumps(
-        {"model": args.model, "split": args.split, **metrics, "predictions": records},
-        ensure_ascii=False, indent=2))
+    out_path.write_text(json.dumps(records, ensure_ascii=False, indent=2))
     print(f"Saved predictions → {out_path}")
 
 

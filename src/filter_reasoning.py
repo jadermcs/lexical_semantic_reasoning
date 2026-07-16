@@ -13,10 +13,12 @@ So filtering runs in two stages:
   every slot that reached the wrong conclusion -- ``votes[j]`` is the
   ``same_sense`` parsed out of ``answers[j]``, so comparing it to the gold
   ``label`` settles faithfulness exactly, for free, and there is nothing for a
-  judge to add. A gloss rule then drops slots whose sense glosses contradict
-  the gold label: identical ``sense1``/``sense2`` glosses under a *different*
-  label, or differing glosses under a *same* label. Roughly half of all slots
-  die here and never reach the GPU.
+  judge to add. A gloss rule then drops slots whose identical
+  ``sense1``/``sense2`` glosses contradict a *different* gold label (with
+  ``--strict-gloss``, also differing glosses under a *same* label -- but
+  string comparison mistakes paraphrases for distinct senses, so that call
+  defaults to the judge). Roughly half of all slots die here and never reach
+  the GPU.
 * **Stage 2 (LLM judge).** Everything that survives -- i.e. only traces that
   landed on the right answer -- is scored by a local Gemma 4 12B (QAT W4A16)
   served with vLLM, on four axes chosen to match the ways these traces actually
@@ -118,14 +120,18 @@ def _normalize_gloss(gloss: str) -> str:
     return " ".join(gloss.lower().split()).rstrip(".")
 
 
-def sense_check(rec: dict, slot: int) -> str | None:
+def sense_check(rec: dict, slot: int, strict_gloss: bool = False) -> str | None:
     """Reject slot ``slot`` if its sense glosses contradict the gold label.
 
-    A ``same`` gold label demands one sense, so the two glosses should be the
-    same definition; a ``different`` gold label demands two, so identical
-    glosses mean the trace never actually distinguished the senses. Either
-    mismatch makes the paired answer JSON unusable as supervision even when
-    its ``same_sense`` verdict happens to be right.
+    Identical glosses under a *different* gold label are always a
+    contradiction: the trace never actually distinguished the senses.
+
+    The converse -- differing glosses under a *same* gold label -- only fires
+    with ``strict_gloss``. String comparison cannot tell a paraphrase of one
+    sense ("to kill someone by firing a gun" vs "to hit or kill someone with a
+    bullet from a gun") from two genuinely different senses, so by default the
+    call is left to the judge's ``consistent`` axis; strict mode demands
+    verbatim-identical glosses and skews the corpus towards *different* labels.
     """
     answers = rec.get("answers") or []
     if slot >= len(answers) or answers[slot] is None:
@@ -138,7 +144,7 @@ def sense_check(rec: dict, slot: int) -> str | None:
     same_gloss = _normalize_gloss(str(sense1)) == _normalize_gloss(str(sense2))
     if same_gloss and not bool(rec["label"]):
         return "same_gloss_diff_label"
-    if not same_gloss and bool(rec["label"]):
+    if strict_gloss and not same_gloss and bool(rec["label"]):
         return "diff_gloss_same_label"
     return None
 
@@ -272,6 +278,13 @@ def main() -> int:
         help="skip the GPU judge; apply stage-1 rules only",
     )
     ap.add_argument(
+        "--strict-gloss",
+        action="store_true",
+        help="also reject same-label slots whose two glosses are not verbatim "
+        "identical (skews towards different-label data; off by default, the "
+        "judge's 'consistent' axis makes the call instead)",
+    )
+    ap.add_argument(
         "--require",
         nargs="+",
         default=["english", "coherent", "faithful", "consistent"],
@@ -288,7 +301,11 @@ def main() -> int:
     pending: list[tuple[int, int]] = []  # (record, slot) awaiting the judge
     for i, rec in enumerate(data):
         for j, text in enumerate(rec.get("reasonings") or []):
-            rule = rule_check(text) or vote_check(rec, j) or sense_check(rec, j)
+            rule = (
+                rule_check(text)
+                or vote_check(rec, j)
+                or sense_check(rec, j, args.strict_gloss)
+            )
             if rule is not None:
                 verdicts.append(Verdict(i, j, "rule", False, rule))
             else:

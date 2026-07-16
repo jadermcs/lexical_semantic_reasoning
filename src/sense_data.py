@@ -87,6 +87,10 @@ def load_mclwic(split: str, data_dir: Path = DATA_DIR) -> list[dict]:
             "lemma": r["lemma"],
             "pos": r["pos"],
             "label": bool(r["label"]),
+            # raw sentences kept so eval predictions can round-trip through
+            # load_teacher_traces (which re-marks the target from the lemma)
+            "sentence1": r["sentence1"],
+            "sentence2": r["sentence2"],
             "usage1": mark_target(r["sentence1"], r["word1"]),
             "usage2": mark_target(r["sentence2"], r["word2"]),
         }
