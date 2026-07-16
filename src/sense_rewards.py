@@ -44,13 +44,17 @@ def _answer_region(text):
 
 
 def _think_answer_format_reward(completions, extractor):
-    """Reward a present <think> block (0.1) and an extractable answer (0.1)."""
+    """Reward a present <think> block (0.1) and an extractable answer (0.1).
+
+    Extractability is judged with ``is not None`` — a boolean False verdict is a
+    perfectly good answer, not a missing one.
+    """
     out = []
     for c in completions:
         r = 0.0
         if re.search(r"<think>.+?</think>", c, re.DOTALL):
             r += 0.1
-        if extractor(c):
+        if extractor(c) is not None:
             r += 0.1
         out.append(r)
     return out
@@ -97,10 +101,10 @@ def reward_wic_accuracy(completions, **kwargs):
     out = []
     for c, label in zip(completions, kwargs["label"]):
         pred = sd.extract_wic_label(c)
-        if not pred:
+        if pred is None:
             out.append(0.0)
         else:
-            out.append(WIC_CORRECT if pred == label else WIC_WRONG)
+            out.append(WIC_CORRECT if pred == bool(label) else WIC_WRONG)
     return out
 
 

@@ -47,16 +47,6 @@ emits its reasoning and then a single JSON verdict:
 `usage1`, `usage2`) and owns the prompt, so SFT, GRPO and eval all see exactly the
 same format.
 
-**Materialise the RL task** so the examples the policy rolls out against can be
-read before spending a run on them:
-
-```bash
-uv run python src/wic_task.py --splits train dev          # -> data/wic_task.<split>.jsonl
-uv run python src/wic_task.py --splits dev --show 3       # print a few rendered prompts
-```
-
-GRPO builds these on first use if the files are missing.
-
 ### (Optional) Re-distil teacher traces
 
 ```bash
@@ -162,7 +152,6 @@ only one rollout per pair so easy pairs don't dominate the SFT mix.
 | File | Role |
 |------|------|
 | `src/sense_data.py` | Record loading (MCL-WiC + teacher traces), the shared prompt, answer parsing |
-| `src/wic_task.py` | Materialise the RL task to `data/wic_task.<split>.jsonl` for inspection |
 | `src/call_api.py` | Teacher self-consistency sampling over the WiC pairs |
 | `src/filter_reasoning.py` | Quality-filter the distilled traces (rules + LLM judge) |
 | `src/sft_sense.py` | SFT warm-start on the distilled traces |

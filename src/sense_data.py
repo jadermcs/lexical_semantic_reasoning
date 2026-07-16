@@ -9,7 +9,7 @@ Two data sources, both landing in the same record shape
 
 * ``load_mclwic`` — the gold MCL-WiC benchmark (``data/mcl-wic.<split>.json``).
   Carries the same/different label but no glosses. This is what GRPO rolls out
-  against (via ``wic_task.py``) and what ``eval_sense.py`` scores.
+  against and what ``eval_sense.py`` scores.
 * ``load_teacher_traces`` — teacher predictions from ``call_api.py``, kept only where the
   teacher's self-consistency vote matched the gold label. These add a distilled
   ``think`` trace and the teacher's two sense glosses, which is what the SFT
@@ -74,7 +74,8 @@ def load_mclwic(split: str, data_dir: Path = DATA_DIR) -> list[dict]:
 
     MCL-WiC is a gold word-in-context dataset: two sentences, the target word's
     surface form in each, and a same/different label (1 = same sense, 0 =
-    different, per the WiC True/False convention). It carries no glosses, so only
+    different) kept here as a boolean, matching the ``same_sense`` answer key.
+    It carries no glosses, so only
     the verifiable same/different verdict can be scored — there is no gold gloss to
     reward the reasoning against. The two sentences aren't pre-tagged, so the
     surface form (``word1``/``word2``) is wrapped with <t> tags here to match the
@@ -85,7 +86,7 @@ def load_mclwic(split: str, data_dir: Path = DATA_DIR) -> list[dict]:
         {
             "lemma": r["lemma"],
             "pos": r["pos"],
-            "label": "same" if r["label"] == 1 else "different",
+            "label": bool(r["label"]),
             "usage1": mark_target(r["sentence1"], r["word1"]),
             "usage2": mark_target(r["sentence2"], r["word2"]),
         }
@@ -177,7 +178,7 @@ def load_teacher_traces(path: str | Path, strategy: str = "first", scorer=None) 
             {
                 "lemma": r["lemma"],
                 "pos": r["pos"],
-                "label": "same" if r["label"] == 1 else "different",
+                "label": bool(r["label"]),
                 "usage1": mark_target(r["sentence1"], r["lemma"]),
                 "usage2": mark_target(r["sentence2"], r["lemma"]),
                 "think": chosen["think"],
@@ -202,7 +203,7 @@ def wic_answer(rec) -> str:
         {
             "sense1": rec.get("sense1", ""),
             "sense2": rec.get("sense2", ""),
-            "same_sense": rec["label"] == "same",
+            "same_sense": bool(rec["label"]),
         }
     )
 
@@ -266,8 +267,8 @@ def parse_wic_answer(text: str) -> dict | None:
     return obj if isinstance(obj, dict) else None
 
 
-def extract_wic_label(text: str) -> str:
-    """Return 'same' or 'different' from the answer region, or '' if unclear.
+def extract_wic_label(text: str) -> bool | None:
+    """Return the same-sense verdict as a boolean, or None if unclear.
 
     Prefer the JSON verdict (``{"same_sense": ...}``, coerced with ``bool`` so a
     stringly-typed "true" still yields a verdict); fall back to a bare
@@ -278,11 +279,11 @@ def extract_wic_label(text: str) -> str:
     obj = parse_wic_answer(text)
     if obj is not None:
         try:
-            return "same" if bool(obj["same_sense"]) else "different"
+            return bool(obj["same_sense"])
         except (KeyError, TypeError):
             pass
     seg = text.split("</think>")[-1]
     if "<think>" in seg:
-        return ""
+        return None
     m = re.search(r"\b(same|different)\b", seg, flags=re.IGNORECASE)
-    return m.group(1).lower() if m else ""
+    return m.group(1).lower() == "same" if m else None

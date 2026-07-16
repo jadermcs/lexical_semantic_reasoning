@@ -13,7 +13,10 @@ So filtering runs in two stages:
   every slot that reached the wrong conclusion -- ``votes[j]`` is the
   ``same_sense`` parsed out of ``answers[j]``, so comparing it to the gold
   ``label`` settles faithfulness exactly, for free, and there is nothing for a
-  judge to add. Roughly half of all slots die here and never reach the GPU.
+  judge to add. A gloss rule then drops slots whose sense glosses contradict
+  the gold label: identical ``sense1``/``sense2`` glosses under a *different*
+  label, or differing glosses under a *same* label. Roughly half of all slots
+  die here and never reach the GPU.
 * **Stage 2 (LLM judge).** Everything that survives -- i.e. only traces that
   landed on the right answer -- is scored by a local Gemma 4 12B (QAT W4A16)
   served with vLLM, on four axes chosen to match the ways these traces actually
@@ -107,6 +110,36 @@ def vote_check(rec: dict, slot: int) -> str | None:
         return "no_vote"
     if bool(votes[slot]) != bool(rec["label"]):
         return "wrong_prediction"
+    return None
+
+
+def _normalize_gloss(gloss: str) -> str:
+    """Canonicalize a sense gloss so trivially-identical wordings compare equal."""
+    return " ".join(gloss.lower().split()).rstrip(".")
+
+
+def sense_check(rec: dict, slot: int) -> str | None:
+    """Reject slot ``slot`` if its sense glosses contradict the gold label.
+
+    A ``same`` gold label demands one sense, so the two glosses should be the
+    same definition; a ``different`` gold label demands two, so identical
+    glosses mean the trace never actually distinguished the senses. Either
+    mismatch makes the paired answer JSON unusable as supervision even when
+    its ``same_sense`` verdict happens to be right.
+    """
+    answers = rec.get("answers") or []
+    if slot >= len(answers) or answers[slot] is None:
+        return None
+    try:
+        answer = json.loads(answers[slot])
+        sense1, sense2 = answer["sense1"], answer["sense2"]
+    except (json.JSONDecodeError, KeyError, TypeError):
+        return None  # unparseable answers already die in vote_check
+    same_gloss = _normalize_gloss(str(sense1)) == _normalize_gloss(str(sense2))
+    if same_gloss and not bool(rec["label"]):
+        return "same_gloss_diff_label"
+    if not same_gloss and bool(rec["label"]):
+        return "diff_gloss_same_label"
     return None
 
 
@@ -255,7 +288,7 @@ def main() -> int:
     pending: list[tuple[int, int]] = []  # (record, slot) awaiting the judge
     for i, rec in enumerate(data):
         for j, text in enumerate(rec.get("reasonings") or []):
-            rule = rule_check(text) or vote_check(rec, j)
+            rule = rule_check(text) or vote_check(rec, j) or sense_check(rec, j)
             if rule is not None:
                 verdicts.append(Verdict(i, j, "rule", False, rule))
             else:

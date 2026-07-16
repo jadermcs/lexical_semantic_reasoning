@@ -110,16 +110,16 @@ def generate_batch(model, tokenizer, texts, grammar=None):
 
 
 def wic_metrics(preds, golds):
-    """Accuracy + same/different P/R/F1 over parsed verdicts; '' preds are unscored."""
+    """Accuracy + same/different P/R/F1 over parsed verdicts; None preds are unscored."""
     from sklearn.metrics import accuracy_score, precision_recall_fscore_support
 
-    scored = [(p, g) for p, g in zip(preds, golds) if p]
+    scored = [(p, g) for p, g in zip(preds, golds) if p is not None]
     n = len(scored)
     y_pred = [p for p, _ in scored]
     y_true = [g for _, g in scored]
     if n:
         prec, rec, f1, _ = precision_recall_fscore_support(
-            y_true, y_pred, average="binary", pos_label="same", zero_division=0,
+            y_true, y_pred, average="binary", pos_label=True, zero_division=0,
         )
         acc = accuracy_score(y_true, y_pred)
     else:
@@ -176,7 +176,8 @@ def main():
     print("\nExamples (first 10):")
     print(f"{'lemma':<18}  {'gold':<10}  {'prediction':<10}")
     for rec in records[:10]:
-        print(f"{rec['lemma']:<18}  {rec['gold']:<10}  {(rec['prediction'] or '—'):<10}")
+        pred = "—" if rec["prediction"] is None else str(rec["prediction"])
+        print(f"{rec['lemma']:<18}  {str(rec['gold']):<10}  {pred:<10}")
 
     out_path = Path(args.output or f"predictions_sense_wic_{args.split}.json")
     out_path.write_text(json.dumps(

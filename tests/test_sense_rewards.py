@@ -132,20 +132,20 @@ class TestWicAccuracy:
     def test_correct_and_wrong_verdicts(self):
         right = wrap(GOOD_THINK, json.dumps({"sense1": "a", "sense2": "b", "same_sense": True}))
         wrong = wrap(GOOD_THINK, json.dumps({"sense1": "a", "sense2": "b", "same_sense": False}))
-        assert R.reward_wic_accuracy([right, wrong], label=["same", "same"]) == [
+        assert R.reward_wic_accuracy([right, wrong], label=[True, True]) == [
             R.WIC_CORRECT,
             R.WIC_WRONG,
         ]
 
     def test_absent_verdict_scores_zero(self):
         c = "<think>never closed and never answered"
-        assert R.reward_wic_accuracy([c], label=["same"]) == [0.0]
+        assert R.reward_wic_accuracy([c], label=[True]) == [0.0]
 
     def test_prose_verdict_still_scores_but_forfeits_json_credit(self):
         # The accuracy reward is deliberately lenient (it scores the decision
         # wherever it was expressed); reward_wic_json is what prices the shape.
         c = wrap(GOOD_THINK, "These are two different senses.")
-        assert R.reward_wic_accuracy([c], label=["different"]) == [R.WIC_CORRECT]
+        assert R.reward_wic_accuracy([c], label=[False]) == [R.WIC_CORRECT]
         assert R.reward_wic_json([c]) == [pytest.approx(R.WIC_JSON_MALFORMED)]
 
     def test_format_reward_pays_for_think_and_extractable_verdict(self):

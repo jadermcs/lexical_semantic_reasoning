@@ -5,8 +5,8 @@ as the same sense or a different sense. The label is gold (MCL-WiC), so the rewa
 is verifiable — see ``sense_rewards``, which is importable without the training
 stack and unit-tested in ``tests/test_sense_rewards.py``.
 
-The examples rolled out against are read from ``data/wic_task.<split>.jsonl`` (built
-on first use by ``wic_task.py``), so they can be inspected before a run.
+The examples rolled out against are the gold MCL-WiC pairs
+(``sense_data.load_mclwic``), the same source ``eval_sense.py`` scores.
 
     uv run python src/grpo_sense.py --model ./qwen-sense-sft-wic-longest
 """
@@ -22,7 +22,6 @@ from trl import GRPOConfig, GRPOTrainer
 from trl.rewards import get_repetition_penalty_reward
 
 import sense_data as sd
-import wic_task
 from sense_rewards import KEEP_COLS, REWARDS, make_trace_saver
 
 
@@ -33,7 +32,7 @@ def format_prompt(rec, tokenizer):
 
 
 def build_dataset(split, tokenizer, cap=None):
-    ds = Dataset.from_list(wic_task.load(split))
+    ds = Dataset.from_list(sd.load_mclwic(split))
     if cap is not None:
         ds = ds.shuffle(seed=42).select(range(min(cap, len(ds))))
     drop = [c for c in ds.column_names if c not in KEEP_COLS]
