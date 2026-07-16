@@ -263,7 +263,7 @@ def main() -> int:
     ap.add_argument(
         "--checkpoint",
         type=Path,
-        default=Path("data/.reasoning_verdicts.jsonl"),
+        default=Path("data/reasoning_verdicts.jsonl"),
         help="resumable verdict log; delete it to re-judge from scratch",
     )
     ap.add_argument(
