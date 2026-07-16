@@ -4,12 +4,19 @@ Greedily generates a verdict per test pair and reports accuracy plus same/differ
 precision/recall/F1. Completions with no extractable verdict are counted as
 ``empty`` and left out of the P/R/F1 (they can't be scored as either class).
 
+With ``--force-json`` the answer region is constrained to schema-valid JSON
+(two-phase decode: free reasoning up to ``</think>``, then an xgrammar-guided
+continuation), so every completion parses and ``empty`` drops to 0 —
+including pairs whose reasoning overran the budget, which get force-closed.
+
 Examples
 --------
   # a trained checkpoint
   uv run python src/eval_sense.py --model ./qwen-sense-grpo-wic
   # zero-shot base-model baseline
   uv run python src/eval_sense.py --model Qwen/Qwen3-0.6B
+  # guarantee a parseable JSON verdict on every pair
+  uv run python src/eval_sense.py --model ./qwen-sense-grpo-wic --force-json
 """
 
 import argparse
@@ -17,8 +24,9 @@ import json
 from pathlib import Path
 
 import torch
+import xgrammar as xgr
 from tqdm import tqdm
-from transformers import AutoModelForCausalLM, AutoTokenizer
+from transformers import AutoModelForCausalLM, AutoTokenizer, LogitsProcessorList
 
 import sense_data as sd
 
@@ -26,6 +34,79 @@ import sense_data as sd
 def build_prompt(rec, tokenizer):
     msgs = sd.wic_messages(rec, with_target=False)
     return tokenizer.apply_chat_template(msgs, tokenize=False, add_generation_prompt=True)
+
+
+# Shape of the answer object (mirrors sense_data.wic_answer / WIC_ANSWER_KEYS).
+WIC_JSON_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "sense1": {"type": "string"},
+        "sense2": {"type": "string"},
+        "same_sense": {"type": "boolean"},
+    },
+    "required": ["sense1", "sense2", "same_sense"],
+}
+
+
+def compile_wic_grammar(model, tokenizer):
+    """Compile WIC_JSON_SCHEMA against the tokenizer, once per run.
+
+    ``vocab_size`` comes from the model config, not the tokenizer: Qwen pads the
+    embedding matrix past the tokenizer vocab, and the grammar bitmask must match
+    the logits width.
+    """
+    info = xgr.TokenizerInfo.from_huggingface(tokenizer, vocab_size=model.config.vocab_size)
+    return xgr.GrammarCompiler(info).compile_json_schema(json.dumps(WIC_JSON_SCHEMA))
+
+
+def generate_batch(model, tokenizer, texts, grammar=None):
+    """Greedy completions for a batch of prompts.
+
+    With a compiled ``grammar``, decoding runs in two phases: free reasoning
+    stopped at ``</think>`` (force-closed if the token budget runs out first),
+    then a continuation whose tokens are constrained to the grammar, so every
+    completion ends in a parseable verdict.
+    """
+    inputs = tokenizer(texts, return_tensors="pt", padding=True, truncation=True).to(model.device)
+    gen_kwargs = dict(do_sample=False, pad_token_id=tokenizer.pad_token_id)
+    input_len = inputs["input_ids"].shape[1]
+
+    if grammar is None:
+        with torch.no_grad():
+            outputs = model.generate(**inputs, max_new_tokens=1024, **gen_kwargs)
+        return [tokenizer.decode(o[input_len:], skip_special_tokens=True) for o in outputs]
+
+    # Phase 1: free-form reasoning, halted at the close of the think block.
+    with torch.no_grad():
+        outputs = model.generate(
+            **inputs, max_new_tokens=1024, stop_strings=["</think>"],
+            tokenizer=tokenizer, **gen_kwargs,
+        )
+    thinks = []
+    for out in outputs:
+        think = tokenizer.decode(out[input_len:], skip_special_tokens=True)
+        if "</think>" not in think:  # budget ran out mid-reasoning: force-close
+            think += "\n</think>"
+        thinks.append(think.rstrip() + "\n")
+
+    # Phase 2: constrained continuation — only tokens forming schema-valid JSON.
+    # The xgrammar processor is stateful (one matcher per row), so build a fresh
+    # one for every generate call; the compiled grammar itself is reused.
+    inputs2 = tokenizer(
+        [p + t for p, t in zip(texts, thinks)],
+        return_tensors="pt", padding=True, truncation=True,
+    ).to(model.device)
+    with torch.no_grad():
+        outputs2 = model.generate(
+            **inputs2, max_new_tokens=512,
+            logits_processor=LogitsProcessorList([xgr.contrib.hf.LogitsProcessor(grammar)]),
+            **gen_kwargs,
+        )
+    input_len2 = inputs2["input_ids"].shape[1]
+    return [
+        think + tokenizer.decode(o[input_len2:], skip_special_tokens=True)
+        for think, o in zip(thinks, outputs2)
+    ]
 
 
 def wic_metrics(preds, golds):
@@ -56,6 +137,8 @@ def main():
     ap.add_argument("--split", default="test")
     ap.add_argument("--batch-size", type=int, default=16)
     ap.add_argument("--max-samples", type=int, default=0, help="0 = full split")
+    ap.add_argument("--force-json", action="store_true",
+                    help="constrain the answer region to schema-valid JSON (xgrammar)")
     ap.add_argument("--output", default=None)
     args = ap.parse_args()
 
@@ -71,19 +154,14 @@ def main():
     if args.max_samples:
         data = data[: args.max_samples]
 
+    grammar = compile_wic_grammar(model, tokenizer) if args.force_json else None
+
     hyps, refs, records = [], [], []
     for i in tqdm(range(0, len(data), args.batch_size)):
         batch = data[i : i + args.batch_size]
         texts = [build_prompt(r, tokenizer) for r in batch]
-        inputs = tokenizer(texts, return_tensors="pt", padding=True, truncation=True).to(model.device)
-        with torch.no_grad():
-            outputs = model.generate(
-                **inputs, max_new_tokens=1024, do_sample=False,
-                pad_token_id=tokenizer.pad_token_id,
-            )
-        input_len = inputs["input_ids"].shape[1]
-        for rec, out in zip(batch, outputs):
-            decoded = tokenizer.decode(out[input_len:], skip_special_tokens=True)
+        decoded_batch = generate_batch(model, tokenizer, texts, grammar)
+        for rec, decoded in zip(batch, decoded_batch):
             hyp, gold = sd.extract_wic_label(decoded), rec["label"]
             hyps.append(hyp)
             refs.append(gold)
