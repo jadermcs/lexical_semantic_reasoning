@@ -115,9 +115,6 @@ def main():
     ap.add_argument("--max-samples", type=int, default=0, help="0 = full split")
     ap.add_argument("--force-json", action="store_true",
                     help="constrain the answer region to schema-valid JSON (xgrammar)")
-    # Short prompts + 1024 think + 512 answer fit well under 4096; a tight
-    # max_model_len keeps the KV cache small. 0.85 leaves headroom for the
-    # structured-output logit buffers on a desktop card (see filter_reasoning).
     ap.add_argument("--max-model-len", type=int, default=4096)
     ap.add_argument("--gpu-memory-utilization", type=float, default=0.85)
     ap.add_argument("--output", default=None)

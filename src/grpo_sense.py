@@ -61,8 +61,8 @@ def main():
     print(train_ds[0])
 
     model = AutoModelForCausalLM.from_pretrained(
-        args.model, device_map="cuda", dtype=torch.bfloat16,
-        trust_remote_code=True, attn_implementation="sdpa",
+        args.model, dtype=torch.bfloat16,
+        trust_remote_code=True, attn_implementation="kernels-community/flash-attn3",
     )
 
     vllm_kwargs = {}
@@ -77,7 +77,7 @@ def main():
     training_args = GRPOConfig(
         output_dir=output_dir,
         num_generations=8,
-        max_completion_length=1024,
+        max_completion_length=2048,
         optim="paged_adamw_8bit",
         temperature=1.0,
         top_p=0.95,

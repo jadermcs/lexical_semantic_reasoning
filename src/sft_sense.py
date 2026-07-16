@@ -56,10 +56,11 @@ def main():
 
     model = AutoModelForCausalLM.from_pretrained(
         args.model,
-        device_map="cuda",
         dtype=torch.bfloat16,
         trust_remote_code=True,
-        attn_implementation="sdpa",
+        # Prebuilt FA2 pulled from the Hub via `kernels` — no flash-attn build
+        # needed. Its varlen path is what keeps BFD-packed sequences separate.
+        attn_implementation="kernels-community/flash-attn2",
     )
 
     dataset = load_dataset(args.data, strategy=args.reasoning_select)
@@ -72,14 +73,16 @@ def main():
     dataset = dataset.map(format_example, remove_columns=cols)
     print(dataset["train"][0])
 
-    # Tag runs with the ablation so different strategies get separate output dirs /
-    # wandb runs and never resume from each other's checkpoints.
     data_tag = Path(args.data).stem
     tag = f"wic-{args.reasoning_select}"
     output_dir = f"./qwen-sense-sft-{tag}-{data_tag}"
     training_args = SFTConfig(
         output_dir=output_dir,
         completion_only_loss=True,
+        max_length=2048,
+        packing=True,
+        use_liger_kernel=True,
+        dataset_num_proc=8,
         num_train_epochs=args.epochs,
         per_device_train_batch_size=32,
         warmup_steps=100,
@@ -90,10 +93,8 @@ def main():
         save_strategy="steps",
         eval_steps=150,
         save_steps=150,
-        save_total_limit=2,
+        save_total_limit=3,
         load_best_model_at_end=True,
-        # Select by greedy-decode proxy (argmax correctness) rather than NLL,
-        # which can rise from overconfidence while decode behavior still improves.
         metric_for_best_model="eval_mean_token_accuracy",
         greater_is_better=True,
         report_to="wandb",
