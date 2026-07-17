@@ -1,36 +1,10 @@
 import argparse
-import random
 from pathlib import Path
 
 import torch
-from datasets import Dataset, DatasetDict
+from datasets import DatasetDict
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from trl import SFTConfig, SFTTrainer
-
-import sense_data as sd
-
-
-def format_example(rec):
-    # Conversational prompt/completion format: TRL renders the chat template and
-    # masks the prompt so loss is computed on the assistant turn only.
-    msgs = sd.wic_messages(rec, with_target=True)
-    return {"prompt": msgs[:-1], "completion": msgs[-1:]}
-
-
-def load_dataset(wic_data, strategy="first", dev_frac=0.05, seed=42):
-    """Distilled traces, split into train/dev.
-
-    The distillation source is a single teacher predictions file (no prebuilt
-    train/dev splits), so a small held-out dev set is carved off a deterministic
-    shuffle.
-    """
-    recs = sd.load_teacher_traces(wic_data, strategy=strategy)
-    random.Random(seed).shuffle(recs)
-    n_dev = max(1, int(len(recs) * dev_frac))
-    dev, train = recs[:n_dev], recs[n_dev:]
-    return DatasetDict(
-        {"train": Dataset.from_list(train), "dev": Dataset.from_list(dev)}
-    )
 
 
 def main():
@@ -39,15 +13,16 @@ def main():
     ap.add_argument("--epochs", type=int, default=3)
     ap.add_argument(
         "--data",
-        default="data/mcl_semcor.json",
-        help="Teacher predictions file written by call_api.py.",
+        default="data/sft_wic",
+        help="Prepared dataset dir written by prepare_data.py (a DatasetDict with "
+        "train/dev splits of {prompt, completion} examples). Build it first with "
+        "`uv run python src/prepare_data.py ...` so the data can be inspected before "
+        "training and isn't re-processed every run.",
     )
     ap.add_argument(
-        "--reasoning-select",
-        choices=["first", "longest"],
-        default="first",
-        help="Which distilled teacher trace to keep per pair: first majority-voting "
-        "sample, longest CoT, or the highest model predictive entropy",
+        "--output-dir",
+        default=None,
+        help="Where to save checkpoints/adapter. Defaults to ./qwen-sft-<data-stem>.",
     )
     args = ap.parse_args()
 
@@ -58,24 +33,15 @@ def main():
         args.model,
         dtype=torch.bfloat16,
         trust_remote_code=True,
-        # Prebuilt FA2 pulled from the Hub via `kernels` — no flash-attn build
-        # needed. Its varlen path is what keeps BFD-packed sequences separate.
         attn_implementation="kernels-community/flash-attn2",
     )
 
-    dataset = load_dataset(args.data, strategy=args.reasoning_select)
-    print(
-        f"[wic] train={len(dataset['train'])} dev={len(dataset['dev'])} "
-        f"reasoning-select={args.reasoning_select}"
-    )
-
-    cols = dataset["train"].column_names
-    dataset = dataset.map(format_example, remove_columns=cols)
+    dataset = DatasetDict.load_from_disk(args.data)
+    print(f"[sft] train={len(dataset['train'])} dev={len(dataset['dev'])} data={args.data}")
     print(dataset["train"][0])
 
-    data_tag = Path(args.data).stem
-    tag = f"wic-{args.reasoning_select}"
-    output_dir = f"./qwen-sense-sft-{tag}-{data_tag}"
+    data_tag = Path(args.data.rstrip("/")).stem
+    output_dir = args.output_dir or f"./qwen-sft-{data_tag}"
     training_args = SFTConfig(
         output_dir=output_dir,
         completion_only_loss=True,
@@ -99,7 +65,7 @@ def main():
         metric_for_best_model="eval_mean_token_accuracy",
         greater_is_better=True,
         report_to="wandb",
-        run_name=f"qwen-sense-sft-{tag}-{data_tag}",
+        run_name=f"qwen-sft-{data_tag}",
     )
     trainer = SFTTrainer(
         model=model,

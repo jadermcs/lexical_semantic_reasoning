@@ -13,7 +13,8 @@ which get force-closed. Prefix caching means the phase-2 pass reuses the
 phase-1 KV cache instead of re-prefilling prompt + reasoning.
 
 Predictions are saved in the ``call_api.py`` teacher schema (one greedy sample
-per pair), so the output file can be fed straight to ``sft_sense.py --data``.
+per pair), so the output file can be fed straight to ``prepare_data.py --data``
+(which builds the SFT dataset ``sft_sense.py`` then trains on).
 
 Examples
 --------
@@ -141,7 +142,7 @@ def main():
         hyps.append(hyp)
         refs.append(gold)
         # Teacher-predictions schema (call_api.py), single greedy sample —
-        # the output file feeds sft_sense.py --data via load_teacher_traces.
+        # the output file feeds prepare_data.py --data via load_teacher_traces.
         think, closed, _ = decoded.partition("</think>")
         answer = sd.parse_wic_answer(decoded)
         records.append({
@@ -164,7 +165,7 @@ def main():
         print(f"{rec['lemma']:<18}  {str(rec['label']):<10}  {pred:<10}")
 
     # Bare list in the call_api.py teacher schema — directly consumable by
-    # sft_sense.py --data. Metrics are printed above, not saved.
+    # prepare_data.py --data. Metrics are printed above, not saved.
     out_path = Path(args.output or f"predictions_sense_wic_{args.split}.json")
     out_path.write_text(json.dumps(records, ensure_ascii=False, indent=2))
     print(f"Saved predictions → {out_path}")
