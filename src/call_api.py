@@ -6,6 +6,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
+import sacrebleu
 from openai import OpenAI
 
 # ── Config ────────────────────────────────────────────────────────────────────
@@ -38,6 +39,26 @@ Sentence 2: "{sentence2}"
 Are the two <t>...</t> uses the same sense?
 """
 
+DEF_SYSTEM_PROMPT = """\
+You are a lexicographer. You are given a target word (with its part of speech) \
+and one sentence that uses it; the target word is wrapped in <t>...</t>. Work out \
+the specific sense in which the target word is used, then write a concise \
+dictionary definition for that sense.
+
+Respond with a single JSON object and nothing else, with exactly one key:
+  "definition": string, the dictionary definition of the target word as used in \
+the sentence
+"""
+
+DEF_USER_TEMPLATE = """\
+Lemma: {lemma}
+POS: {pos}
+
+Sentence: "{sentence}"
+
+Define the <t>...</t> word as it is used in this sentence.
+"""
+
 
 def _safe_mark(word: str, sentence: str) -> str:
     idx = sentence.find(word)
@@ -66,6 +87,18 @@ def build_messages(
                 pos=pos,
                 sentence1=_safe_mark(word1, sentence1),
                 sentence2=_safe_mark(word2, sentence2),
+            ),
+        },
+    ]
+
+
+def build_def_messages(lemma: str, pos: str, word: str, sentence: str) -> list[dict]:
+    return [
+        {"role": "system", "content": DEF_SYSTEM_PROMPT},
+        {
+            "role": "user",
+            "content": DEF_USER_TEMPLATE.format(
+                lemma=lemma, pos=pos, sentence=_safe_mark(word, sentence)
             ),
         },
     ]
@@ -146,6 +179,42 @@ def _metrics(results: list[dict]) -> dict:
     }
 
 
+def _def_metrics(results: list[dict]) -> dict:
+    """Quality of the generated glosses vs. the gold WordNet definitions.
+
+    ``sample_parse_rate`` is the per-sample rate of parseable JSON with a non-empty
+    ``definition``. ``bleu`` is sacrebleu's corpus BLEU over every such parsed gloss
+    (hypothesis) against its gold gloss (reference) — a single 0-100 score
+    summarizing how close the teacher's wording lands to WordNet.
+    """
+    ok = [r for r in results if "error" not in r]
+    n = len(ok)
+    total = usable = 0
+    hyps: list[str] = []
+    refs: list[str] = []
+    for r in ok:
+        gold = str(r.get("definition") or "").strip()
+        for ans in r.get("answers", []):
+            total += 1
+            try:
+                gen = str(json.loads(ans)["definition"]).strip()
+            except (json.JSONDecodeError, KeyError, TypeError):
+                continue
+            if not gen:
+                continue
+            usable += 1
+            if gold:
+                hyps.append(gen)
+                refs.append(gold)
+    bleu = sacrebleu.corpus_bleu(hyps, [refs]).score if hyps else 0.0
+    return {
+        "n_scored": n,
+        "n_skipped": len(results) - n,
+        "sample_parse_rate": usable / total if total else 0.0,
+        "bleu": bleu,
+    }
+
+
 def _paths(name: str) -> dict:
     return {
         "results": Path(f"predictions_{name}.jsonl"),
@@ -198,8 +267,56 @@ def _pair_key(item: dict) -> tuple:
     return (item["lemma"], item["pos"], item["sentence1"], item["sentence2"])
 
 
-def _load_resume(resume_path: str) -> dict[tuple, dict]:
-    """Map completed pairs (no error) from a previous results JSONL by pair key."""
+def _evaluate_definition(client: OpenAI, model_id: str, item: dict) -> dict:
+    """One definition record: k teacher samples of the gloss for a single usage.
+
+    No self-consistency vote — definitions aren't a binary decision. The gold
+    WordNet ``definition`` is carried through unchanged as the training target, and
+    ``prepare_data.py`` keeps only samples whose reasoning leads to a gloss close to
+    it (see ``sense_data.load_definition_traces``).
+
+    Records carry the target surface form in ``word``, so ``_safe_mark`` wraps it in
+    the ``sentence`` usage directly — no fuzzy/lemma-based lookup of the target.
+    """
+    base = {
+        "lemma": item["lemma"],
+        "pos": item["pos"],
+        "sentence": item["sentence"],
+        "definition": item.get("definition"),
+    }
+    messages = build_def_messages(
+        item["lemma"], item["pos"], item["word"], item["sentence"]
+    )
+    try:
+        samples = [_sample(client, model_id, messages) for _ in range(SAMPLES)]
+    except Exception as e:
+        return {**base, "error": str(e)}
+    return {
+        **base,
+        "answers": [c for c, _ in samples],
+        "reasonings": [r for _, r in samples],
+    }
+
+
+def _def_key(item: dict) -> tuple:
+    return (item["lemma"], item["pos"], item["sentence"])
+
+
+# A task bundles the three things run() varies on: how to query one item, how to
+# key it for resume/caching, and how to score a batch of results. Adding a task
+# elsewhere in the repo means adding an entry here.
+TASKS = {
+    "wic": {"evaluate": _evaluate_pair, "key": _pair_key, "metrics": _metrics},
+    "definition": {
+        "evaluate": _evaluate_definition,
+        "key": _def_key,
+        "metrics": _def_metrics,
+    },
+}
+
+
+def _load_resume(resume_path: str, key_fn) -> dict[tuple, dict]:
+    """Map completed items (no error) from a previous results JSONL by their key."""
     done: dict[tuple, dict] = {}
     for line in Path(resume_path).read_text().splitlines():
         line = line.strip()
@@ -207,8 +324,8 @@ def _load_resume(resume_path: str) -> dict[tuple, dict]:
             continue
         r = json.loads(line)
         if "error" not in r:
-            done[_pair_key(r)] = r
-    print(f"Resuming: {len(done)} completed pairs loaded from {resume_path}", file=sys.stderr)
+            done[key_fn(r)] = r
+    print(f"Resuming: {len(done)} completed items loaded from {resume_path}", file=sys.stderr)
     return done
 
 
@@ -216,16 +333,23 @@ def run(
     input_path: str,
     model_id: str = DEFAULT_MODEL_ID,
     resume_path: str | None = None,
+    task: str = "wic",
 ) -> None:
+    handlers = TASKS[task]
+    evaluate, key_fn, metrics_fn = (
+        handlers["evaluate"],
+        handlers["key"],
+        handlers["metrics"],
+    )
     path = Path(input_path)
     model_slug = model_id.replace("/", "_")
     p = _paths(f"{path.stem}_{model_slug}")
     data = json.loads(path.read_text())
-    print(f"{len(data)} pairs → {model_id} @ {BASE_URL}", file=sys.stderr)
+    print(f"{len(data)} {task} items → {model_id} @ {BASE_URL}", file=sys.stderr)
 
     # Read any resume file before opening the output for writing, since the
     # two may be the same path and opening in "w" mode truncates it.
-    resume = _load_resume(resume_path) if resume_path else {}
+    resume = _load_resume(resume_path, key_fn) if resume_path else {}
 
     client = _make_client()
     results: list[dict] = []
@@ -241,21 +365,21 @@ def run(
     try:
         futures = {}
         for item in data:
-            cached = resume.get(_pair_key(item))
+            cached = resume.get(key_fn(item))
             if cached is not None:
                 _write(cached)
             else:
-                futures[pool.submit(_evaluate_pair, client, model_id, dict(item))] = item
+                futures[pool.submit(evaluate, client, model_id, dict(item))] = item
         skipped = len(results)
         if skipped:
-            print(f"  {skipped} pairs already done, {len(futures)} to go", file=sys.stderr)
+            print(f"  {skipped} items already done, {len(futures)} to go", file=sys.stderr)
         done = skipped
         for fut in as_completed(futures):
             _write(fut.result())
             done += 1
             if done % 25 == 0 or done == len(data):
                 print(f"  {done}/{len(data)}", file=sys.stderr)
-                p["metrics"].write_text(json.dumps(_metrics(results), indent=2))
+                p["metrics"].write_text(json.dumps(metrics_fn(results), indent=2))
     except KeyboardInterrupt:
         interrupted = True
         print("\nInterrupted — saving partial results …", file=sys.stderr)
@@ -263,7 +387,7 @@ def run(
         pool.shutdown(wait=False, cancel_futures=True)
         out.close()
 
-    metrics = _metrics(results)
+    metrics = metrics_fn(results)
     p["metrics"].write_text(json.dumps(metrics, indent=2))
     print(f"Wrote {len(results)} results to {p['results']}", file=sys.stderr)
     print(json.dumps(metrics, indent=2), file=sys.stderr)
@@ -277,7 +401,8 @@ if __name__ == "__main__":
         "-f",
         "--file",
         required=True,
-        help="Path to the input JSON file of WiC pairs.",
+        help="Path to the input JSON file (WiC pairs, or definition items for "
+        "--task definition).",
     )
     parser.add_argument(
         "-m",
@@ -289,7 +414,17 @@ if __name__ == "__main__":
         "-r",
         "--resume",
         help="Path to a previous (partial) results JSONL to continue from; "
-        "already-completed pairs are skipped.",
+        "already-completed items are skipped.",
+    )
+    parser.add_argument(
+        "-t",
+        "--task",
+        choices=list(TASKS),
+        default="wic",
+        help="wic: same-sense verdict for a sentence pair (word1/word2/sentence1/"
+        "sentence2/label). definition: gloss one usage (lemma/pos/word/sentence/"
+        "definition); the target word is marked in the sentence usage and the gold "
+        "definition is carried through as the training target.",
     )
     args = parser.parse_args()
-    run(args.file, args.model, args.resume)
+    run(args.file, args.model, args.resume, args.task)

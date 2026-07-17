@@ -27,9 +27,6 @@ import sense_data as sd
 
 
 def format_example(rec):
-    # Conversational prompt/completion format: TRL renders the chat template and
-    # masks the prompt so loss is computed on the assistant turn only. The record's
-    # ``task`` tag picks the right prompt/target builder (wic, definition, ...).
     msgs = sd.build_messages(rec, with_target=True)
     return {"prompt": msgs[:-1], "completion": msgs[-1:]}
 

@@ -15,7 +15,8 @@ uv run pytest                                # reward unit tests (CPU, fast)
 uv run pytest tests/test_sense_rewards.py -k <name>   # single test
 
 # Pipeline stages, in order:
-uv run python src/call_api.py -f data/pairs.json -m deepseek/deepseek-v4-flash  # teacher traces (needs OPENROUTER_API_KEY; -r resumes)
+uv run python src/call_api.py -f data/pairs.json -m deepseek/deepseek-v4-flash  # WiC teacher traces (needs OPENROUTER_API_KEY; -r resumes)
+uv run python src/call_api.py -f data/wordnet.json -t definition                # definition teacher traces (gloss one usage; -t picks the task)
 uv run python src/filter_reasoning.py --data data/mcl_semcor.json               # quality filter (stage 2 needs a GPU + vLLM)
 uv run python src/prepare_data.py --data data/mcl_semcor_filtered.json --def-data data/wordnet_def.json --reasoning-select longest --out data/sft_wic-def  # mix tasks → inspectable DatasetDict (+ .preview.jsonl)
 uv run python src/sft_sense.py --data data/sft_wic-def
