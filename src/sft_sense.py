@@ -33,13 +33,9 @@ def main():
         args.model,
         dtype=torch.bfloat16,
         trust_remote_code=True,
-        # Prebuilt FA2 pulled from the Hub via `kernels` — no flash-attn build
-        # needed. Its varlen path is what keeps BFD-packed sequences separate.
         attn_implementation="kernels-community/flash-attn2",
     )
 
-    # Preprocessing (task mixing, trace selection, formatting, the train/dev split)
-    # all happens in prepare_data.py; here we just load the materialized splits.
     dataset = DatasetDict.load_from_disk(args.data)
     print(f"[sft] train={len(dataset['train'])} dev={len(dataset['dev'])} data={args.data}")
     print(dataset["train"][0])
