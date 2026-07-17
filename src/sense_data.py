@@ -221,52 +221,38 @@ def load_teacher_traces(path: str | Path, strategy: str = "first", scorer=None) 
 # --------------------------------------------------------------------------- #
 # Definition task: teacher traces over WordNet glosses
 # --------------------------------------------------------------------------- #
-DEF_FUZZY_THRESHOLD = 60.0
-
-
-def _def_candidates(rec: dict, fuzzy_threshold: float = DEF_FUZZY_THRESHOLD) -> list[dict]:
-    """Teacher samples whose generated definition agrees with the gold gloss.
+def _def_candidates(rec: dict) -> list[dict]:
+    """Teacher samples with a usable reasoning trace for the definition task.
 
     ``call_api.py`` records one reasoning per self-consistency sample alongside its
-    JSON answer (``{"definition": ...}``). The training target is the *gold* WordNet
-    gloss (``rec["definition"]``), so only samples whose own definition fuzzy-matches
-    that gold are kept — this ensures the distilled <think> block actually reasons
-    toward the answer we train against (the definition analogue of keeping only the
-    teacher-correct WiC samples). Samples with an unparseable answer or an empty trace
-    are dropped; the returned list preserves sample order.
+    JSON answer (``{"definition": ...}``). The training target is the gold WordNet
+    gloss (``rec["definition"]``), which is already the best-matching sense supplied
+    for the usage — so we don't second-guess it by fuzzy-matching the teacher's
+    paraphrase against it (that only rejected faithful rewordings). Every sample with a
+    non-empty reasoning trace is kept; the ``<think>`` block is what we distill, the
+    JSON answer isn't used. The returned list preserves sample order.
     """
-    gold = str(rec.get("definition", "")).strip()
-    cands = []
-    for ans, rea in zip(rec.get("answers", []), rec.get("reasonings", [])):
-        try:
-            obj = json.loads(ans)
-            gen = str(obj["definition"]).strip()
-        except (json.JSONDecodeError, KeyError, TypeError):
-            continue
-        if not gen or not (rea and rea.strip()):
-            continue
-        if gold and fuzz.token_set_ratio(gen.lower(), gold.lower()) < fuzzy_threshold:
-            continue
-        cands.append({"think": rea.strip()})
-    return cands
+    return [
+        {"think": rea.strip()}
+        for rea in rec.get("reasonings", [])
+        if rea and rea.strip()
+    ]
 
 
 def load_definition_traces(
     path: str | Path,
     strategy: str = "first",
     scorer=None,
-    fuzzy_threshold: float = DEF_FUZZY_THRESHOLD,
 ) -> list[dict]:
     """Load teacher definition traces (from ``call_api.py``) as definition SFT records.
 
     Distillation source: each record carries a target word, one usage sentence, the
     gold WordNet ``definition``, and the teacher's chain-of-thought samples
-    (``answers``/``reasonings``). The training target is the gold gloss; among the
-    samples whose own definition agrees with it (see ``_def_candidates``) one trace is
-    picked per ``strategy`` (``first``/``longest``/``entropy`` — see
-    ``_select_candidate``) and becomes the ``think`` field. The usage is (re-)marked
-    with <t> tags from the lemma to match the prompt format. Records with no gold gloss
-    or no usable trace are skipped.
+    (``reasonings``). The training target is the gold gloss; among the samples with a
+    usable reasoning trace (see ``_def_candidates``) one is picked per ``strategy``
+    (``first``/``longest``/``entropy`` — see ``_select_candidate``) and becomes the
+    ``think`` field. The usage is (re-)marked with <t> tags from the lemma to match the
+    prompt format. Records with no gold gloss or no usable trace are skipped.
     """
     raw = json.loads(Path(path).read_text())
     out = []
@@ -274,7 +260,7 @@ def load_definition_traces(
         definition = str(r.get("definition", "")).strip()
         if not definition:
             continue
-        cands = _def_candidates(r, fuzzy_threshold=fuzzy_threshold)
+        cands = _def_candidates(r)
         if not cands:
             continue
         chosen = _select_candidate(cands, r, strategy=strategy, scorer=scorer)

@@ -1,6 +1,7 @@
 import argparse
 import json
 import os
+import re
 import sys
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -17,17 +18,16 @@ SAMPLES = 3  # self-consistency: k samples per pair, majority vote
 MAX_WORKERS = 8  # concurrent pairs in flight
 MAX_RETRIES = 4  # per-call retries on transient errors
 
-SYSTEM_PROMPT = """\
-You are a linguistic analysis assistant. You decide whether a target word \
-is used with the same sense in two sentences. The target word is wrapped in \
-<t>...</t> in each sentence. First, briefly describe the sense of the target \
-in each sentence, then return the final decision.
-
-Respond with a single JSON object and nothing else, with exactly these keys:
-  "sense1":     string, the sense of the target in sentence 1
-  "sense2":     string, the sense of the target in sentence 2
-  "same_sense": boolean, true if the two uses share the same sense
-"""
+SYSTEM_PROMPT = (
+    "You are an expert lexicographer. You are given two sentences, each using the same "
+    "target word (marked with <t> tags). Inside <think> tags, work out what the target "
+    "word means in each sentence then compare the two senses. Then, after </think>, "
+    "answer with a single JSON object and nothing else, with exactly these keys: "
+    '"sense1" (string, the gloss of the target in sentence 1), "sense2" (string, the '
+    'gloss of the target in sentence 2), and "same_sense" (boolean, true if the two '
+    "uses share the same sense). "
+    'Format: <think>...</think>\n{"sense1": ..., "sense2": ..., "same_sense": ...}'
+)
 
 USER_TEMPLATE = """\
 Lemma: {lemma}
@@ -39,16 +39,15 @@ Sentence 2: "{sentence2}"
 Are the two <t>...</t> uses the same sense?
 """
 
-DEF_SYSTEM_PROMPT = """\
-You are a lexicographer. You are given a target word (with its part of speech) \
-and one sentence that uses it; the target word is wrapped in <t>...</t>. Work out \
-the specific sense in which the target word is used, then write a concise \
-dictionary definition for that sense.
-
-Respond with a single JSON object and nothing else, with exactly one key:
-  "definition": string, the dictionary definition of the target word as used in \
-the sentence
-"""
+DEF_SYSTEM_PROMPT = (
+    "You are an expert lexicographer. You are given a single sentence using a "
+    "target word (marked with <t> tags). Inside <think> tags, work out what the "
+    "target word means in that sentence, reasoning toward a concise dictionary "
+    "definition. Then, after </think>, answer with a single JSON object and nothing "
+    'else, with exactly one key: "definition" (string, the dictionary gloss of the '
+    "target word as used in the sentence). "
+    'Format: <think>...</think>\n{"definition": ...}'
+)
 
 DEF_USER_TEMPLATE = """\
 Lemma: {lemma}
@@ -104,23 +103,61 @@ def build_def_messages(lemma: str, pos: str, word: str, sentence: str) -> list[d
     ]
 
 
+_THINK_RE = re.compile(r"<think>(.*?)</think>", re.DOTALL)
+
+
+def _split_think(raw: str) -> tuple[str | None, str]:
+    """Split a ``<think>…</think> {json}`` completion into (reasoning, json body).
+
+    Returns the think-block text (or ``None`` when the model omits the tags) and the
+    remaining content with the think block stripped out, so the body is left as the
+    JSON answer for downstream ``json.loads``.
+    """
+    m = _THINK_RE.search(raw)
+    if not m:
+        return None, raw.strip()
+    reasoning = m.group(1).strip()
+    body = (raw[: m.start()] + raw[m.end() :]).strip()
+    return reasoning, body
+
+
+def _extract_json(body: str) -> str:
+    """Best-effort pull of the JSON object out of a completion body.
+
+    Strips ``` fences and returns the substring from the first ``{`` to the last
+    ``}`` so any stray prose around the object doesn't break ``json.loads``.
+    """
+    body = body.strip().removeprefix("```json").removeprefix("```").removesuffix("```").strip()
+    i, j = body.find("{"), body.rfind("}")
+    return body[i : j + 1] if i != -1 and j > i else body
+
+
 def _sample(
     client: OpenAI, model_id: str, messages: list[dict]
 ) -> tuple[str, str | None]:
-    """One chat completion → (content, reasoning), with retries on transient errors."""
+    """One chat completion → (json_answer, reasoning), with retries on transient errors.
+
+    The model is prompted to emit a ``<think>…</think>`` block before the JSON, so the
+    reasoning is captured from either the provider's dedicated ``reasoning_content``
+    field or, failing that, the inline think block. ``response_format`` is intentionally
+    *not* constrained to ``json_object``: that mode suppresses the reasoning channel,
+    which is the whole point of collecting these teacher traces.
+    """
     last_err: Exception | None = None
     for attempt in range(MAX_RETRIES):
         try:
             resp = client.chat.completions.create(
                 model=model_id,
                 messages=messages,
-                response_format={"type": "json_object"},
             )
             msg = resp.choices[0].message
-            reasoning = getattr(msg, "reasoning_content", None) or getattr(
-                msg, "reasoning", None
+            think, body = _split_think(msg.content or "")
+            reasoning = (
+                getattr(msg, "reasoning_content", None)
+                or getattr(msg, "reasoning", None)
+                or think
             )
-            return msg.content or "", reasoning
+            return _extract_json(body), reasoning
         except Exception as e:  # network / rate-limit / server errors
             last_err = e
             time.sleep(2**attempt)
