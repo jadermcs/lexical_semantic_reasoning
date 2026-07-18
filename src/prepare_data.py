@@ -70,11 +70,15 @@ def write_preview(recs, path, n=20):
     with Path(path).open("w") as f:
         for r in recs[:n]:
             msgs = sd.build_messages(r, with_target=True)
+            system = next(
+                (m["content"] for m in msgs if m["role"] == "system"), None
+            )
             f.write(
                 json.dumps(
                     {
                         "task": r["task"],
                         "lemma": r.get("lemma"),
+                        "system": system,
                         "prompt": msgs[-2]["content"],
                         "completion": msgs[-1]["content"],
                     },
