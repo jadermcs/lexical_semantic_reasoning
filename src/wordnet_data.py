@@ -64,7 +64,7 @@ for synset in tqdm(en.synsets()):
                         "lemma": lemma,
                         "pos": pos,
                         "word": word,
-                        "example": example,
+                        "sentence": example,
                         "definition": synset.definition()
                     }
     if best:
@@ -73,6 +73,6 @@ for synset in tqdm(en.synsets()):
 if st:
     # Append the new entries to the CSV file
     df_new = pd.DataFrame(st).sort_values(by="example", key=lambda col: -col.str.len())
-    df_new = df_new.head(500).sample(frac=1.0, random_state=42)
+    df_new = df_new.head(2000).sample(frac=1.0, random_state=42)
     df_new.to_json(OUTPUT_FILE, orient="records", indent=2)
     print(f"Processed {len(st)} entries and saved to {OUTPUT_FILE}")
