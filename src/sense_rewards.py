@@ -20,6 +20,7 @@ The reward has two halves:
 import json
 import os
 import re
+from difflib import SequenceMatcher
 from pathlib import Path
 
 from sklearn.feature_extraction.text import ENGLISH_STOP_WORDS
@@ -153,21 +154,43 @@ def reward_wic_json(completions, **kwargs):
 
 
 # The answer states the verdict twice: once as the sense1/sense2 gloss pair and
-# once as the boolean. An answer whose glosses contradict its verdict (identical
-# glosses with same_sense=false, or differing glosses with same_sense=true) got
-# the JSON shape right while being internally incoherent — punish it.
+# once as the boolean. An answer whose glosses contradict its verdict (dissimilar
+# glosses with same_sense=true, or near-identical glosses with same_sense=false)
+# got the JSON shape right while being internally incoherent — punish it, graded
+# by *how far* the glosses are from the verdict they claim.
 WIC_INCONSISTENT = -0.3
 
 
+def _gloss_similarity(s1, s2):
+    """Token-sequence similarity of two glosses, in [0, 1].
+
+    A normalised edit-distance ratio (``difflib.SequenceMatcher`` over the tokens
+    ``sd._tok`` yields, so it inherits the same case/punctuation folding) — 1.0
+    for token-identical glosses, ~0 for glosses with nothing in common.
+    """
+    return SequenceMatcher(None, sd._tok(s1), sd._tok(s2)).ratio()
+
+
 def reward_wic_consistency(completions, **kwargs):
-    """Punish a same_sense verdict that contradicts the emitted glosses.
+    """Punish a same_sense verdict that contradicts the emitted glosses, graded.
 
     The SFT target (see ``sd.wic_answer``) writes the *same* gloss string into
     sense1 and sense2 when the senses match, and different glosses when they
-    don't — so gloss equality (compared token-wise, ignoring case/punctuation)
-    must agree with the boolean. Anything unparseable, missing a piece, or with a
-    non-boolean verdict scores 0: ``reward_wic_json`` already charges for those,
-    and double-charging would drown the accuracy signal.
+    don't. The penalty is asymmetric by verdict:
+
+    * **same_sense=true** — the glosses should agree, so the penalty scales with
+      their *dis*similarity, ``WIC_INCONSISTENT * (1 - sim)``. Rather than an exact
+      match (which fired the full penalty on a genuine paraphrase — two wordings of
+      one sense — as hard as on a real contradiction), a paraphrase is barely
+      touched while glosses that genuinely disagree pay close to the full penalty.
+    * **same_sense=false** — different senses of one lemma routinely share generic
+      words ("a short *story*" vs "a false *story*"), so incidental token overlap
+      is *not* incoherence. This branch keeps the strict rule: penalise only when
+      the glosses are token-identical, which the model does not do in practice.
+
+    Anything unparseable, missing a piece, or with a non-boolean verdict scores 0:
+    ``reward_wic_json`` already charges for those, and double-charging would drown
+    the accuracy signal.
     """
     out = []
     for c in completions:
@@ -177,8 +200,9 @@ def reward_wic_consistency(completions, **kwargs):
             s1, s2, verdict = obj.get("sense1"), obj.get("sense2"), obj.get("same_sense")
             if isinstance(s1, str) and isinstance(s2, str) and isinstance(verdict, bool) \
                     and s1.strip() and s2.strip():
-                glosses_same = sd._tok(s1) == sd._tok(s2)
-                if glosses_same != verdict:
+                if verdict:
+                    r = WIC_INCONSISTENT * (1.0 - _gloss_similarity(s1, s2))
+                elif sd._tok(s1) == sd._tok(s2):
                     r = WIC_INCONSISTENT
         out.append(r)
     return out

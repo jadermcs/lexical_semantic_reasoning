@@ -1,15 +1,13 @@
-"""Build the mixed SFT dataset once, ahead of training, so it can be inspected.
+"""Build the SFT dataset once, ahead of training, so it can be inspected.
 
-Loads teacher traces for every task, distils/selects one trace per record, renders
-each to the uniform conversational ``{prompt, completion}`` shape, mixes the tasks
-into one deterministically shuffled set, carves off a dev split, and saves the
-result as a HuggingFace ``DatasetDict`` that ``sft_sense.py`` loads straight from
-disk. A ``<out>.preview.jsonl`` of readable examples is written alongside so the
-data can be eyeballed before committing GPU time.
+Loads teacher traces, distils/selects one trace per record, renders each to the
+uniform conversational ``{prompt, completion}`` shape, deterministically shuffles,
+carves off a dev split, and saves the result as a HuggingFace ``DatasetDict`` that
+``sft_sense.py`` loads straight from disk. A ``<out>.preview.jsonl`` of readable
+examples is written alongside so the data can be eyeballed before committing GPU time.
 
     uv run python src/prepare_data.py \
-        --data mcl_semcor.json --def-data data/wordnet_def.json \
-        --reasoning-select longest --out data/sft_wic-def
+        --data mcl_semcor.json --reasoning-select longest --out data/sft_wic
 
 Adding a task later means adding a loader in ``sense_data.py`` and a line here — the
 training script stays untouched because every record renders through the same
@@ -31,19 +29,40 @@ def format_example(rec):
     return {"prompt": msgs[:-1], "completion": msgs[-1:]}
 
 
-def build_records(wic_data, def_data=None, strategy="first"):
-    """Distilled, task-tagged SFT records pooled from every task, plus per-task counts."""
+def balance_wic_labels(recs, seed=42):
+    """Down-sample the majority same/different class so the wic set is 50/50.
+
+    The teacher-filtered WiC distillation set is skewed (``mcl_train_dev_filtered`` is
+    ~64/36 toward ``same_sense=false``), while the dev/test eval splits are exactly
+    50/50. An imbalanced warm-start instils a matching label prior, so GRPO starts from
+    a low balanced-accuracy point. Balancing the SFT set removes that prior. Only the
+    dropped pairs never enter the ``sft_pairs`` manifest, so they also become available
+    to the GRPO rollout set (see ``--exclude-pairs`` in ``grpo_sense.py``).
+    """
+    same = [r for r in recs if r["label"]]
+    diff = [r for r in recs if not r["label"]]
+    n = min(len(same), len(diff))
+    rng = random.Random(seed)
+    rng.shuffle(same)
+    rng.shuffle(diff)
+    out = same[:n] + diff[:n]
+    rng.shuffle(out)
+    return out
+
+
+def build_records(wic_data, strategy="first", balance=False, seed=42):
+    """Distilled, task-tagged SFT records, plus per-task counts."""
     recs = sd.load_teacher_traces(wic_data, strategy=strategy)
+    if balance:
+        before = len(recs)
+        recs = balance_wic_labels(recs, seed=seed)
+        print(f"[prepare] balanced wic labels: {before} → {len(recs)} pairs (50/50)")
     counts = {"wic": len(recs)}
-    if def_data is not None:
-        def_recs = sd.load_definition_traces(def_data, strategy=strategy)
-        counts["definition"] = len(def_recs)
-        recs += def_recs
     return recs, counts
 
 
 def split(recs, dev_frac=0.05, seed=42):
-    """Deterministic shuffle (interleaving the tasks) then a front-carved dev split."""
+    """Deterministic shuffle then a front-carved dev split."""
     recs = list(recs)
     random.Random(seed).shuffle(recs)
     n_dev = max(1, int(len(recs) * dev_frac))
@@ -54,8 +73,7 @@ def to_dataset_dict(train, dev):
     """Render both splits to uniform {prompt, completion} rows and wrap as a DatasetDict.
 
     Formatting happens here (not lazily in the trainer) because the raw records carry
-    task-specific columns (wic vs definition); rendering first keeps the Arrow schema
-    uniform across the mixed set.
+    task-specific columns; rendering first keeps the Arrow schema uniform.
     """
     return DatasetDict(
         {
@@ -63,6 +81,19 @@ def to_dataset_dict(train, dev):
             "dev": Dataset.from_list([format_example(r) for r in dev]),
         }
     )
+
+
+def write_sft_pairs(recs, path):
+    """Write the identity of every WiC pair distilled into the SFT set.
+
+    Emits a JSON list of ``pair_key`` tuples for all wic records (both the train and
+    dev splits are seen by the model). ``grpo_sense.py --exclude-pairs`` reads this to
+    hold those pairs out of the GRPO rollout set, so RL only ever rolls out on pairs
+    the SFT warm-start never saw.
+    """
+    keys = [list(sd.pair_key(r)) for r in recs if r.get("task") == "wic"]
+    Path(path).write_text(json.dumps(keys, ensure_ascii=False))
+    return len(keys)
 
 
 def write_preview(recs, path, n=20):
@@ -96,42 +127,52 @@ def main():
         help="WiC teacher predictions file written by call_api.py.",
     )
     ap.add_argument(
-        "--def-data",
-        default=None,
-        help="Optional definition teacher-trace file (target word + usage → gloss "
-        "over WordNet). When set, its examples are mixed into the WiC set.",
-    )
-    ap.add_argument(
         "--reasoning-select",
         choices=["first", "longest"],
         default="first",
         help="Which distilled teacher trace to keep per record: first surviving "
         "sample or the longest CoT.",
     )
+    ap.add_argument(
+        "--balance-labels",
+        action="store_true",
+        help="Down-sample the majority same/different class among wic records so the "
+        "distilled set is 50/50. The teacher-filtered set skews toward "
+        "same_sense=false while dev/test are exactly balanced; an imbalanced "
+        "warm-start biases the label prior and lowers GRPO's starting accuracy. "
+        "Dropped pairs also fall out of the sft_pairs manifest, so they free up for "
+        "the GRPO rollout set.",
+    )
     ap.add_argument("--dev-frac", type=float, default=0.05)
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument(
         "--out",
         default=None,
-        help="Output dataset dir. Defaults to data/sft_<tasks>-<strategy>-<data-stem>.",
+        help="Output dataset dir. Defaults to data/sft_wic-<strategy>-<data-stem>.",
     )
     ap.add_argument("--preview", type=int, default=20, help="Examples to write to <out>.preview.jsonl.")
     args = ap.parse_args()
 
     recs, counts = build_records(
-        args.data, def_data=args.def_data, strategy=args.reasoning_select
+        args.data,
+        strategy=args.reasoning_select,
+        balance=args.balance_labels,
+        seed=args.seed,
     )
     train, dev = split(recs, dev_frac=args.dev_frac, seed=args.seed)
 
-    tasks = "wic-def" if args.def_data else "wic"
-    out = args.out or f"data/sft_{tasks}-{args.reasoning_select}-{Path(args.data).stem}"
+    out = args.out or f"data/sft_wic-{args.reasoning_select}-{Path(args.data).stem}"
 
     ds = to_dataset_dict(train, dev)
     ds.save_to_disk(out)
     write_preview(train, f"{out}.preview.jsonl", n=args.preview)
+    # Manifest of every WiC pair consumed by SFT (train ∪ dev, i.e. all of recs), so
+    # GRPO can roll out only on the pairs the policy never saw during warm-start.
+    n_pairs = write_sft_pairs(recs, f"{out}.sft_pairs.json")
 
     print(f"[prepare] tasks={counts} train={len(ds['train'])} dev={len(ds['dev'])}")
     print(f"[prepare] saved → {out}  (preview → {out}.preview.jsonl)")
+    print(f"[prepare] SFT-consumed WiC pairs → {out}.sft_pairs.json  ({n_pairs} pairs to exclude from GRPO)")
     print(json.dumps(ds["train"][0], indent=2, ensure_ascii=False)[:1200])
 
 

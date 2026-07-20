@@ -83,17 +83,33 @@ class TestWicJson:
 
 
 class TestWicConsistency:
-    def test_different_glosses_with_same_verdict_is_penalised(self):
+    def test_fully_different_glosses_with_same_verdict_is_fully_penalised(self):
+        # No token overlap ⇒ similarity 0, so a same_sense=true verdict pays the
+        # full WIC_INCONSISTENT (the graded penalty's floor).
         c = wrap(GOOD_THINK, json.dumps(
             {"sense1": "a financial institution", "sense2": "sloping land", "same_sense": True}
         ))
         assert R.reward_wic_consistency([c]) == [R.WIC_INCONSISTENT]
 
-    def test_identical_glosses_with_different_verdict_is_penalised(self):
+    def test_identical_glosses_with_different_verdict_is_fully_penalised(self):
+        # Similarity 1 against a same_sense=false verdict ⇒ full penalty.
         c = wrap(GOOD_THINK, json.dumps(
             {"sense1": "a financial institution", "sense2": "a financial institution", "same_sense": False}
         ))
         assert R.reward_wic_consistency([c]) == [R.WIC_INCONSISTENT]
+
+    def test_paraphrased_glosses_with_same_verdict_are_barely_penalised(self):
+        # A genuine paraphrase of one sense under same_sense=true: high similarity,
+        # so the graded penalty is a small nudge, strictly milder than a real
+        # contradiction — this is the case exact-match used to over-punish.
+        c = wrap(GOOD_THINK, json.dumps(
+            {"sense1": "relating to clergy, in an administrative context",
+             "sense2": "relating to clergy or religious matters, in an administrative context",
+             "same_sense": True}
+        ))
+        [r] = R.reward_wic_consistency([c])
+        assert R.WIC_INCONSISTENT < r < 0.0
+        assert r > R.WIC_INCONSISTENT / 2   # closer to 0 than to the full penalty
 
     @pytest.mark.parametrize("verdict, sense2", [(False, "sloping land"), (True, "a financial institution")])
     def test_coherent_answers_are_not_penalised(self, verdict, sense2):

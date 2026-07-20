@@ -1,17 +1,14 @@
 """Shared data + prompt utilities for the lexical-semantic reasoning tasks.
 
 Every SFT record carries a ``task`` tag and is rendered to chat messages by a
-task-specific builder (see ``build_messages``); ``sft_sense.py`` mixes records from
-several tasks into one prompt/completion set. Two tasks live here today:
+task-specific builder (see ``build_messages``); ``sft_sense.py`` loads the prepared
+prompt/completion set. One task lives here today:
 
 * **wic** — given two sentences using the same target word (marked with <t> tags),
   decide whether both uses carry the *same* WordNet sense and gloss each usage. The
   verdict is a verifiable label, so GRPO can score it exactly (see
   ``sense_rewards.reward_wic_accuracy``). Record shape: ``lemma``, ``pos``, ``label``,
   ``usage1``, ``usage2`` (+ distilled ``think``/``sense1``/``sense2`` for SFT).
-* **definition** — given a single sentence using a target word, write its dictionary
-  definition. Record shape: ``lemma``, ``pos``, ``usage``, ``definition`` (the gold
-  gloss) + a distilled ``think`` trace.
 
 Data sources:
 
@@ -21,9 +18,6 @@ Data sources:
 * ``load_teacher_traces`` — teacher WiC predictions from ``call_api.py``, kept only
   where the teacher's self-consistency vote matched the gold label. These add a
   distilled ``think`` trace and the teacher's two sense glosses.
-* ``load_definition_traces`` — teacher definition traces from ``call_api.py`` over
-  WordNet glosses (target word + one usage → gloss). The gold WordNet gloss is the
-  training target and the teacher reasoning becomes the ``think`` trace.
 
 This module imports neither torch nor trl, so the data can be built and inspected
 on the laptop; the training scripts import the heavy stack.
@@ -49,16 +43,6 @@ WIC_SYSTEM = (
     'gloss of the target in sentence 2), and "same_sense" (boolean, true if the two '
     "uses share the same sense). "
     'Format: <think>...</think>\n{"sense1": ..., "sense2": ..., "same_sense": ...}'
-)
-
-DEF_SYSTEM = (
-    "You are an expert lexicographer. You are given a single sentence using a "
-    "target word (marked with <t> tags). Inside <think> tags, work out what the "
-    "target word means in that sentence, reasoning toward a concise dictionary "
-    "definition. Then, after </think>, answer with a single JSON object and nothing "
-    'else, with exactly one key: "definition" (string, the dictionary gloss of the '
-    "target word as used in the sentence). "
-    'Format: <think>...</think>\n{"definition": ...}'
 )
 
 
@@ -89,7 +73,19 @@ def mark_target(sentence: str, word: str, fuzzy_threshold: float = 70.0) -> str:
 # --------------------------------------------------------------------------- #
 # Data loading
 # --------------------------------------------------------------------------- #
-def load_mclwic(split: str, data_dir: Path = DATA_DIR) -> list[dict]:
+def pair_key(rec: dict) -> tuple:
+    """Stable identity of a WiC pair, shared across every loader.
+
+    Keys on ``(lemma, pos, sentence1, sentence2)`` — the raw, un-marked fields both
+    ``load_mclwic`` and ``load_teacher_traces`` now carry — so a pair distilled into
+    the SFT set can be recognised in the GRPO rollout source and held out of it.
+    """
+    return (rec["lemma"], rec["pos"], rec["sentence1"], rec["sentence2"])
+
+
+def load_mclwic(
+    split: str, data_dir: Path = DATA_DIR, exclude_pairs=None
+) -> list[dict]:
     """Load the MCL-WiC benchmark split as internal wic records.
 
     MCL-WiC is a gold word-in-context dataset: two sentences, the target word's
@@ -100,9 +96,13 @@ def load_mclwic(split: str, data_dir: Path = DATA_DIR) -> list[dict]:
     reward the reasoning against. The two sentences aren't pre-tagged, so the
     surface form (``word1``/``word2``) is wrapped with <t> tags here to match the
     ``wic_messages`` prompt format.
+
+    ``exclude_pairs`` is an optional set of ``pair_key`` tuples to drop — used to
+    hold the SFT-consumed pairs out of the GRPO rollout set (avoiding rolling out on
+    pairs the policy already memorised during SFT warm-start).
     """
     raw = json.loads((data_dir / f"mcl-wic.{split}.json").read_text())
-    return [
+    recs = [
         {
             "lemma": r["lemma"],
             "pos": r["pos"],
@@ -116,6 +116,10 @@ def load_mclwic(split: str, data_dir: Path = DATA_DIR) -> list[dict]:
         }
         for r in raw
     ]
+    if exclude_pairs:
+        exclude_pairs = set(exclude_pairs)
+        recs = [r for r in recs if pair_key(r) not in exclude_pairs]
+    return recs
 
 
 def _wic_candidates(rec: dict) -> list[dict]:
@@ -153,8 +157,7 @@ def _select_candidate(cands, rec, strategy="first", scorer=None):
     """Pick one teacher sample from ``cands`` under the chosen ablation strategy.
 
     Task-neutral: every candidate carries a ``think`` field, which is all the
-    ``first``/``longest`` strategies need, so this is shared by the wic and
-    definition loaders.
+    ``first``/``longest`` strategies need.
 
     ``first``   keep the original behaviour: the earliest surviving sample.
     ``longest`` the sample with the longest reasoning trace (most CoT).
@@ -208,70 +211,15 @@ def load_teacher_traces(path: str | Path, strategy: str = "first", scorer=None) 
                 "lemma": r["lemma"],
                 "pos": r["pos"],
                 "label": bool(r["label"]),
+                # raw sentences kept so the SFT-consumed pairs can be keyed and held
+                # out of the GRPO rollout set (see pair_key / prepare_data manifest)
+                "sentence1": r["sentence1"],
+                "sentence2": r["sentence2"],
                 "usage1": mark_target(r["sentence1"], r["lemma"]),
                 "usage2": mark_target(r["sentence2"], r["lemma"]),
                 "think": chosen["think"],
                 "sense1": chosen["sense1"],
                 "sense2": chosen["sense2"],
-            }
-        )
-    return out
-
-
-# --------------------------------------------------------------------------- #
-# Definition task: teacher traces over WordNet glosses
-# --------------------------------------------------------------------------- #
-def _def_candidates(rec: dict) -> list[dict]:
-    """Teacher samples with a usable reasoning trace for the definition task.
-
-    ``call_api.py`` records one reasoning per self-consistency sample alongside its
-    JSON answer (``{"definition": ...}``). The training target is the gold WordNet
-    gloss (``rec["definition"]``), which is already the best-matching sense supplied
-    for the usage — so we don't second-guess it by fuzzy-matching the teacher's
-    paraphrase against it (that only rejected faithful rewordings). Every sample with a
-    non-empty reasoning trace is kept; the ``<think>`` block is what we distill, the
-    JSON answer isn't used. The returned list preserves sample order.
-    """
-    return [
-        {"think": rea.strip()}
-        for rea in rec.get("reasonings", [])
-        if rea and rea.strip()
-    ]
-
-
-def load_definition_traces(
-    path: str | Path,
-    strategy: str = "first",
-    scorer=None,
-) -> list[dict]:
-    """Load teacher definition traces (from ``call_api.py``) as definition SFT records.
-
-    Distillation source: each record carries a target word, one usage sentence, the
-    gold WordNet ``definition``, and the teacher's chain-of-thought samples
-    (``reasonings``). The training target is the gold gloss; among the samples with a
-    usable reasoning trace (see ``_def_candidates``) one is picked per ``strategy``
-    (``first``/``longest``/``entropy`` — see ``_select_candidate``) and becomes the
-    ``think`` field. The usage is (re-)marked with <t> tags from the lemma to match the
-    prompt format. Records with no gold gloss or no usable trace are skipped.
-    """
-    raw = json.loads(Path(path).read_text())
-    out = []
-    for r in raw:
-        definition = str(r.get("definition", "")).strip()
-        if not definition:
-            continue
-        cands = _def_candidates(r)
-        if not cands:
-            continue
-        chosen = _select_candidate(cands, r, strategy=strategy, scorer=scorer)
-        out.append(
-            {
-                "task": "definition",
-                "lemma": r["lemma"],
-                "pos": r["pos"],
-                "definition": definition,
-                "usage": mark_target(r["sentence"], r["lemma"]),
-                "think": chosen["think"],
             }
         )
     return out
@@ -327,39 +275,10 @@ def wic_messages(rec, with_target=False):
     return msgs
 
 
-def def_answer(rec) -> str:
-    """JSON gloss target for the definition task: a single ``definition`` key."""
-    return json.dumps({"definition": rec.get("definition", "")})
-
-
-def def_messages(rec, with_target=False):
-    """Chat messages for one definition example (target word + a single usage).
-
-    ``with_target`` appends the assistant turn (the SFT target), which needs the
-    distilled ``think`` trace and the gold ``definition`` — i.e. a
-    ``load_definition_traces`` record.
-    """
-    user = (
-        f"Target word: {rec['lemma']} ({rec['pos']})\n\n"
-        f"Sentence: {rec['usage']}\n\n"
-        "What does the target word mean in this sentence? Respond with a single JSON "
-        'object with key "definition" (the dictionary gloss of the target word).'
-    )
-    msgs = [
-        {"role": "system", "content": DEF_SYSTEM},
-        {"role": "user", "content": user},
-    ]
-    if with_target:
-        msgs.append(
-            {"role": "assistant", "content": f"{think_block(rec)}\n{def_answer(rec)}"}
-        )
-    return msgs
-
-
 # Dispatch a record to its task's message builder via the ``task`` tag, so the SFT
 # pipeline (``sft_sense.py``) stays task-agnostic and new tasks only need an entry
 # here plus a loader above.
-MESSAGE_BUILDERS = {"wic": wic_messages, "definition": def_messages}
+MESSAGE_BUILDERS = {"wic": wic_messages}
 
 
 def build_messages(rec, with_target=False):

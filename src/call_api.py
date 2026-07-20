@@ -7,7 +7,6 @@ import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
-import sacrebleu
 from openai import OpenAI
 
 # ── Config ────────────────────────────────────────────────────────────────────
@@ -39,25 +38,6 @@ Sentence 2: "{sentence2}"
 Are the two <t>...</t> uses the same sense?
 """
 
-DEF_SYSTEM_PROMPT = (
-    "You are an expert lexicographer. You are given a single sentence using a "
-    "target word (marked with <t> tags). Inside <think> tags, work out what the "
-    "target word means in that sentence, reasoning toward a concise dictionary "
-    "definition. Then, after </think>, answer with a single JSON object and nothing "
-    'else, with exactly one key: "definition" (string, the dictionary gloss of the '
-    "target word as used in the sentence). "
-    'Format: <think>...</think>\n{"definition": ...}'
-)
-
-DEF_USER_TEMPLATE = """\
-Lemma: {lemma}
-POS: {pos}
-
-Sentence: "{sentence}"
-
-Define the <t>...</t> word as it is used in this sentence.
-"""
-
 
 def _safe_mark(word: str, sentence: str) -> str:
     idx = sentence.find(word)
@@ -86,18 +66,6 @@ def build_messages(
                 pos=pos,
                 sentence1=_safe_mark(word1, sentence1),
                 sentence2=_safe_mark(word2, sentence2),
-            ),
-        },
-    ]
-
-
-def build_def_messages(lemma: str, pos: str, word: str, sentence: str) -> list[dict]:
-    return [
-        {"role": "system", "content": DEF_SYSTEM_PROMPT},
-        {
-            "role": "user",
-            "content": DEF_USER_TEMPLATE.format(
-                lemma=lemma, pos=pos, sentence=_safe_mark(word, sentence)
             ),
         },
     ]
@@ -216,42 +184,6 @@ def _metrics(results: list[dict]) -> dict:
     }
 
 
-def _def_metrics(results: list[dict]) -> dict:
-    """Quality of the generated glosses vs. the gold WordNet definitions.
-
-    ``sample_parse_rate`` is the per-sample rate of parseable JSON with a non-empty
-    ``definition``. ``bleu`` is sacrebleu's corpus BLEU over every such parsed gloss
-    (hypothesis) against its gold gloss (reference) — a single 0-100 score
-    summarizing how close the teacher's wording lands to WordNet.
-    """
-    ok = [r for r in results if "error" not in r]
-    n = len(ok)
-    total = usable = 0
-    hyps: list[str] = []
-    refs: list[str] = []
-    for r in ok:
-        gold = str(r.get("definition") or "").strip()
-        for ans in r.get("answers", []):
-            total += 1
-            try:
-                gen = str(json.loads(ans)["definition"]).strip()
-            except (json.JSONDecodeError, KeyError, TypeError):
-                continue
-            if not gen:
-                continue
-            usable += 1
-            if gold:
-                hyps.append(gen)
-                refs.append(gold)
-    bleu = sacrebleu.corpus_bleu(hyps, [refs]).score if hyps else 0.0
-    return {
-        "n_scored": n,
-        "n_skipped": len(results) - n,
-        "sample_parse_rate": usable / total if total else 0.0,
-        "bleu": bleu,
-    }
-
-
 def _paths(name: str) -> dict:
     return {
         "results": Path(f"predictions_{name}.jsonl"),
@@ -304,51 +236,11 @@ def _pair_key(item: dict) -> tuple:
     return (item["lemma"], item["pos"], item["sentence1"], item["sentence2"])
 
 
-def _evaluate_definition(client: OpenAI, model_id: str, item: dict) -> dict:
-    """One definition record: k teacher samples of the gloss for a single usage.
-
-    No self-consistency vote — definitions aren't a binary decision. The gold
-    WordNet ``definition`` is carried through unchanged as the training target, and
-    ``prepare_data.py`` keeps only samples whose reasoning leads to a gloss close to
-    it (see ``sense_data.load_definition_traces``).
-
-    Records carry the target surface form in ``word``, so ``_safe_mark`` wraps it in
-    the ``sentence`` usage directly — no fuzzy/lemma-based lookup of the target.
-    """
-    base = {
-        "lemma": item["lemma"],
-        "pos": item["pos"],
-        "sentence": item["sentence"],
-        "definition": item.get("definition"),
-    }
-    messages = build_def_messages(
-        item["lemma"], item["pos"], item["word"], item["sentence"]
-    )
-    try:
-        samples = [_sample(client, model_id, messages) for _ in range(SAMPLES)]
-    except Exception as e:
-        return {**base, "error": str(e)}
-    return {
-        **base,
-        "answers": [c for c, _ in samples],
-        "reasonings": [r for _, r in samples],
-    }
-
-
-def _def_key(item: dict) -> tuple:
-    return (item["lemma"], item["pos"], item["sentence"])
-
-
 # A task bundles the three things run() varies on: how to query one item, how to
 # key it for resume/caching, and how to score a batch of results. Adding a task
 # elsewhere in the repo means adding an entry here.
 TASKS = {
     "wic": {"evaluate": _evaluate_pair, "key": _pair_key, "metrics": _metrics},
-    "definition": {
-        "evaluate": _evaluate_definition,
-        "key": _def_key,
-        "metrics": _def_metrics,
-    },
 }
 
 
@@ -438,8 +330,7 @@ if __name__ == "__main__":
         "-f",
         "--file",
         required=True,
-        help="Path to the input JSON file (WiC pairs, or definition items for "
-        "--task definition).",
+        help="Path to the input JSON file (WiC pairs).",
     )
     parser.add_argument(
         "-m",
@@ -459,9 +350,7 @@ if __name__ == "__main__":
         choices=list(TASKS),
         default="wic",
         help="wic: same-sense verdict for a sentence pair (word1/word2/sentence1/"
-        "sentence2/label). definition: gloss one usage (lemma/pos/word/sentence/"
-        "definition); the target word is marked in the sentence usage and the gold "
-        "definition is carried through as the training target.",
+        "sentence2/label).",
     )
     args = parser.parse_args()
     run(args.file, args.model, args.resume, args.task)
