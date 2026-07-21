@@ -101,22 +101,17 @@ def main():
         "same/different. Strongly recommended with --exclude-pairs.",
     )
     ap.add_argument(
-        "--beta",
-        type=float,
-        default=0.0,
-        help="KL coefficient anchoring the policy to the SFT reference. Unlike "
-        "grpo_sense.py this defaults to 0: with no adapter to disable, beta>0 loads a "
-        "second full copy of the model as the reference. Raise it (and budget the "
-        "VRAM) if the policy drifts off the warm start.",
-    )
-    # ---- SDPO-specific knobs ----
-    ap.add_argument(
         "--distillation-weight",
         type=float,
-        default=0.5,
+        default=0.25,
         help="Convex blend: loss = (1-w)*policy_grad + w*self_distillation. 1.0 is "
-        "pure SDPO, 0.0 collapses to GRPO. 0.5 keeps the verifiable reward driving "
-        "the update while the teacher densifies the zero-variance groups.",
+        "pure SDPO, 0.0 collapses to GRPO. With --teacher-kind live the teacher is the "
+        "student under a gold hint, so this term is the *only* thing pulling the policy "
+        "off its warm start — and with no reference model (beta=0, which a full "
+        "fine-tune cannot afford: a second fp32 copy is ~2.4GB on top of an already "
+        "~9.5GB budget) it is also the only drift knob. 0.5 was enough to cost ~5 points "
+        "of dev accuracy over 300 steps while completions shortened; 0.25 leaves the "
+        "teacher densifying the zero-variance groups without steering the update.",
     )
     ap.add_argument(
         "--teacher-kind",
@@ -190,13 +185,12 @@ def main():
         max_completion_length=args.max_completion_length,
         mask_truncated_completions=True,
         optim="paged_adamw_8bit",
-        beta=args.beta,
         temperature=0.6,
         top_p=0.95,
         top_k=20,
         min_p=0.0,
         per_device_train_batch_size=2,
-        gradient_accumulation_steps=8,
+        gradient_accumulation_steps=32,
         gradient_checkpointing=True,
         gradient_checkpointing_kwargs={"use_reentrant": False},
         num_train_epochs=2,
@@ -205,13 +199,15 @@ def main():
         lr_scheduler_type="cosine",
         bf16=True,
         eval_strategy="steps",
+        # ~1100 optimizer steps at accum=32 on the --exclude-pairs rollout set, so 100
+        # buys ~11 eval points for ~1h total — enough resolution to see the dev curve
+        # turn over and stop at the right checkpoint, which is the failure mode this
+        # run is watching for. Raise both if the rollout set grows.
         eval_steps=100,
         save_strategy="steps",
         save_steps=100,
         save_total_limit=2,
-        logging_steps=100,
-        log_completions=True,
-        num_completions_to_print=3,
+        logging_steps=25,
         report_to="wandb",
         run_name=run_name,
         # --- self-distillation ---
