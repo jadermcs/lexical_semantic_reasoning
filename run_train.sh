@@ -10,6 +10,21 @@ export TORCHDYNAMO_DISABLE=1
 # export WANDB_MODE=disabled
 # export HF_HOME=/scratch/$USER/.cache/huggingface
 
-uv sync                        # idempotent; resolves from the shared uv.lock
-uv run src/grpo_sense.py --model ./qwen-sense-sft-wic-longest \
-    --vllm-server-host isp-cap-n10 --vllm-server-port 8000
+uv sync
+uv run src/prepare_data.py \
+    --data data/mcl_train_dev_filtered.json \
+    --reasoning-select longest \
+    --out data/sft_wic_filtered \
+    --balance-labels
+
+uv run src/sft_sense.py \
+    --data data/sft_wic_filtered
+
+uv run src/eval_sense.py \
+    --model ./qwen-sft_wic_filtered \
+    --split test
+
+uv run src/grpo_sense.py \
+    --model ./qwen-sft_wic_filtered \
+    --exclude-pairs data/sft_wic_filtered.sft_pairs.json
+    --balance-labels

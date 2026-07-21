@@ -22,7 +22,7 @@ def main():
     ap.add_argument(
         "--output-dir",
         default=None,
-        help="Where to save checkpoints/adapter. Defaults to ./qwen-sft-<data-stem>.",
+        help="Where to save checkpoints/adapter. Defaults to ./qwen-<data-stem>.",
     )
     args = ap.parse_args()
 
@@ -41,7 +41,7 @@ def main():
     print(dataset["train"][0])
 
     data_tag = Path(args.data.rstrip("/")).stem
-    output_dir = args.output_dir or f"./qwen-sft-{data_tag}"
+    output_dir = args.output_dir or f"./qwen-{data_tag}"
     training_args = SFTConfig(
         output_dir=output_dir,
         completion_only_loss=True,

@@ -131,10 +131,6 @@ def main():
             vllm_server_host=args.vllm_server_host, vllm_server_port=args.vllm_server_port,
         )
     else:
-        # Colocated vLLM context must hold prompt + completion. GRPO (TRL 1.8) does
-        # not truncate prompts, so reserve headroom above the observed max WiC prompt
-        # (~382 tokens) rather than aliasing the context to max_completion_length,
-        # which would let the prompt silently eat the generation budget.
         prompt_headroom = 512
         vllm_kwargs = dict(
             use_vllm=True,
