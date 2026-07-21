@@ -186,11 +186,6 @@ def main():
     output_dir = f"./{run_name}"
     training_args = SDPOConfig(
         output_dir=output_dir,
-        # float32 params + bf16 autocast: see the module docstring. TRL instantiates
-        # the model from --model with these, so a reference/teacher copy matches it.
-        model_init_kwargs=dict(
-            dtype="float32", attn_implementation="kernels-community/flash-attn2"
-        ),
         num_generations=8,
         max_completion_length=args.max_completion_length,
         mask_truncated_completions=True,
@@ -200,17 +195,12 @@ def main():
         top_p=0.95,
         top_k=20,
         min_p=0.0,
-        # The logits tensor is (batch × seq × 151936) and outweighs a 0.6B model's
-        # weights, so batch stays at 2 even though the policy is small. 2×8 keeps the
-        # generation batch at 16, divisible by num_generations.
         per_device_train_batch_size=2,
         gradient_accumulation_steps=8,
         gradient_checkpointing=True,
         gradient_checkpointing_kwargs={"use_reentrant": False},
         num_train_epochs=2,
         warmup_steps=50,
-        # 5x below the LoRA LR: every weight moves here, and there is no adapter
-        # scaling to absorb an oversized step.
         learning_rate=1e-6,
         lr_scheduler_type="cosine",
         bf16=True,
@@ -264,14 +254,7 @@ def main():
         eval_dataset=dev_ds,
     )
 
-    last = None
-    out = Path(output_dir)
-    if out.exists():
-        cks = sorted(out.glob("checkpoint-*"), key=lambda p: int(p.name.split("-")[-1]))
-        if cks:
-            last = str(cks[-1])
-            print(f"Resuming from checkpoint: {last}")
-    trainer.train(resume_from_checkpoint=last)
+    trainer.train()
     trainer.save_model(output_dir)
     print(f"Saved final model → {output_dir}")
 
