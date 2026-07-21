@@ -12,6 +12,13 @@ def main():
     ap.add_argument("--model", default="Qwen/Qwen3-0.6B")
     ap.add_argument("--epochs", type=int, default=3)
     ap.add_argument(
+        "--lr",
+        type=float,
+        default=1e-4,
+        help="Peak learning rate. 1e-4 suits the 0.6B; scale it down for anything "
+        "bigger (2e-5 for 2B) or the loss climbs through warmup and never recovers.",
+    )
+    ap.add_argument(
         "--data",
         default="data/sft_wic",
         help="Prepared dataset dir written by prepare_data.py (a DatasetDict with "
@@ -53,7 +60,7 @@ def main():
         per_device_train_batch_size=16,
         per_device_eval_batch_size=16,
         warmup_steps=0.03,
-        learning_rate=1e-4,
+        learning_rate=args.lr,
         lr_scheduler_type="cosine",
         bf16=True,
         eval_strategy="steps",
