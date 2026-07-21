@@ -80,14 +80,7 @@ def main():
         args=training_args,
     )
 
-    last = None
-    out = Path(output_dir)
-    if out.exists():
-        cks = sorted(out.glob("checkpoint-*"), key=lambda p: int(p.name.split("-")[-1]))
-        if cks:
-            last = str(cks[-1])
-            print(f"Resuming from checkpoint: {last}")
-    trainer.train(resume_from_checkpoint=last)
+    trainer.train()
     trainer.save_model(output_dir)
     print(f"Saved final adapter → {output_dir}")
 
