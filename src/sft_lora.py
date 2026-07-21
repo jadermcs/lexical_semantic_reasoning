@@ -28,6 +28,14 @@ def main():
         default=None,
         help="Where to save checkpoints/adapter. Defaults to ./qwen-lora-<data-stem>.",
     )
+    ap.add_argument(
+        "--merged-dir",
+        default=None,
+        help="Where to write the adapter merged back into the base weights. Defaults "
+        "to '<output-dir>-merged'. This merged model is what grpo_lora.py consumes: "
+        "GRPO then starts a fresh LoRA on top of the warm-started weights instead of "
+        "continuing the SFT adapter. Pass '' to skip merging.",
+    )
     args = ap.parse_args()
 
     tokenizer = AutoTokenizer.from_pretrained(args.model, trust_remote_code=True)
@@ -95,6 +103,16 @@ def main():
     trainer.train(resume_from_checkpoint=last)
     trainer.save_model(output_dir)
     print(f"Saved final adapter → {output_dir}")
+
+    merged_dir = args.merged_dir if args.merged_dir is not None else f"{output_dir}-merged"
+    if merged_dir:
+        # Fold the adapter into the base weights and save a plain HF model, so the
+        # downstream GRPO run attaches a *fresh* LoRA to the warm-started policy
+        # (and its adapter-disabled base is the correct KL reference).
+        merged = trainer.model.merge_and_unload()
+        merged.save_pretrained(merged_dir)
+        tokenizer.save_pretrained(merged_dir)
+        print(f"Saved merged model → {merged_dir}")
 
 
 if __name__ == "__main__":
