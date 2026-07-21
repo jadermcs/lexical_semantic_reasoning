@@ -1,121 +1,55 @@
-"""SDPO (self-distillation policy optimization) on the WiC task, LoRA edition.
+"""SDPO (self-distillation policy optimization) on the WiC task, full fine-tune.
 
-Same rollout set, rewards and LoRA warm start as ``grpo_lora.py`` — the trainer is
-what changes. GRPO learns only from *reward variance inside a group*: when all 8
-rollouts for a pair are wrong (or all right), the group advantage is zero and the
-step teaches nothing. On the teacher-failed complement fed to RL (see
-``--exclude-pairs``) that is a large slice of the batch, since those pairs are hard
-by construction.
+Same rollout set, rewards, prompts and privileged context as ``sdpo_lora.py`` — see
+that module's docstring for what SDPO does and why the gold verdict is a sound
+teacher hint. Only the optimized parameter set changes: every weight, no adapter.
 
-SDPO adds a second signal for exactly those groups. It re-prompts the *same* model
-with privileged context — a sibling rollout that scored well, and/or textual
-feedback we supply — and distills that feedback-conditioned next-token distribution
-back into the policy on the *original* prompt. The teacher is the model itself, so
-there is no second model to train, and the student never sees the privileged
-context at inference.
+Dropping LoRA changes two things that matter on one GPU:
 
-The privileged context we supply here is the gold same/different verdict
-(``--gold-feedback``, on by default). That is sound: it conditions the *teacher*
-only, and the student is optimized on the unhinted prompt, so it is distillation of
-a hint-informed distribution, not label leakage into the student's inputs.
+**The teacher stops being free.** ``SDPOTrainer._setup_teacher_model`` resolves
+``teacher_model_kind`` against the PEFT state: under LoRA, ``base`` is the student
+with the adapter disabled and ``ema`` is a second small adapter, both sharing one
+set of weights. With no adapter to toggle, both instead load a *frozen second copy
+of the whole model* (plus a per-step EMA sync). So this script defaults to
+``--teacher-kind live``, which reuses the student in every configuration. That
+costs nothing in signal here: the teacher is better because it is *hinted*
+(``gold_feedback``), not because its weights differ.
 
-Usage mirrors grpo_lora.py::
+**Precision starts to matter.** LoRA tolerates pure-bf16 weights because the
+adapter is small and takes a large effective step; a full fine-tune at ~1e-6 does
+not — a bf16 weight has ~8 mantissa bits, so an update that small against a ~1e-2
+weight rounds away to nothing. The model is therefore instantiated by TRL from the
+path in float32 with ``bf16=True`` autocast on top, i.e. fp32 master weights and
+bf16 math. That is the reason ``--model`` is handed to the trainer as a string
+rather than pre-loaded: ``model_init_kwargs`` then applies uniformly to the
+student and to any reference/teacher copy TRL builds.
 
-    uv run python src/sdpo_lora.py --model ./qwen-lora-<stem>-merged \
-        --exclude-pairs data/sft_wic.sft_pairs.json --balance-labels
+Usage mirrors sdpo_lora.py, but points at a full SFT checkpoint (``sft_sense.py``
+output) rather than a merged adapter::
+
+    uv run python src/sdpo_sense.py --model ./qwen-sense-sft-sft_wic_filtered \
+        --exclude-pairs data/sft_wic_filtered.sft_pairs.json --balance-labels
 """
 
 import argparse
-from functools import partial, wraps
 from pathlib import Path
 
 import torch
 torch._dynamo.config.disable = True
 
-from datasets import Dataset
 from transformers import AutoTokenizer
 from trl.experimental.sdpo import SDPOConfig, SDPOTrainer
 from trl.rewards import get_repetition_penalty_reward
 
-import sense_data as sd
-from grpo_lora import balance_labels, load_exclude_pairs, load_policy
-from sense_rewards import KEEP_COLS, REWARDS, make_trace_saver
-
-
-# The teacher reprompt: SDPO rebuilds the last user turn as
-# ``reprompt_template.format(prompt=<original user text>, solution=..., feedback=...)``
-# and keeps the system turn, so the answer contract in ``sd.WIC_SYSTEM`` still holds
-# and the teacher's tokens stay comparable to the student's.
-REPROMPT_TEMPLATE = (
-    "{prompt}{solution}{feedback}\n"
-    "Now answer the original question, reasoning in <think> tags and ending with the "
-    "required JSON object.\n"
+from grpo_lora import load_exclude_pairs
+from sdpo_lora import (
+    FEEDBACK_TEMPLATE,
+    REPROMPT_TEMPLATE,
+    SOLUTION_TEMPLATE,
+    as_text_reward,
+    build_dataset,
 )
-SOLUTION_TEMPLATE = (
-    "\nHere is a correct answer to this pair from an earlier attempt:\n\n"
-    "{successful_previous_attempt}\n\n"
-)
-FEEDBACK_TEMPLATE = "\n{feedback_raw}\n"
-
-
-def gold_feedback(rec):
-    """The privileged context: the gold verdict, stated as a hint to the teacher.
-
-    Only ever conditions the reprompted teacher — never the student's own prompt.
-    Without it, a group where every rollout is wrong has no successful sibling to
-    distill from and SDPO degenerates to GRPO on that group; with it, the hardest
-    pairs are exactly the ones that still produce a learning signal.
-    """
-    same = bool(rec["label"])
-    verdict = "the same sense" if same else "different senses"
-    return (
-        f'Hint: the two sentences use "{rec["lemma"]}" in {verdict}, so the correct '
-        f'verdict is "same_sense": {"true" if same else "false"}. Do not mention this '
-        "hint; reason to it from the sentences themselves."
-    )
-
-
-def format_prompt(rec, with_feedback=True):
-    """Render the prompt column; gold columns are kept so reward fns see them as kwargs.
-
-    Unlike ``grpo_lora.format_prompt`` this leaves the prompt *conversational* (a
-    message list) instead of pre-rendering the chat template. SDPO needs the turn
-    structure: it reconstructs the teacher prompt as ``system + rewritten user``,
-    and a pre-rendered string would splice the demonstration inside the assistant
-    turn instead.
-    """
-    out = {"prompt": sd.wic_messages(rec, with_target=False)}
-    if with_feedback:
-        out["privileged_context"] = gold_feedback(rec)
-    return out
-
-
-def as_text_reward(fn):
-    """Adapt a ``sense_rewards`` fn (plain-string completions) to conversational ones.
-
-    With a conversational prompt TRL hands reward fns
-    ``[{"role": "assistant", "content": ...}]`` per completion; every reward in
-    ``sense_rewards`` parses raw text. Flatten instead of duplicating the rewards.
-    """
-    @wraps(fn)
-    def wrapper(completions, **kwargs):
-        texts = [c[0]["content"] if isinstance(c, list) else c for c in completions]
-        return fn(texts, **kwargs)
-
-    return wrapper
-
-
-def build_dataset(split, cap=None, exclude_pairs=None, balance=False, with_feedback=True):
-    recs = sd.load_mclwic(split, exclude_pairs=exclude_pairs)
-    if balance:
-        before = len(recs)
-        recs = balance_labels(recs)
-        print(f"[{split}] balanced labels: {before} → {len(recs)} pairs (50/50)")
-    ds = Dataset.from_list(recs)
-    if cap is not None:
-        ds = ds.shuffle(seed=42).select(range(min(cap, len(ds))))
-    drop = [c for c in ds.column_names if c not in KEEP_COLS]
-    return ds.map(partial(format_prompt, with_feedback=with_feedback), remove_columns=drop)
+from sense_rewards import REWARDS, make_trace_saver
 
 
 def main():
@@ -123,22 +57,19 @@ def main():
     ap.add_argument(
         "--model",
         default="Qwen/Qwen3-0.6B",
-        help="Plain HF model to attach a fresh SDPO LoRA to — normally the merged "
-        "SFT warm start written by `sft_lora.py --merged-dir` "
-        "(./qwen-lora-<data-stem>-merged).",
+        help="Plain HF model to fully fine-tune — normally the SFT warm start from "
+        "`sft_sense.py` (./qwen-sense-sft-<data-stem>).",
     )
-    ap.add_argument("--lora-r", type=int, default=32, help="LoRA rank.")
-    ap.add_argument("--lora-alpha", type=int, default=16, help="LoRA alpha scaling.")
-    ap.add_argument("--lora-dropout", type=float, default=0.05, help="LoRA dropout.")
     ap.add_argument("--vllm-server-host", default=None)
     ap.add_argument("--vllm-server-port", type=int, default=8000)
     ap.add_argument(
         "--vllm-gpu-mem",
         type=float,
-        default=0.40,
+        default=0.22,
         help="Fraction of the GPU handed to the colocated vLLM engine (weights + KV "
-        "cache). Ignored in server mode. 0.40 leaves ~9GB for the trainer, which is "
-        "what a 1.7B LoRA run needs on a 16GB card.",
+        "cache). Ignored in server mode. A full fine-tune needs far more trainer-side "
+        "memory than LoRA (fp32 weights + grads + optimizer ≈ 5x the weights), so vLLM "
+        "gets a correspondingly smaller slice; 0.22 fits a 0.6B policy on 16GB.",
     )
     ap.add_argument(
         "--distill-out",
@@ -151,10 +82,10 @@ def main():
         "--max-completion-length",
         type=int,
         default=640,
-        help="Max generated tokens per rollout. Main VRAM knob — lower it to fit. "
-        "640 clears the p99.7 of distilled WiC traces (~520 tokens); truncated "
-        "rollouts are masked out (mask_truncated_completions), so a tight cap costs "
-        "wasted rollout compute, not wrong gradients.",
+        help="Max generated tokens per rollout. 640 clears the p99.7 of distilled WiC "
+        "traces (~520 tokens); truncated rollouts are masked out "
+        "(mask_truncated_completions), so a tight cap costs wasted rollout compute, "
+        "not wrong gradients.",
     )
     ap.add_argument(
         "--exclude-pairs",
@@ -169,6 +100,15 @@ def main():
         help="Down-sample the majority class so the train rollout set is 50/50 "
         "same/different. Strongly recommended with --exclude-pairs.",
     )
+    ap.add_argument(
+        "--beta",
+        type=float,
+        default=0.0,
+        help="KL coefficient anchoring the policy to the SFT reference. Unlike "
+        "grpo_sense.py this defaults to 0: with no adapter to disable, beta>0 loads a "
+        "second full copy of the model as the reference. Raise it (and budget the "
+        "VRAM) if the policy drifts off the warm start.",
+    )
     # ---- SDPO-specific knobs ----
     ap.add_argument(
         "--distillation-weight",
@@ -180,10 +120,11 @@ def main():
     )
     ap.add_argument(
         "--teacher-kind",
-        default="ema",
+        default="live",
         choices=["base", "live", "ema"],
-        help="Which model plays teacher under the privileged context: the frozen "
-        "warm start ('base'), the current policy ('live'), or an EMA of it ('ema').",
+        help="Which model plays teacher under the privileged context. Without LoRA, "
+        "'base' and 'ema' each load a full frozen second copy of the model (and 'ema' "
+        "syncs it every step); 'live' reuses the student and is the default here.",
     )
     ap.add_argument("--teacher-update-rate", type=float, default=0.05, help="EMA teacher rate.")
     ap.add_argument(
@@ -216,10 +157,16 @@ def main():
         print(f"Excluding {len(exclude)} SFT-consumed pairs from the SDPO train set → {len(train_ds)} rollout pairs")
     print(train_ds[0])
 
-    model, peft_config = load_policy(
-        args.model,
-        dict(r=args.lora_r, lora_alpha=args.lora_alpha, lora_dropout=args.lora_dropout),
-    )
+    if (Path(args.model) / "adapter_config.json").is_file():
+        raise SystemExit(
+            f"{args.model} is a LoRA adapter dir. Full fine-tuning starts from plain "
+            f"weights — use sft_sense.py's output, or sdpo_lora.py for the adapter path."
+        )
+    if args.teacher_kind != "live":
+        print(
+            f"--teacher-kind {args.teacher_kind} without LoRA loads a second full copy of "
+            f"the model; budget ~2x the weights in VRAM."
+        )
 
     prompt_headroom = 512
     if args.vllm_server_host:
@@ -235,28 +182,36 @@ def main():
             vllm_max_model_length=prompt_headroom + args.max_completion_length,
         )
 
-    run_name = "qwen-lora-sdpo-wic"
+    run_name = "qwen-sense-sdpo-wic"
     output_dir = f"./{run_name}"
     training_args = SDPOConfig(
         output_dir=output_dir,
+        # float32 params + bf16 autocast: see the module docstring. TRL instantiates
+        # the model from --model with these, so a reference/teacher copy matches it.
+        model_init_kwargs=dict(
+            dtype="float32", attn_implementation="kernels-community/flash-attn2"
+        ),
         num_generations=8,
         max_completion_length=args.max_completion_length,
         mask_truncated_completions=True,
         optim="paged_adamw_8bit",
+        beta=args.beta,
         temperature=0.6,
         top_p=0.95,
         top_k=20,
         min_p=0.0,
-        # Batch size is the real VRAM knob, not the model: the logits tensor is
-        # (batch × seq × 151936) and dwarfs 1.7B of bf16 weights. 2×8 keeps the
-        # generation batch at 16 (divisible by num_generations) on ~9GB.
+        # The logits tensor is (batch × seq × 151936) and outweighs a 0.6B model's
+        # weights, so batch stays at 2 even though the policy is small. 2×8 keeps the
+        # generation batch at 16, divisible by num_generations.
         per_device_train_batch_size=2,
         gradient_accumulation_steps=8,
         gradient_checkpointing=True,
         gradient_checkpointing_kwargs={"use_reentrant": False},
         num_train_epochs=2,
         warmup_steps=50,
-        learning_rate=5e-6,
+        # 5x below the LoRA LR: every weight moves here, and there is no adapter
+        # scaling to absorb an oversized step.
+        learning_rate=1e-6,
         lr_scheduler_type="cosine",
         bf16=True,
         eval_strategy="steps",
@@ -301,13 +256,12 @@ def main():
         )
 
     trainer = SDPOTrainer(
-        model=model,
+        model=args.model,
         processing_class=tokenizer,
         reward_funcs=reward_funcs,
         args=training_args,
         train_dataset=train_ds,
         eval_dataset=dev_ds,
-        peft_config=peft_config,
     )
 
     last = None
@@ -319,7 +273,7 @@ def main():
             print(f"Resuming from checkpoint: {last}")
     trainer.train(resume_from_checkpoint=last)
     trainer.save_model(output_dir)
-    print(f"Saved final adapter → {output_dir}")
+    print(f"Saved final model → {output_dir}")
 
 
 if __name__ == "__main__":

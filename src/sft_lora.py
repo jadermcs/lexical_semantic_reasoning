@@ -16,14 +16,7 @@ def main():
     ap.add_argument("--lora-r", type=int, default=256, help="LoRA rank.")
     ap.add_argument("--lora-alpha", type=int, default=16, help="LoRA alpha scaling.")
     ap.add_argument("--lora-dropout", type=float, default=0.05, help="LoRA dropout.")
-    ap.add_argument(
-        "--data",
-        default="data/sft_wic",
-        help="Prepared dataset dir written by prepare_data.py (a DatasetDict with "
-        "train/dev splits of {prompt, completion} examples). Build it first with "
-        "`uv run python src/prepare_data.py ...` so the data can be inspected before "
-        "training and isn't re-processed every run.",
-    )
+    ap.add_argument("--data", default="data/sft_wic")
     ap.add_argument(
         "--output-dir",
         default=None,
@@ -63,7 +56,7 @@ def main():
         use_liger_kernel=True,
         dataset_num_proc=8,
         num_train_epochs=args.epochs,
-        per_device_train_batch_size=16,
+        per_device_train_batch_size=8,
         per_device_eval_batch_size=16,
         warmup_steps=0.03,
         learning_rate=args.lr,
@@ -100,9 +93,6 @@ def main():
 
     merged_dir = args.merged_dir if args.merged_dir is not None else f"{output_dir}-merged"
     if merged_dir:
-        # Fold the adapter into the base weights and save a plain HF model, so the
-        # downstream GRPO run attaches a *fresh* LoRA to the warm-started policy
-        # (and its adapter-disabled base is the correct KL reference).
         merged = trainer.model.merge_and_unload()
         merged.save_pretrained(merged_dir)
         tokenizer.save_pretrained(merged_dir)
