@@ -30,10 +30,6 @@ The script *annotates* rather than deletes: it writes every reasoning back with
 its verdict and a ``keep`` flag, so the accept threshold can be retuned without
 paying for the judgements again. ``--emit-filtered`` writes the pruned corpus.
 
-vLLM is imported lazily and this module needs nothing else from the project, so
-it can run in an isolated env without disturbing the training stack::
-
-    VIRTUAL_ENV=/path/to/vllm-env uv run --active python src/filter_reasoning.py
 """
 
 from __future__ import annotations
@@ -211,11 +207,15 @@ def build_prompt(rec: dict, slot: int) -> str:
     )
 
 
+# Gemma 4's recommended sampling settings.
+SAMPLING = dict(temperature=1.0, top_p=0.95, top_k=64)
+
+
 def make_sampling_params(max_tokens: int):
     """Structured-output params, tolerating the pre/post-0.10 vLLM API rename."""
     from vllm import SamplingParams
 
-    common = dict(temperature=0.0, max_tokens=max_tokens)
+    common = dict(max_tokens=max_tokens, **SAMPLING)
     try:  # vLLM >= 0.10
         from vllm.sampling_params import StructuredOutputsParams
 
