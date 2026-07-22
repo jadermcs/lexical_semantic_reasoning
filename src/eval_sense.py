@@ -55,7 +55,8 @@ WIC_JSON_SCHEMA = {
 
 # Qwen3 thinking-mode sampling settings (greedy decoding is discouraged for
 # reasoning models — it degenerates into repetition).
-SAMPLING = dict(temperature=0.6, top_p=0.95, top_k=20, min_p=0.0)
+# SAMPLING = dict(temperature=0.6, top_p=0.95, top_k=20, min_p=0.0)
+SAMPLING = dict()
 
 
 def generate_all(llm, texts, force_json=False):

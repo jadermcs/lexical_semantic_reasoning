@@ -208,7 +208,8 @@ def build_prompt(rec: dict, slot: int) -> str:
 
 
 # Gemma 4's recommended sampling settings.
-SAMPLING = dict(temperature=1.0, top_p=0.95, top_k=64)
+# SAMPLING = dict(temperature=1.0, top_p=0.95, top_k=64)
+SAMPLING = dict()
 
 
 def make_sampling_params(max_tokens: int):

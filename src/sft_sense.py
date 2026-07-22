@@ -52,9 +52,10 @@ def main():
     training_args = SFTConfig(
         output_dir=output_dir,
         completion_only_loss=True,
-        max_length=1024,
+        max_length=2048,
         packing=True,
         use_liger_kernel=True,
+        weight_decay=0.1,
         dataset_num_proc=8,
         num_train_epochs=args.epochs,
         per_device_train_batch_size=16,

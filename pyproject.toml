@@ -23,7 +23,13 @@ dependencies = [
 ]
 
 [dependency-groups]
-dev = ["pytest>=8.0"]
+dev = [
+    "jupyter>=1.1.1",
+    "matplotlib>=3.11.1",
+    "nbformat>=5.10.4",
+    "pandas>=3.0.3",
+    "pytest>=8.0",
+]
 
 [tool.pytest.ini_options]
 # The training scripts import their siblings as top-level modules (``import
