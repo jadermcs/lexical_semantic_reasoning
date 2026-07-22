@@ -11,26 +11,9 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--model", default="Qwen/Qwen3-0.6B")
     ap.add_argument("--epochs", type=int, default=3)
-    ap.add_argument(
-        "--lr",
-        type=float,
-        default=1e-4,
-        help="Peak learning rate. 1e-4 suits the 0.6B; scale it down for anything "
-        "bigger (2e-5 for 2B) or the loss climbs through warmup and never recovers.",
-    )
-    ap.add_argument(
-        "--data",
-        default="data/sft_wic",
-        help="Prepared dataset dir written by prepare_data.py (a DatasetDict with "
-        "train/dev splits of {prompt, completion} examples). Build it first with "
-        "`uv run python src/prepare_data.py ...` so the data can be inspected before "
-        "training and isn't re-processed every run.",
-    )
-    ap.add_argument(
-        "--output-dir",
-        default=None,
-        help="Where to save checkpoints/adapter. Defaults to ./qwen-<data-stem>.",
-    )
+    ap.add_argument("--lr", type=float, default=1e-4)
+    ap.add_argument("--data", default="data/sft_wic")
+    ap.add_argument("--output-dir", default=None)
     args = ap.parse_args()
 
     tokenizer = AutoTokenizer.from_pretrained(args.model, trust_remote_code=True)
