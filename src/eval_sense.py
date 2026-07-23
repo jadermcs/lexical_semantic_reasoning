@@ -1,7 +1,6 @@
 """Evaluate a WiC checkpoint on a held-out MCL-WiC split.
 
-Generates one verdict per test pair (vLLM, continuous batching; Qwen3
-thinking-mode sampling — temperature 0.6, top-p 0.95, top-k 20, min-p 0) and
+Greedily generates a verdict per test pair (vLLM, continuous batching) and
 reports accuracy plus same/different precision/recall/F1. Completions with no
 extractable verdict are counted as ``empty`` and left out of the P/R/F1 (they
 can't be scored as either class).
@@ -13,7 +12,7 @@ continuation via vLLM structured outputs), so every completion parses and
 which get force-closed. Prefix caching means the phase-2 pass reuses the
 phase-1 KV cache instead of re-prefilling prompt + reasoning.
 
-Predictions are saved in the ``call_api.py`` teacher schema (one sample
+Predictions are saved in the ``call_api.py`` teacher schema (one greedy sample
 per pair), so the output file can be fed straight to ``prepare_data.py --data``
 (which builds the SFT dataset ``sft_sense.py`` then trains on).
 
@@ -53,14 +52,9 @@ WIC_JSON_SCHEMA = {
     "required": ["sense1", "sense2", "same_sense"],
 }
 
-# Qwen3 thinking-mode sampling settings (greedy decoding is discouraged for
-# reasoning models — it degenerates into repetition).
-# SAMPLING = dict(temperature=0.6, top_p=0.95, top_k=20, min_p=0.0)
-SAMPLING = dict()
-
 
 def generate_all(llm, texts, force_json=False):
-    """Sampled completions for all prompts; vLLM schedules the batch internally.
+    """Greedy completions for all prompts; vLLM schedules the batch internally.
 
     With ``force_json``, decoding runs in two phases: free reasoning stopped at
     ``</think>`` (force-closed if the token budget runs out first), then a
@@ -69,12 +63,12 @@ def generate_all(llm, texts, force_json=False):
     verdict. Prefix caching makes phase 2 a near-pure decode of the answer.
     """
     if not force_json:
-        sp = SamplingParams(max_tokens=1024, **SAMPLING)
+        sp = SamplingParams(temperature=0.0, max_tokens=1024)
         return [out.outputs[0].text for out in llm.generate(texts, sp)]
 
     # Phase 1: free-form reasoning, halted at the close of the think block.
     sp1 = SamplingParams(
-        max_tokens=1024, **SAMPLING,
+        temperature=0.0, max_tokens=1024,
         stop=["</think>"], include_stop_str_in_output=True,
     )
     thinks = []
@@ -86,7 +80,7 @@ def generate_all(llm, texts, force_json=False):
 
     # Phase 2: constrained continuation — only tokens forming schema-valid JSON.
     sp2 = SamplingParams(
-        max_tokens=512, **SAMPLING,
+        temperature=0.0, max_tokens=512,
         structured_outputs=StructuredOutputsParams(json=WIC_JSON_SCHEMA),
     )
     outs2 = llm.generate([p + t for p, t in zip(texts, thinks)], sp2)
@@ -147,7 +141,7 @@ def main():
         hyp, gold = sd.extract_wic_label(decoded), rec["label"]
         hyps.append(hyp)
         refs.append(gold)
-        # Teacher-predictions schema (call_api.py), single sample —
+        # Teacher-predictions schema (call_api.py), single greedy sample —
         # the output file feeds prepare_data.py --data via load_teacher_traces.
         think, closed, _ = decoded.partition("</think>")
         answer = sd.parse_wic_answer(decoded)
