@@ -260,7 +260,9 @@ def wic_messages(rec, with_target=False):
         f"Target word: {rec['lemma']} ({rec['pos']})\n\n"
         f"Sentence 1: {rec['usage1']}\n"
         f"Sentence 2: {rec['usage2']}\n\n"
-        "Do both sentences use the target word in the same sense?"
+        "Do both sentences use the target word in the same sense? Respond with a "
+        'single JSON object with keys "sense1", "sense2" (the gloss of the target '
+        'in each sentence) and "same_sense" (boolean).'
     )
     msgs = [
         {"role": "system", "content": WIC_SYSTEM},
