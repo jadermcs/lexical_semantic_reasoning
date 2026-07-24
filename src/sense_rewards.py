@@ -9,12 +9,18 @@ The reward has two halves:
 * **Correctness** — ``reward_wic_accuracy``. The gold same/different label is
   known, so this is exact rather than a similarity estimate. It dominates
   (+/-1.0) everything else.
-* **Shape** — ``reward_wic_format``, ``reward_wic_json``, ``reward_wic_consistency``
-  and ``reward_think_length`` pay for the reasoning block and the JSON answer contract
-  the prompt asks for, and punish the ways models degenerate out of it (a stubbed
-  <think>, a prose answer, an unclosed reasoning block, a gloss pair that contradicts
-  the same_sense verdict). Their combined ceiling stays well under the accuracy term,
-  so being right always beats being tidy.
+* **Shape** — ``reward_wic_format``, ``reward_wic_json``, ``reward_wic_consistency``,
+  ``reward_wic_wordnet`` and ``reward_think_length`` pay for the reasoning block and the
+  JSON answer contract the prompt asks for, and punish the ways models degenerate out of
+  it (a stubbed <think>, a prose answer, an unclosed reasoning block, a gloss pair that
+  contradicts the same_sense verdict). Their combined ceiling stays well under the
+  accuracy term, so being right always beats being tidy.
+
+``reward_wic_wordnet`` is the only term that consults anything outside the answer
+itself. That is deliberate: ``same_sense`` is one bit, so a trace that guesses it
+correctly is indistinguishable from one that reasoned to it, and no amount of
+self-referential shaping can tell them apart. WordNet has no stake in the pipeline,
+so snapping the emitted glosses to it is genuine outside information.
 """
 
 import json
@@ -209,16 +215,102 @@ def reward_wic_consistency(completions, **kwargs):
     return out
 
 
+# --------------------------------------------------------------------------- #
+# WordNet: the semantic counterpart of the consistency reward's false branch
+# --------------------------------------------------------------------------- #
+WIC_WN_MERGED = -0.25
+
+# Sentinel-cached ``gloss_wordnet.snap``: False = not yet probed, None = unavailable.
+_WN_SNAP = False
+
+
+def _wn_snap():
+    """``gloss_wordnet.snap``, or None when the lexicon is not installed.
+
+    ``wn`` is deliberately absent from the shared uv.lock (the training servers
+    build torch/vLLM from it), so this has to degrade to a no-op rather than take
+    down a run — or the CPU test suite — wherever the lexicon is missing. Probing
+    once with a real lookup is what distinguishes "package installed" from
+    "lexicon downloaded"; ``gloss_wordnet`` opens the lexicon lazily and only
+    raises on first use.
+    """
+    global _WN_SNAP
+    if _WN_SNAP is False:
+        try:
+            import gloss_wordnet
+
+            gloss_wordnet.synsets_for("bank", "noun")
+            _WN_SNAP = gloss_wordnet.snap
+        except (ImportError, LookupError):
+            _WN_SNAP = None
+    return _WN_SNAP
+
+
+def reward_wic_wordnet(completions, **kwargs):
+    """Punish a "different senses" verdict whose two glosses name one WordNet sense.
+
+    ``reward_wic_consistency``'s ``same_sense=false`` branch only fires on
+    *token-identical* glosses — a case its own docstring notes the model does not
+    produce. Snapping each gloss to the best-matching synset of its ``(lemma, pos)``
+    catches the same failure worded differently: measured over the SFT model's 1000
+    test records, on the 422 traces claiming *different* for a gold-different pair
+    the string rule fires 6 times and this one 163, a strict superset of it.
+
+    Every one of those 163 is a *label-correct* trace, which is the whole point.
+    They are the lucky guesses a one-bit verifier cannot separate from real sense
+    discrimination, so they carry the same accuracy reward as a trace that did the
+    work — which is what flattens the GRPO advantage on hard pairs.
+
+    Label-free, exactly like the reward it upgrades: it scores whether the glosses
+    support the verdict the answer *claims*, not whether that verdict is right.
+    ``reward_wic_accuracy`` already charges for being wrong, and double-charging it
+    here would just widen the accuracy term under another name.
+
+    Only the *merge* direction is checked. The converse — a ``same`` verdict whose
+    glosses snap to different synsets — is anti-correlated with quality (the API
+    teacher trips it more often than the SFT model does, because two good
+    paraphrases of one sense routinely land on neighbouring synsets), which is why
+    ``gloss_wordnet.check`` keeps it behind ``strict=True``. That module's docstring
+    has the calibration; do not symmetrise this without redoing it.
+
+    Scores 0.0 when the lexicon is unavailable, when the answer does not parse, and
+    when the lemma is absent from WordNet — absence of evidence is not evidence of a
+    merged gloss.
+    """
+    snap = _wn_snap()
+    if snap is None:
+        return [0.0] * len(completions)
+    out = []
+    for c, lemma, pos in zip(completions, kwargs["lemma"], kwargs["pos"]):
+        r = 0.0
+        obj = sd.parse_wic_answer(c)
+        if obj is not None:
+            s1, s2, verdict = obj.get("sense1"), obj.get("sense2"), obj.get("same_sense")
+            if verdict is False and isinstance(s1, str) and isinstance(s2, str) \
+                    and s1.strip() and s2.strip():
+                syn1, _ = snap(s1, lemma, pos)
+                syn2, _ = snap(s2, lemma, pos)
+                # `snap` returns None for a lemma WordNet does not have; two Nones
+                # are not a merged gloss.
+                if syn1 is not None and syn1 == syn2:
+                    r = WIC_WN_MERGED
+        out.append(r)
+    return out
+
+
 REWARDS = [
     reward_wic_accuracy,
     reward_wic_format,
     reward_wic_json,
     reward_wic_consistency,
+    reward_wic_wordnet,
     reward_think_length,
 ]
 
 # Gold columns the reward fns (and the trace saver) read off the dataset.
-KEEP_COLS = ["lemma", "label"]
+# ``pos`` is required by reward_wic_wordnet: `gloss_wordnet` keys its synset lookup
+# on (lemma, pos), and adjectives have to query both 'a' and 's'.
+KEEP_COLS = ["lemma", "pos", "label"]
 
 
 # --------------------------------------------------------------------------- #

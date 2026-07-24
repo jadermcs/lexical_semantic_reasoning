@@ -42,7 +42,7 @@ def main():
         num_train_epochs=args.epochs,
         per_device_train_batch_size=16,
         per_device_eval_batch_size=16,
-        warmup_steps=0.03,
+        warmup_steps=0.02,
         learning_rate=args.lr,
         lr_scheduler_type="cosine",
         bf16=True,

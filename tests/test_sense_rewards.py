@@ -197,6 +197,73 @@ class TestThinkLength:
 
 
 # --------------------------------------------------------------------------- #
+# WordNet gloss check
+# --------------------------------------------------------------------------- #
+def _wn(completion, lemma="bank", pos="noun"):
+    return R.reward_wic_wordnet([completion], lemma=[lemma], pos=[pos])[0]
+
+
+def _answer(s1, s2, same):
+    return wrap(GOOD_THINK, json.dumps({"sense1": s1, "sense2": s2, "same_sense": same}))
+
+
+def test_wordnet_reward_is_a_noop_without_the_lexicon(monkeypatch):
+    # `wn` is not in the shared uv.lock, so a training run on a machine without the
+    # lexicon must lose this term rather than crash. Pinned without the lexicon
+    # installed, so it runs everywhere the rest of the CPU suite does.
+    monkeypatch.setattr(R, "_WN_SNAP", None)
+    assert _wn(_answer("a financial institution", "a place to keep money", False)) == 0.0
+
+
+needs_wordnet = pytest.mark.skipif(
+    R._wn_snap() is None, reason="wn / Open English WordNet lexicon not installed"
+)
+
+
+@needs_wordnet
+class TestWicWordnet:
+    def test_differently_worded_glosses_of_one_sense_are_punished(self):
+        # The failure the string rule misses: both glosses name the financial sense
+        # in different words, and the answer still claims the senses differ.
+        assert _wn(_answer(
+            "a financial institution that accepts deposits",
+            "an institution for receiving and lending money",
+            False,
+        )) == R.WIC_WN_MERGED
+
+    def test_genuinely_distinct_senses_are_not_punished(self):
+        assert _wn(_answer(
+            "a financial institution that accepts deposits",
+            "the sloping land beside a body of water",
+            False,
+        )) == 0.0
+
+    def test_a_same_verdict_is_never_punished(self):
+        # Only the merge direction is checked; the converse rule is anti-correlated
+        # with gloss quality. See gloss_wordnet's docstring.
+        assert _wn(_answer(
+            "a financial institution that accepts deposits",
+            "the sloping land beside a body of water",
+            True,
+        )) == 0.0
+
+    def test_lemma_absent_from_wordnet_is_neutral(self):
+        # Absence of evidence is not evidence of a merged gloss.
+        assert _wn(_answer("one thing", "another thing", False), lemma="zzqqxx") == 0.0
+
+    @pytest.mark.parametrize(
+        "answer",
+        [
+            "The two uses are different.",                            # no JSON
+            '{"sense1": "a", "sense2": "b", "same_sense": "false"}',  # non-boolean verdict
+            '{"sense1": "", "sense2": "b", "same_sense": false}',     # empty gloss
+        ],
+    )
+    def test_unscorable_answers_are_neutral(self, answer):
+        assert _wn(wrap(GOOD_THINK, answer)) == 0.0
+
+
+# --------------------------------------------------------------------------- #
 # Registry wiring
 # --------------------------------------------------------------------------- #
 def test_accuracy_dominates_the_shape_rewards():
@@ -206,8 +273,28 @@ def test_accuracy_dominates_the_shape_rewards():
     assert shape_ceiling < R.WIC_CORRECT
 
 
-def _total(completion, label):
-    return sum(f([completion], label=[label])[0] for f in R.REWARDS)
+def test_shape_range_cannot_close_the_accuracy_gap():
+    # The ceiling test above bounds only what a *wrong* answer can earn. The
+    # penalties bound the other end, and they stack: a correct "different" verdict
+    # with token-identical glosses and a stubbed <think> takes the think, consistency
+    # and WordNet penalties at once (identical glosses necessarily snap to one
+    # synset). So the invariant that actually matters is that the full shape *span*
+    # stays narrower than the accuracy gap — otherwise shaping alone could rank a
+    # correct answer below a wrong one.
+    #
+    # This is the constraint any new shaping term has to buy its way into. As of
+    # reward_wic_wordnet the span is 1.35 against a gap of 1.5, so there is 0.15 of
+    # headroom left; a further penalty of more than that has to be paid for by
+    # shrinking an existing one.
+    shape_ceiling = 0.2 + R.WIC_JSON_PARSES + R.WIC_JSON_KEYS + R.WIC_JSON_BOOL
+    shape_floor = R.THINK_MIN_PENALTY + R.WIC_INCONSISTENT + R.WIC_WN_MERGED
+    assert shape_ceiling - shape_floor < R.WIC_CORRECT - R.WIC_WRONG
+
+
+def _total(completion, label, lemma="bank", pos="noun"):
+    return sum(
+        f([completion], label=[label], lemma=[lemma], pos=[pos])[0] for f in R.REWARDS
+    )
 
 
 def test_an_ugly_correct_answer_still_beats_a_pretty_wrong_one():
@@ -240,6 +327,9 @@ def test_every_reward_is_registered():
         R.reward_wic_format,
         R.reward_wic_json,
         R.reward_wic_consistency,
+        R.reward_wic_wordnet,
         R.reward_think_length,
     ]
-    assert R.KEEP_COLS == ["lemma", "label"]
+    # `pos` is not decoration: reward_wic_wordnet cannot look a lemma up without it,
+    # and build_dataset drops every column that is not listed here.
+    assert R.KEEP_COLS == ["lemma", "pos", "label"]
