@@ -120,26 +120,14 @@ def build_dataset(split, cap=None, exclude_pairs=None, balance=False, with_feedb
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument(
-        "--model",
-        default="Qwen/Qwen3-0.6B",
-        help="Plain HF model to attach a fresh SDPO LoRA to — normally the merged "
-        "SFT warm start written by `sft_lora.py --merged-dir` "
-        "(./qwen-lora-<data-stem>-merged).",
-    )
-    ap.add_argument("--lora-r", type=int, default=32, help="LoRA rank.")
-    ap.add_argument("--lora-alpha", type=int, default=16, help="LoRA alpha scaling.")
-    ap.add_argument("--lora-dropout", type=float, default=0.05, help="LoRA dropout.")
+    ap.add_argument("--model", default="Qwen/Qwen3-0.6B")
+    ap.add_argument("--batch-size", type=int, default=1)
+    ap.add_argument("--lora-r", type=int, default=32)
+    ap.add_argument("--lora-alpha", type=int, default=16)
+    ap.add_argument("--lora-dropout", type=float, default=0.05)
     ap.add_argument("--vllm-server-host", default=None)
     ap.add_argument("--vllm-server-port", type=int, default=8000)
-    ap.add_argument(
-        "--vllm-gpu-mem",
-        type=float,
-        default=0.55,
-        help="Fraction of the GPU handed to the colocated vLLM engine (weights + KV "
-        "cache). Ignored in server mode. 0.40 leaves ~9GB for the trainer, which is "
-        "what a 1.7B LoRA run needs on a 16GB card.",
-    )
+    ap.add_argument("--vllm-gpu-mem", type=float, default=0.55)
     ap.add_argument(
         "--distill-out",
         default=None,
@@ -147,35 +135,19 @@ def main():
         "offline self-distillation (the SFT loop). Does not affect training.",
     )
     ap.add_argument("--distill-threshold", type=float, default=0.5)
-    ap.add_argument(
-        "--max-completion-length",
-        type=int,
-        default=768,
-        help="Max generated tokens per rollout. Main VRAM knob — lower it to fit. "
-        "768 clears the p99.7 of the distilled WiC traces (688 tokens; p50=191, "
-        "p99=537), and the healthy phase of the previous run never exceeded ~530.",
-    )
+    ap.add_argument("--max-completion-length", type=int, default=768)
     ap.add_argument(
         "--soft-punish-cache",
         type=int,
         default=128,
         help="Width of the DAPO soft-overlong band below the cap: completions longer "
-        "than (max_completion_length - this) are penalised on a 0 → -1 ramp. With "
-        "mask_truncated_completions=False a runaway rollout already pays (its verdict "
-        "is unextractable, so WIC_ABSENT applies), but only as a cliff at the cap; the "
-        "band grades length on the approach so the policy gets a slope to descend "
-        "instead of a step. 0 disables it.",
+        "than (max_completion_length - this) are penalised on a 0 → -1 ramp. Truncated "
+        "rollouts are dropped from the loss entirely (mask_truncated_completions=True), "
+        "so this band is the only length pressure left — it grades the *approach* to the "
+        "cap on completions that do terminate, giving the policy a slope to descend "
+        "before it falls off the edge. 0 disables it.",
     )
-    ap.add_argument(
-        "--beta",
-        type=float,
-        default=0.02,
-        help="KL coefficient against the frozen warm start. Costs no extra weights "
-        "under LoRA — TRL takes the reference by disabling the adapter, so ref_model "
-        "stays None (see grpo_trainer.py). Non-zero is what stops the policy drifting "
-        "off the SFT distribution; 0.0 (TRL's default) is how a previous run collapsed "
-        "into runaway generation and never came back.",
-    )
+    ap.add_argument("--beta", type=float, default=0.05)
     ap.add_argument(
         "--exclude-pairs",
         default=None,
@@ -193,17 +165,25 @@ def main():
     ap.add_argument(
         "--distillation-weight",
         type=float,
-        default=0.55,
+        default=0.3,
         help="Convex blend: loss = (1-w)*policy_grad + w*self_distillation. 1.0 is "
-        "pure SDPO, 0.0 collapses to GRPO. 0.5 keeps the verifiable reward driving "
-        "the update while the teacher densifies the zero-variance groups.",
+        "pure SDPO, 0.0 collapses to GRPO. Keep it a minority of the loss so the "
+        "verifiable reward drives the update and the teacher only densifies the "
+        "zero-variance groups: at 0.55 distillation outvoted the reward, and since the "
+        "distillation term is masked by completion_mask alone (no reward gating — see "
+        "sdpo_trainer._compute_self_distillation_loss) it kept training on runaway "
+        "rollouts that the reward had already condemned.",
     )
     ap.add_argument(
         "--teacher-kind",
-        default="ema",
+        default="base",
         choices=["base", "live", "ema"],
         help="Which model plays teacher under the privileged context: the frozen "
-        "warm start ('base'), the current policy ('live'), or an EMA of it ('ema').",
+        "warm start ('base'), the current policy ('live'), or an EMA of it ('ema'). "
+        "'base' is the only one that is an *anchor*: 'live' and 'ema' make the "
+        "distillation target track the policy, so there is no fixed point and any "
+        "drift certifies itself as the new target. An 'ema' run at rate 0.05 was stable "
+        "for ~700 steps and then collapsed into runaway generation in under 200.",
     )
     ap.add_argument("--teacher-update-rate", type=float, default=0.05, help="EMA teacher rate.")
     ap.add_argument(
@@ -264,40 +244,30 @@ def main():
         num_generations=16,
         num_generations_eval=1,
         max_completion_length=args.max_completion_length,
-        mask_truncated_completions=False,
-        # Anchor to the frozen merged SFT weights. Free in memory under pure LoRA —
-        # TRL sets ref_model=None for a PEFT policy and takes the reference by
-        # disabling the adapter — at the cost of one extra no-grad forward per batch.
-        # beta=0.0 (TRL's default) is how the previous run drifted off the warm-start
-        # distribution into runaway generation and never came back.
+        mask_truncated_completions=True,
         beta=args.beta,
         optim="paged_adamw_8bit",
         temperature=0.6,
         top_p=0.95,
         top_k=20,
         min_p=0.0,
-        per_device_train_batch_size=1,
-        gradient_accumulation_steps=32,
-        per_device_eval_batch_size=2,
-        gradient_checkpointing=True,
-        gradient_checkpointing_kwargs={"use_reentrant": False},
+        per_device_train_batch_size=args.batch_size,
+        per_device_eval_batch_size=args.batch_size,
+        gradient_accumulation_steps=32//args.batch_size,
         num_train_epochs=2,
-        warmup_steps=50,
+        warmup_steps=0.2,
         learning_rate=5e-6,
         lr_scheduler_type="cosine",
         bf16=True,
         eval_strategy="steps",
         eval_steps=100,
         save_strategy="steps",
-        save_steps=100,
-        save_total_limit=2,
-        logging_steps=100,
+        save_steps=50,
+        save_total_limit=6,
+        logging_steps=25,
         report_to="wandb",
         run_name=run_name,
-        # --- self-distillation ---
-        # sampled_token is the paper's mode and pins distillation_alpha=1.0 (reverse
-        # KL); use_liger_kernel is deliberately off, since the fused JSD path only
-        # supports full_logits with distillation_weight=1.0.
+        use_liger_kernel=True,
         distillation_mode="sampled_token",
         distillation_alpha=1.0,
         distillation_weight=args.distillation_weight,
@@ -307,6 +277,13 @@ def main():
         success_reward_threshold=args.success_reward_threshold,
         dont_reprompt_on_self_success=True,
         include_environment_feedback=with_feedback,
+        # Restrict the gold hint to groups with no successful sibling — the case SDPO
+        # exists for. Without this the hint is always available, so the reprompt mask
+        # in SuccessfulRolloutTeacherContextBuilder.build is 1.0 for *every* sample
+        # (dont_reprompt_on_self_success only bars a sample from being its own demo,
+        # it does not gate reprompting), and the distillation term fires uniformly
+        # including on the ~90% of groups that already had plenty of reward variance.
+        environment_feedback_only_without_solution=True,
         reprompt_template=REPROMPT_TEMPLATE,
         solution_template=SOLUTION_TEMPLATE,
         feedback_template=FEEDBACK_TEMPLATE,
@@ -343,14 +320,7 @@ def main():
         peft_config=peft_config,
     )
 
-    last = None
-    out = Path(output_dir)
-    if out.exists():
-        cks = sorted(out.glob("checkpoint-*"), key=lambda p: int(p.name.split("-")[-1]))
-        if cks:
-            last = str(cks[-1])
-            print(f"Resuming from checkpoint: {last}")
-    trainer.train(resume_from_checkpoint=last)
+    trainer.train()
     trainer.save_model(output_dir)
     print(f"Saved final adapter → {output_dir}")
 

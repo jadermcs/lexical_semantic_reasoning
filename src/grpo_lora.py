@@ -97,6 +97,7 @@ def main():
     ap.add_argument("--lora-dropout", type=float, default=0.05, help="LoRA dropout.")
     ap.add_argument("--vllm-server-host", default=None)
     ap.add_argument("--vllm-server-port", type=int, default=8000)
+    ap.add_argument("--vllm-gpu-mem", type=float, default=0.55)
     ap.add_argument(
         "--distill-out",
         default=None,
@@ -104,15 +105,8 @@ def main():
         "self-distillation. Does not affect training.",
     )
     ap.add_argument("--distill-threshold", type=float, default=0.5)
-    ap.add_argument(
-        "--max-completion-length",
-        type=int,
-        default=640,
-        help="Max generated tokens per rollout. Main VRAM knob — lower it to fit. "
-        "640 clears the p99.7 of distilled WiC traces (~520 tokens); truncated "
-        "rollouts are masked out (mask_truncated_completions), so a tight cap costs "
-        "wasted rollout compute, not wrong gradients.",
-    )
+    ap.add_argument("--max-completion-length", type=int, default=768)
+    ap.add_argument("--beta", type=float, default=0.05)
     ap.add_argument(
         "--exclude-pairs",
         default=None,
@@ -124,9 +118,7 @@ def main():
         "--balance-labels",
         action="store_true",
         help="Down-sample the majority class so the train rollout set is 50/50 "
-        "same/different. Strongly recommended with --exclude-pairs: the "
-        "teacher-failed complement skews heavily toward same_sense=true, and the "
-        "policy otherwise collapses to the majority class.",
+        "same/different. Strongly recommended with --exclude-pairs.",
     )
     args = ap.parse_args()
 
@@ -145,15 +137,17 @@ def main():
         dict(r=args.lora_r, lora_alpha=args.lora_alpha, lora_dropout=args.lora_dropout),
     )
 
+    prompt_headroom = 512
     if args.vllm_server_host:
         vllm_kwargs = dict(
             use_vllm=True, vllm_mode="server",
             vllm_server_host=args.vllm_server_host, vllm_server_port=args.vllm_server_port,
         )
     else:
-        prompt_headroom = 512
         vllm_kwargs = dict(
             use_vllm=True,
+            vllm_mode="colocate",
+            vllm_gpu_memory_utilization=args.vllm_gpu_mem,
             vllm_max_model_length=prompt_headroom + args.max_completion_length,
         )
 
@@ -161,32 +155,35 @@ def main():
     output_dir = f"./{run_name}"
     training_args = GRPOConfig(
         output_dir=output_dir,
-        num_generations=8,
+        num_generations=16,
+        num_generations_eval=1,
         max_completion_length=args.max_completion_length,
         mask_truncated_completions=True,
+        beta=args.beta,
         optim="paged_adamw_8bit",
         temperature=0.6,
         top_p=0.95,
         top_k=20,
         min_p=0.0,
-        per_device_train_batch_size=4,
-        gradient_accumulation_steps=4,
+        per_device_train_batch_size=args.batch_size,
+        per_device_eval_batch_size=args.batch_size,
+        gradient_accumulation_steps=32//args.batch_size,
         num_train_epochs=2,
-        warmup_steps=50,
+        warmup_steps=0.2,
         learning_rate=5e-6,
         lr_scheduler_type="cosine",
         bf16=True,
         eval_strategy="steps",
         eval_steps=100,
         save_strategy="steps",
-        save_steps=100,
-        save_total_limit=2,
-        logging_steps=100,
-        log_completions=True,
-        num_completions_to_print=3,
+        save_steps=50,
+        save_total_limit=6,
+        logging_steps=25,
         report_to="wandb",
         run_name=run_name,
         use_liger_kernel=True,
+        log_completions=True,
+        num_completions_to_print=3,
         **vllm_kwargs,
     )
 
