@@ -90,11 +90,12 @@ def reward_think_length(completions, **kwargs):
 # WiC (word-in-context): verifiable same/different-sense classification
 # --------------------------------------------------------------------------- #
 WIC_CORRECT = 1.0
-WIC_WRONG = -1.0
+WIC_WRONG = -0.5
+WIC_ABSENT = -1.0
 
 
 def reward_wic_accuracy(completions, **kwargs):
-    """+1 for the right same/different verdict, -1 for the wrong one, 0 if absent.
+    """+1 for the right same/different verdict, -1 for the wrong one or for none.
 
     This is the verifiable signal: the gold label is known, so the reward is exact
     rather than a similarity estimate.
@@ -103,7 +104,7 @@ def reward_wic_accuracy(completions, **kwargs):
     for c, label in zip(completions, kwargs["label"]):
         pred = sd.extract_wic_label(c)
         if pred is None:
-            out.append(0.0)
+            out.append(WIC_ABSENT)
         else:
             out.append(WIC_CORRECT if pred == bool(label) else WIC_WRONG)
     return out

@@ -153,9 +153,11 @@ class TestWicAccuracy:
             R.WIC_WRONG,
         ]
 
-    def test_absent_verdict_scores_zero(self):
+    def test_absent_verdict_is_penalised_like_a_wrong_one(self):
+        # Scoring this 0.0 makes staying silent cheaper than committing, which is how
+        # a policy learns to ramble to the length cap instead of answering.
         c = "<think>never closed and never answered"
-        assert R.reward_wic_accuracy([c], label=[True]) == [0.0]
+        assert R.reward_wic_accuracy([c], label=[True]) == [R.WIC_ABSENT]
 
     def test_prose_verdict_still_scores_but_forfeits_json_credit(self):
         # The accuracy reward is deliberately lenient (it scores the decision
@@ -202,6 +204,34 @@ def test_accuracy_dominates_the_shape_rewards():
     # farm the format terms while answering wrongly.
     shape_ceiling = 0.2 + R.WIC_JSON_PARSES + R.WIC_JSON_KEYS + R.WIC_JSON_BOOL
     assert shape_ceiling < R.WIC_CORRECT
+
+
+def _total(completion, label):
+    return sum(f([completion], label=[label])[0] for f in R.REWARDS)
+
+
+def test_an_ugly_correct_answer_still_beats_a_pretty_wrong_one():
+    # The invariant above only bounds the shape *ceiling*, so it holds for any
+    # WIC_WRONG and cannot catch the accuracy gap being narrowed. This pins the
+    # comparison that actually matters, on scored completions rather than arithmetic:
+    # the worst-formatted correct answer must outscore the best-formatted wrong one.
+    # Note WIC_JSON_MALFORMED and WIC_INCONSISTENT are mutually exclusive (consistency
+    # scores 0 when the JSON does not parse), so the ugly case takes the parseable
+    # branch: stubbed <think> plus glosses that contradict a correct verdict.
+    ugly_correct = "<think>ok</think>" + json.dumps(
+        {"sense1": "a river bank", "sense2": "a place for money", "same_sense": True}
+    )
+    pretty_wrong = wrap(GOOD_THINK, json.dumps(
+        {"sense1": "a river bank", "sense2": "a river bank", "same_sense": True}
+    ))
+    assert _total(ugly_correct, True) > _total(pretty_wrong, False)
+
+
+def test_silence_never_scores_better_than_committing():
+    # A coin-flip guess is worth (WIC_CORRECT + WIC_WRONG) / 2 in expectation.
+    # Refusing to answer must not beat that, or the policy is paid to stall — which
+    # is how a run degenerated into rambling past the length cap without answering.
+    assert R.WIC_ABSENT <= (R.WIC_CORRECT + R.WIC_WRONG) / 2
 
 
 def test_every_reward_is_registered():

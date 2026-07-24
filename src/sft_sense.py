@@ -65,7 +65,7 @@ def main():
 
     trainer.train()
     trainer.save_model(output_dir)
-    print(f"Saved final adapter → {output_dir}")
+    print(f"Saved final model → {output_dir}")
 
 
 if __name__ == "__main__":

@@ -13,23 +13,12 @@ def main():
     ap.add_argument("--model", default="Qwen/Qwen3-0.6B")
     ap.add_argument("--epochs", type=int, default=3)
     ap.add_argument("--lr", type=float, default=1e-3)
-    ap.add_argument("--lora-r", type=int, default=256, help="LoRA rank.")
+    ap.add_argument("--lora-r", type=int, default=128, help="LoRA rank.")
     ap.add_argument("--lora-alpha", type=int, default=16, help="LoRA alpha scaling.")
     ap.add_argument("--lora-dropout", type=float, default=0.05, help="LoRA dropout.")
     ap.add_argument("--data", default="data/sft_wic")
-    ap.add_argument(
-        "--output-dir",
-        default=None,
-        help="Where to save checkpoints/adapter. Defaults to ./qwen-lora-<data-stem>.",
-    )
-    ap.add_argument(
-        "--merged-dir",
-        default=None,
-        help="Where to write the adapter merged back into the base weights. Defaults "
-        "to '<output-dir>-merged'. This merged model is what grpo_lora.py consumes: "
-        "GRPO then starts a fresh LoRA on top of the warm-started weights instead of "
-        "continuing the SFT adapter. Pass '' to skip merging.",
-    )
+    ap.add_argument("--output-dir", default=None)
+    ap.add_argument("--merged-dir", default=None)
     args = ap.parse_args()
 
     tokenizer = AutoTokenizer.from_pretrained(args.model, trust_remote_code=True)
@@ -51,12 +40,13 @@ def main():
     training_args = SFTConfig(
         output_dir=output_dir,
         completion_only_loss=True,
-        max_length=1024,
+        max_length=2048,
         packing=True,
         use_liger_kernel=True,
         dataset_num_proc=8,
         num_train_epochs=args.epochs,
         per_device_train_batch_size=8,
+        gradient_accumulation_steps=2,
         per_device_eval_batch_size=16,
         warmup_steps=0.03,
         learning_rate=args.lr,
@@ -88,15 +78,10 @@ def main():
     )
 
     trainer.train()
-    trainer.save_model(output_dir)
-    print(f"Saved final adapter → {output_dir}")
-
-    merged_dir = args.merged_dir if args.merged_dir is not None else f"{output_dir}-merged"
-    if merged_dir:
-        merged = trainer.model.merge_and_unload()
-        merged.save_pretrained(merged_dir)
-        tokenizer.save_pretrained(merged_dir)
-        print(f"Saved merged model → {merged_dir}")
+    merged = trainer.model.merge_and_unload()
+    merged.save_pretrained(output_dir)
+    tokenizer.save_pretrained(output_dir)
+    print(f"Saved final model → {output_dir}")
 
 
 if __name__ == "__main__":

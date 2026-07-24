@@ -35,7 +35,7 @@ torch._dynamo.config.disable = True
 from datasets import Dataset
 from transformers import AutoTokenizer
 from trl.experimental.sdpo import SDPOConfig, SDPOTrainer
-from trl.rewards import get_repetition_penalty_reward
+from trl.rewards import get_repetition_penalty_reward, get_soft_overlong_punishment
 
 import sense_data as sd
 from grpo_lora import balance_labels, load_exclude_pairs, load_policy
@@ -135,7 +135,7 @@ def main():
     ap.add_argument(
         "--vllm-gpu-mem",
         type=float,
-        default=0.40,
+        default=0.55,
         help="Fraction of the GPU handed to the colocated vLLM engine (weights + KV "
         "cache). Ignored in server mode. 0.40 leaves ~9GB for the trainer, which is "
         "what a 1.7B LoRA run needs on a 16GB card.",
@@ -150,11 +150,31 @@ def main():
     ap.add_argument(
         "--max-completion-length",
         type=int,
-        default=640,
+        default=768,
         help="Max generated tokens per rollout. Main VRAM knob — lower it to fit. "
-        "640 clears the p99.7 of distilled WiC traces (~520 tokens); truncated "
-        "rollouts are masked out (mask_truncated_completions), so a tight cap costs "
-        "wasted rollout compute, not wrong gradients.",
+        "768 clears the p99.7 of the distilled WiC traces (688 tokens; p50=191, "
+        "p99=537), and the healthy phase of the previous run never exceeded ~530.",
+    )
+    ap.add_argument(
+        "--soft-punish-cache",
+        type=int,
+        default=128,
+        help="Width of the DAPO soft-overlong band below the cap: completions longer "
+        "than (max_completion_length - this) are penalised on a 0 → -1 ramp. With "
+        "mask_truncated_completions=False a runaway rollout already pays (its verdict "
+        "is unextractable, so WIC_ABSENT applies), but only as a cliff at the cap; the "
+        "band grades length on the approach so the policy gets a slope to descend "
+        "instead of a step. 0 disables it.",
+    )
+    ap.add_argument(
+        "--beta",
+        type=float,
+        default=0.02,
+        help="KL coefficient against the frozen warm start. Costs no extra weights "
+        "under LoRA — TRL takes the reference by disabling the adapter, so ref_model "
+        "stays None (see grpo_trainer.py). Non-zero is what stops the policy drifting "
+        "off the SFT distribution; 0.0 (TRL's default) is how a previous run collapsed "
+        "into runaway generation and never came back.",
     )
     ap.add_argument(
         "--exclude-pairs",
@@ -173,7 +193,7 @@ def main():
     ap.add_argument(
         "--distillation-weight",
         type=float,
-        default=0.5,
+        default=0.55,
         help="Convex blend: loss = (1-w)*policy_grad + w*self_distillation. 1.0 is "
         "pure SDPO, 0.0 collapses to GRPO. 0.5 keeps the verifiable reward driving "
         "the update while the teacher densifies the zero-variance groups.",
@@ -191,8 +211,10 @@ def main():
         type=float,
         default=1.0,
         help="Minimum total reward for a rollout to be reused as a demonstration. "
-        "Our shaping terms sit on top of the ±1 accuracy term, so 1.0 means "
-        "'correct verdict and reasonably well formed'.",
+        "The shaping terms sit on top of the accuracy term (+1.0 correct / -0.5 wrong "
+        "/ -1.0 no verdict), whose ceiling puts a perfectly-formed wrong answer at "
+        "0.0, so 1.0 means 'correct verdict and reasonably well formed' and no "
+        "incorrect rollout can qualify.",
     )
     ap.add_argument(
         "--no-gold-feedback",
@@ -239,19 +261,24 @@ def main():
     output_dir = f"./{run_name}"
     training_args = SDPOConfig(
         output_dir=output_dir,
-        num_generations=8,
+        num_generations=16,
+        num_generations_eval=1,
         max_completion_length=args.max_completion_length,
-        mask_truncated_completions=True,
+        mask_truncated_completions=False,
+        # Anchor to the frozen merged SFT weights. Free in memory under pure LoRA —
+        # TRL sets ref_model=None for a PEFT policy and takes the reference by
+        # disabling the adapter — at the cost of one extra no-grad forward per batch.
+        # beta=0.0 (TRL's default) is how the previous run drifted off the warm-start
+        # distribution into runaway generation and never came back.
+        beta=args.beta,
         optim="paged_adamw_8bit",
         temperature=0.6,
         top_p=0.95,
         top_k=20,
         min_p=0.0,
-        # Batch size is the real VRAM knob, not the model: the logits tensor is
-        # (batch × seq × 151936) and dwarfs 1.7B of bf16 weights. 2×8 keeps the
-        # generation batch at 16 (divisible by num_generations) on ~9GB.
-        per_device_train_batch_size=2,
-        gradient_accumulation_steps=8,
+        per_device_train_batch_size=1,
+        gradient_accumulation_steps=32,
+        per_device_eval_batch_size=2,
         gradient_checkpointing=True,
         gradient_checkpointing_kwargs={"use_reentrant": False},
         num_train_epochs=2,
@@ -265,8 +292,6 @@ def main():
         save_steps=100,
         save_total_limit=2,
         logging_steps=100,
-        log_completions=True,
-        num_completions_to_print=3,
         report_to="wandb",
         run_name=run_name,
         # --- self-distillation ---
@@ -293,6 +318,14 @@ def main():
 
     reward_funcs = [as_text_reward(f) for f in REWARDS]
     reward_funcs.append(get_repetition_penalty_reward(ngram_size=3, max_penalty=-0.2))
+    if args.soft_punish_cache > 0:
+        # Not wrapped in as_text_reward: this one scores completion_ids, not text.
+        reward_funcs.append(
+            get_soft_overlong_punishment(
+                max_completion_len=args.max_completion_length,
+                soft_punish_cache=args.soft_punish_cache,
+            )
+        )
     if args.distill_out:
         reward_funcs.append(as_text_reward(make_trace_saver(args.distill_out, args.distill_threshold)))
         print(

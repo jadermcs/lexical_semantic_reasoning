@@ -148,7 +148,9 @@ def main():
         records.append({
             "lemma": rec["lemma"], "pos": rec["pos"],
             "sentence1": rec["sentence1"], "sentence2": rec["sentence2"],
-            "label": gold, "prediction": hyp,
+            "label": gold,
+            "prediction": hyp,
+            "votes": [hyp],
             "answers": [json.dumps(answer, ensure_ascii=False)] if answer is not None else [],
             "reasonings": [think.replace("<think>", "").strip()] if closed else [],
         })
