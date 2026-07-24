@@ -114,14 +114,6 @@ def main():
         help="Down-sample the majority class so the train rollout set is 50/50 "
         "same/different. Strongly recommended with --exclude-pairs.",
     )
-    ap.add_argument(
-        "--beta",
-        type=float,
-        default=0.02,
-        help="KL coefficient anchoring the policy to the SFT reference. >0 loads a "
-        "reference model and stops the policy drifting off the warm-start init "
-        "(set 0 to disable).",
-    )
     args = ap.parse_args()
 
     tokenizer = AutoTokenizer.from_pretrained(args.model, trust_remote_code=True)

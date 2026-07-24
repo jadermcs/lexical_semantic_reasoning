@@ -26,8 +26,13 @@ Usage mirrors grpo_lora.py::
 """
 
 import argparse
+import os
 from functools import partial, wraps
 from pathlib import Path
+
+# Rollout lengths vary batch to batch, so the caching allocator fragments; the OOMs on
+# a 16GB card were failing with 1.5-1.9GB reserved-but-unallocated.
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
 import torch
 torch._dynamo.config.disable = True
@@ -121,13 +126,44 @@ def build_dataset(split, cap=None, exclude_pairs=None, balance=False, with_feedb
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--model", default="Qwen/Qwen3-0.6B")
-    ap.add_argument("--batch-size", type=int, default=1)
+    ap.add_argument(
+        "--batch-size",
+        type=int,
+        default=2,
+        help="Backward micro-batch, in completions. This is the knob that OOMs, and "
+        "the ONLY thing it controls is peak activation memory — see --generation-batch "
+        "for the one that sets how many prompts each gradient averages over.",
+    )
+    ap.add_argument(
+        "--num-generations",
+        type=int,
+        default=8,
+        help="Rollouts per prompt (the GRPO group size the advantage is centred on).",
+    )
+    ap.add_argument(
+        "--generation-batch",
+        type=int,
+        default=64,
+        help="Completions per optimizer step; grad-accum is derived from it as "
+        "(this // --batch-size). Prompt groups per step = this // --num-generations, "
+        "and that is what the gradient averages over. Deriving grad-accum this way "
+        "keeps the group count fixed when you trade micro-batch size for memory — the "
+        "previous 'gradient_accumulation_steps=32//batch_size' pinned the generation "
+        "batch at 32, so --batch-size bought OOM and left the group count at 2.",
+    )
     ap.add_argument("--lora-r", type=int, default=32)
-    ap.add_argument("--lora-alpha", type=int, default=16)
+    ap.add_argument("--lora-alpha", type=int, default=32)
     ap.add_argument("--lora-dropout", type=float, default=0.05)
     ap.add_argument("--vllm-server-host", default=None)
     ap.add_argument("--vllm-server-port", type=int, default=8000)
-    ap.add_argument("--vllm-gpu-mem", type=float, default=0.55)
+    ap.add_argument(
+        "--vllm-gpu-mem",
+        type=float,
+        default=0.3,
+        help="Colocate-mode share of the card reserved for the vLLM KV cache. 0.3 is "
+        "sized for the observed rollouts (~240 tokens mean, 291 max); the old 0.55 "
+        "handed vLLM half a 16GB card and starved the training step.",
+    )
     ap.add_argument(
         "--distill-out",
         default=None,
@@ -135,7 +171,16 @@ def main():
         "offline self-distillation (the SFT loop). Does not affect training.",
     )
     ap.add_argument("--distill-threshold", type=float, default=0.5)
-    ap.add_argument("--max-completion-length", type=int, default=768)
+    ap.add_argument(
+        "--max-completion-length",
+        type=int,
+        default=512,
+        help="Rollout cap. Measured max_terminated_length never passed 291 and the "
+        "clipped ratio sat at ~0.2%%, so 768 was paying KV cache for headroom nothing "
+        "used. Do not drop below 512 without also cutting --soft-punish-cache: the "
+        "penalty ramp starts at (cap - soft_punish_cache), and a 384 cap would put it "
+        "at 256, below the ~240-token mean.",
+    )
     ap.add_argument(
         "--soft-punish-cache",
         type=int,
@@ -147,7 +192,18 @@ def main():
         "cap on completions that do terminate, giving the policy a slope to descend "
         "before it falls off the edge. 0 disables it.",
     )
-    ap.add_argument("--beta", type=float, default=0.05)
+    ap.add_argument(
+        "--beta",
+        type=float,
+        default=0.0,
+        help="KL coefficient toward the warm start. INERT in SDPOTrainer: it assigns "
+        "self.beta (trl/experimental/sdpo/sdpo_trainer.py:606) and never reads it — "
+        "_compute_policy_loss has no KL term, no reference logprobs are gathered, and "
+        "no reference model is built, which is why no 'kl' metric is ever logged. "
+        "Defaulted to 0.0 so the config stops implying an anchor that is not applied; "
+        "note this also means runs here are NOT comparable to a stock GRPOTrainer run "
+        "with beta>0, where it does bite.",
+    )
     ap.add_argument(
         "--exclude-pairs",
         default=None,
@@ -205,6 +261,24 @@ def main():
     )
     args = ap.parse_args()
 
+    # Fail loudly at launch rather than silently training on 2 prompt groups.
+    if args.generation_batch % args.batch_size:
+        ap.error(f"--generation-batch ({args.generation_batch}) must be divisible by --batch-size ({args.batch_size})")
+    if args.generation_batch % args.num_generations:
+        # SDPOConfig enforces this too (grpo_config.py:1090); catching it here reports
+        # the prompt-group count that actually motivates the constraint.
+        ap.error(
+            f"--generation-batch ({args.generation_batch}) must be divisible by "
+            f"--num-generations ({args.num_generations})"
+        )
+    grad_accum = args.generation_batch // args.batch_size
+    prompt_groups = args.generation_batch // args.num_generations
+    print(
+        f"batching: micro={args.batch_size} x grad_accum={grad_accum} = "
+        f"{args.generation_batch} completions/step / {args.num_generations} rollouts "
+        f"= {prompt_groups} prompt groups averaged per optimizer step"
+    )
+
     tokenizer = AutoTokenizer.from_pretrained(args.model, trust_remote_code=True)
     tokenizer.pad_token = tokenizer.eos_token
 
@@ -241,7 +315,7 @@ def main():
     output_dir = f"./{run_name}"
     training_args = SDPOConfig(
         output_dir=output_dir,
-        num_generations=16,
+        num_generations=args.num_generations,
         num_generations_eval=1,
         max_completion_length=args.max_completion_length,
         mask_truncated_completions=True,
@@ -253,21 +327,27 @@ def main():
         min_p=0.0,
         per_device_train_batch_size=args.batch_size,
         per_device_eval_batch_size=args.batch_size,
-        gradient_accumulation_steps=32//args.batch_size,
+        gradient_accumulation_steps=grad_accum,
         num_train_epochs=2,
-        warmup_steps=0.2,
-        learning_rate=5e-6,
+        # transformers reads a fractional warmup_steps as a *ratio*
+        # (TrainingArguments.get_warmup_steps: `int(x) if x >= 1 else ceil(n * x)`),
+        # so this is 3% of the run, not 0.03 steps. The previous 0.2/0.3 meant 20-30%
+        # of an RL run crawled at near-zero LR before cosine started decaying it.
+        warmup_steps=0.03,
+        learning_rate=3e-5,
         lr_scheduler_type="cosine",
         bf16=True,
         eval_strategy="steps",
-        eval_steps=100,
+        # ~8x fewer optimizer steps now that each averages 8 prompt groups instead of
+        # 2, so eval/save cadence scales down with it to keep the dev curve readable.
+        eval_steps=50,
         save_strategy="steps",
-        save_steps=50,
+        save_steps=100,
         save_total_limit=6,
         logging_steps=25,
         report_to="wandb",
         run_name=run_name,
-        use_liger_kernel=True,
+        scale_rewards="none",
         distillation_mode="sampled_token",
         distillation_alpha=1.0,
         distillation_weight=args.distillation_weight,
