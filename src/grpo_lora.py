@@ -85,13 +85,7 @@ def build_dataset(split, tokenizer, cap=None, exclude_pairs=None, balance=False)
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument(
-        "--model",
-        default="Qwen/Qwen3-0.6B",
-        help="Plain HF model to attach a fresh GRPO LoRA to — normally the merged "
-        "SFT warm start written by `sft_lora.py --merged-dir` "
-        "(./qwen-lora-<data-stem>-merged).",
-    )
+    ap.add_argument("--model", default="Qwen/Qwen3-0.6B")
     ap.add_argument("--lora-r", type=int, default=32, help="LoRA rank.")
     ap.add_argument("--lora-alpha", type=int, default=16, help="LoRA alpha scaling.")
     ap.add_argument("--lora-dropout", type=float, default=0.05, help="LoRA dropout.")
@@ -119,6 +113,14 @@ def main():
         action="store_true",
         help="Down-sample the majority class so the train rollout set is 50/50 "
         "same/different. Strongly recommended with --exclude-pairs.",
+    )
+    ap.add_argument(
+        "--beta",
+        type=float,
+        default=0.02,
+        help="KL coefficient anchoring the policy to the SFT reference. >0 loads a "
+        "reference model and stops the policy drifting off the warm-start init "
+        "(set 0 to disable).",
     )
     args = ap.parse_args()
 
