@@ -207,20 +207,6 @@ def _answer(s1, s2, same):
     return wrap(GOOD_THINK, json.dumps({"sense1": s1, "sense2": s2, "same_sense": same}))
 
 
-def test_wordnet_reward_is_a_noop_without_the_lexicon(monkeypatch):
-    # `wn` is not in the shared uv.lock, so a training run on a machine without the
-    # lexicon must lose this term rather than crash. Pinned without the lexicon
-    # installed, so it runs everywhere the rest of the CPU suite does.
-    monkeypatch.setattr(R, "_WN_SNAP", None)
-    assert _wn(_answer("a financial institution", "a place to keep money", False)) == 0.0
-
-
-needs_wordnet = pytest.mark.skipif(
-    R._wn_snap() is None, reason="wn / Open English WordNet lexicon not installed"
-)
-
-
-@needs_wordnet
 class TestWicWordnet:
     def test_differently_worded_glosses_of_one_sense_are_punished(self):
         # The failure the string rule misses: both glosses name the financial sense

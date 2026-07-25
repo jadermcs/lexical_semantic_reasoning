@@ -24,6 +24,9 @@ Examples
   uv run python src/eval_sense.py --model Qwen/Qwen3-0.6B
   # guarantee a parseable JSON verdict on every pair
   uv run python src/eval_sense.py --model ./qwen-sense-grpo-wic --force-json
+  # an unmerged LoRA adapter served on top of its base model
+  uv run python src/eval_sense.py --model ./qwen-sft_wic_filtered \\
+      --lora ./qwen-lora-sdpo-wic/checkpoint-500
 """
 
 import argparse
@@ -53,7 +56,23 @@ WIC_JSON_SCHEMA = {
 }
 
 
-def generate_all(llm, texts, force_json=False):
+def load_lora(path):
+    """``(LoRARequest, rank)`` for an adapter dir, or ``(None, None)`` if unset.
+
+    vLLM applies an adapter per *request*, but sizes its LoRA slots at engine
+    init, so the rank has to be read off ``adapter_config.json`` up front —
+    the default (16) is smaller than the ranks sft_lora.py/grpo_lora.py train.
+    """
+    if not path:
+        return None, None
+    from vllm.lora.request import LoRARequest
+
+    adapter = Path(path).resolve()
+    cfg = json.loads((adapter / "adapter_config.json").read_text())
+    return LoRARequest("adapter", 1, str(adapter)), int(cfg["r"])
+
+
+def generate_all(llm, texts, force_json=False, lora_request=None):
     """Greedy completions for all prompts; vLLM schedules the batch internally.
 
     With ``force_json``, decoding runs in two phases: free reasoning stopped at
@@ -64,7 +83,7 @@ def generate_all(llm, texts, force_json=False):
     """
     if not force_json:
         sp = SamplingParams(temperature=0.0, max_tokens=1024)
-        return [out.outputs[0].text for out in llm.generate(texts, sp)]
+        return [out.outputs[0].text for out in llm.generate(texts, sp, lora_request=lora_request)]
 
     # Phase 1: free-form reasoning, halted at the close of the think block.
     sp1 = SamplingParams(
@@ -72,7 +91,7 @@ def generate_all(llm, texts, force_json=False):
         stop=["</think>"], include_stop_str_in_output=True,
     )
     thinks = []
-    for out in llm.generate(texts, sp1):
+    for out in llm.generate(texts, sp1, lora_request=lora_request):
         think = out.outputs[0].text
         if "</think>" not in think:  # budget ran out mid-reasoning: force-close
             think += "\n</think>"
@@ -83,7 +102,7 @@ def generate_all(llm, texts, force_json=False):
         temperature=0.0, max_tokens=512,
         structured_outputs=StructuredOutputsParams(json=WIC_JSON_SCHEMA),
     )
-    outs2 = llm.generate([p + t for p, t in zip(texts, thinks)], sp2)
+    outs2 = llm.generate([p + t for p, t in zip(texts, thinks)], sp2, lora_request=lora_request)
     return [think + out.outputs[0].text for think, out in zip(thinks, outs2)]
 
 
@@ -112,6 +131,9 @@ def wic_metrics(preds, golds):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--model", type=str, required=True)
+    ap.add_argument("--lora", default=None,
+                    help="LoRA adapter dir to apply on top of --model (which must then be "
+                         "the adapter's base model, not a merged checkpoint)")
     ap.add_argument("--split", default="test")
     ap.add_argument("--max-samples", type=int, default=0, help="0 = full split")
     ap.add_argument("--force-json", action="store_true",
@@ -121,11 +143,13 @@ def main():
     ap.add_argument("--output", default=None)
     args = ap.parse_args()
 
+    lora_req, lora_rank = load_lora(args.lora)
     llm = LLM(
         model=args.model,
         max_model_len=args.max_model_len,
         gpu_memory_utilization=args.gpu_memory_utilization,
         enable_prefix_caching=True,  # phase 2 of --force-json reuses phase-1 KV
+        **(dict(enable_lora=True, max_lora_rank=lora_rank) if lora_req else {}),
     )
     tokenizer = llm.get_tokenizer()
 
@@ -134,7 +158,7 @@ def main():
         data = data[: args.max_samples]
 
     texts = [build_prompt(r, tokenizer) for r in data]
-    decoded_all = generate_all(llm, texts, force_json=args.force_json)
+    decoded_all = generate_all(llm, texts, force_json=args.force_json, lora_request=lora_req)
 
     hyps, refs, records = [], [], []
     for rec, decoded in zip(data, decoded_all):

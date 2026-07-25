@@ -31,6 +31,7 @@ from pathlib import Path
 
 from sklearn.feature_extraction.text import ENGLISH_STOP_WORDS
 
+import gloss_wordnet
 import sense_data as sd
 
 
@@ -220,31 +221,6 @@ def reward_wic_consistency(completions, **kwargs):
 # --------------------------------------------------------------------------- #
 WIC_WN_MERGED = -0.25
 
-# Sentinel-cached ``gloss_wordnet.snap``: False = not yet probed, None = unavailable.
-_WN_SNAP = False
-
-
-def _wn_snap():
-    """``gloss_wordnet.snap``, or None when the lexicon is not installed.
-
-    ``wn`` is deliberately absent from the shared uv.lock (the training servers
-    build torch/vLLM from it), so this has to degrade to a no-op rather than take
-    down a run — or the CPU test suite — wherever the lexicon is missing. Probing
-    once with a real lookup is what distinguishes "package installed" from
-    "lexicon downloaded"; ``gloss_wordnet`` opens the lexicon lazily and only
-    raises on first use.
-    """
-    global _WN_SNAP
-    if _WN_SNAP is False:
-        try:
-            import gloss_wordnet
-
-            gloss_wordnet.synsets_for("bank", "noun")
-            _WN_SNAP = gloss_wordnet.snap
-        except (ImportError, LookupError):
-            _WN_SNAP = None
-    return _WN_SNAP
-
 
 def reward_wic_wordnet(completions, **kwargs):
     """Punish a "different senses" verdict whose two glosses name one WordNet sense.
@@ -273,13 +249,13 @@ def reward_wic_wordnet(completions, **kwargs):
     ``gloss_wordnet.check`` keeps it behind ``strict=True``. That module's docstring
     has the calibration; do not symmetrise this without redoing it.
 
-    Scores 0.0 when the lexicon is unavailable, when the answer does not parse, and
-    when the lemma is absent from WordNet — absence of evidence is not evidence of a
-    merged gloss.
+    Scores 0.0 when the answer does not parse and when the lemma is absent from
+    WordNet — absence of evidence is not evidence of a merged gloss.
+
+    ``gloss_wordnet`` opens the lexicon on first use, so a missing Open English
+    WordNet download surfaces here as a ``LookupError`` carrying the command to fix
+    it, not as a silently disabled reward term.
     """
-    snap = _wn_snap()
-    if snap is None:
-        return [0.0] * len(completions)
     out = []
     for c, lemma, pos in zip(completions, kwargs["lemma"], kwargs["pos"]):
         r = 0.0
@@ -288,8 +264,8 @@ def reward_wic_wordnet(completions, **kwargs):
             s1, s2, verdict = obj.get("sense1"), obj.get("sense2"), obj.get("same_sense")
             if verdict is False and isinstance(s1, str) and isinstance(s2, str) \
                     and s1.strip() and s2.strip():
-                syn1, _ = snap(s1, lemma, pos)
-                syn2, _ = snap(s2, lemma, pos)
+                syn1, _ = gloss_wordnet.snap(s1, lemma, pos)
+                syn2, _ = gloss_wordnet.snap(s2, lemma, pos)
                 # `snap` returns None for a lemma WordNet does not have; two Nones
                 # are not a merged gloss.
                 if syn1 is not None and syn1 == syn2:
