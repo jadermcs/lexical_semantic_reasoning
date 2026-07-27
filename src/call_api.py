@@ -9,8 +9,6 @@ from pathlib import Path
 
 from openai import OpenAI
 
-# ── Config ────────────────────────────────────────────────────────────────────
-
 DEFAULT_MODEL_ID = "deepseek/deepseek-v4-flash"
 BASE_URL = "https://openrouter.ai/api/v1"
 SAMPLES = 3  # self-consistency: k samples per pair, majority vote
@@ -95,7 +93,13 @@ def _extract_json(body: str) -> str:
     Strips ``` fences and returns the substring from the first ``{`` to the last
     ``}`` so any stray prose around the object doesn't break ``json.loads``.
     """
-    body = body.strip().removeprefix("```json").removeprefix("```").removesuffix("```").strip()
+    body = (
+        body.strip()
+        .removeprefix("```json")
+        .removeprefix("```")
+        .removesuffix("```")
+        .strip()
+    )
     i, j = body.find("{"), body.rfind("}")
     return body[i : j + 1] if i != -1 and j > i else body
 
@@ -152,7 +156,9 @@ def _vote(contents: list[str]) -> tuple[bool | None, float, list[bool | None]]:
 
 
 def _metrics(results: list[dict]) -> dict:
-    scored = [r for r in results if r["prediction"] is not None and r["label"] is not None]
+    scored = [
+        r for r in results if r["prediction"] is not None and r["label"] is not None
+    ]
     n = len(scored)
     correct = sum(int(r["prediction"]) == int(r["label"]) for r in scored)
     tp = sum(1 for r in scored if r["prediction"] and r["label"] == 1)
@@ -254,7 +260,10 @@ def _load_resume(resume_path: str, key_fn) -> dict[tuple, dict]:
         r = json.loads(line)
         if "error" not in r:
             done[key_fn(r)] = r
-    print(f"Resuming: {len(done)} completed items loaded from {resume_path}", file=sys.stderr)
+    print(
+        f"Resuming: {len(done)} completed items loaded from {resume_path}",
+        file=sys.stderr,
+    )
     return done
 
 
@@ -301,7 +310,9 @@ def run(
                 futures[pool.submit(evaluate, client, model_id, dict(item))] = item
         skipped = len(results)
         if skipped:
-            print(f"  {skipped} items already done, {len(futures)} to go", file=sys.stderr)
+            print(
+                f"  {skipped} items already done, {len(futures)} to go", file=sys.stderr
+            )
         done = skipped
         for fut in as_completed(futures):
             _write(fut.result())
@@ -332,25 +343,13 @@ if __name__ == "__main__":
         required=True,
         help="Path to the input JSON file (WiC pairs).",
     )
-    parser.add_argument(
-        "-m",
-        "--model",
-        default=DEFAULT_MODEL_ID,
-        help=f"Model id to query (default: {DEFAULT_MODEL_ID}).",
-    )
+    parser.add_argument("-m", "--model", default=DEFAULT_MODEL_ID)
     parser.add_argument(
         "-r",
         "--resume",
         help="Path to a previous (partial) results JSONL to continue from; "
         "already-completed items are skipped.",
     )
-    parser.add_argument(
-        "-t",
-        "--task",
-        choices=list(TASKS),
-        default="wic",
-        help="wic: same-sense verdict for a sentence pair (word1/word2/sentence1/"
-        "sentence2/label).",
-    )
+    parser.add_argument("-t", "--task", choices=list(TASKS), default="wic")
     args = parser.parse_args()
     run(args.file, args.model, args.resume, args.task)
