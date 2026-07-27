@@ -41,7 +41,9 @@ import sense_data as sd
 
 def build_prompt(rec, tokenizer):
     msgs = sd.wic_messages(rec, with_target=False)
-    return tokenizer.apply_chat_template(msgs, tokenize=False, add_generation_prompt=True)
+    return tokenizer.apply_chat_template(
+        msgs, tokenize=False, add_generation_prompt=True
+    )
 
 
 # Shape of the answer object (mirrors sense_data.wic_answer / WIC_ANSWER_KEYS).
@@ -57,12 +59,6 @@ WIC_JSON_SCHEMA = {
 
 
 def load_lora(path):
-    """``(LoRARequest, rank)`` for an adapter dir, or ``(None, None)`` if unset.
-
-    vLLM applies an adapter per *request*, but sizes its LoRA slots at engine
-    init, so the rank has to be read off ``adapter_config.json`` up front —
-    the default (16) is smaller than the ranks sft_lora.py/grpo_lora.py train.
-    """
     if not path:
         return None, None
     from vllm.lora.request import LoRARequest
@@ -73,22 +69,19 @@ def load_lora(path):
 
 
 def generate_all(llm, texts, force_json=False, lora_request=None):
-    """Greedy completions for all prompts; vLLM schedules the batch internally.
-
-    With ``force_json``, decoding runs in two phases: free reasoning stopped at
-    ``</think>`` (force-closed if the token budget runs out first), then a
-    continuation whose tokens are constrained to schema-valid JSON (xgrammar,
-    via vLLM structured outputs), so every completion ends in a parseable
-    verdict. Prefix caching makes phase 2 a near-pure decode of the answer.
-    """
     if not force_json:
         sp = SamplingParams(temperature=0.0, max_tokens=1024)
-        return [out.outputs[0].text for out in llm.generate(texts, sp, lora_request=lora_request)]
+        return [
+            out.outputs[0].text
+            for out in llm.generate(texts, sp, lora_request=lora_request)
+        ]
 
     # Phase 1: free-form reasoning, halted at the close of the think block.
     sp1 = SamplingParams(
-        temperature=0.0, max_tokens=1024,
-        stop=["</think>"], include_stop_str_in_output=True,
+        temperature=0.0,
+        max_tokens=1024,
+        stop=["</think>"],
+        include_stop_str_in_output=True,
     )
     thinks = []
     for out in llm.generate(texts, sp1, lora_request=lora_request):
@@ -99,10 +92,13 @@ def generate_all(llm, texts, force_json=False, lora_request=None):
 
     # Phase 2: constrained continuation — only tokens forming schema-valid JSON.
     sp2 = SamplingParams(
-        temperature=0.0, max_tokens=512,
+        temperature=0.0,
+        max_tokens=512,
         structured_outputs=StructuredOutputsParams(json=WIC_JSON_SCHEMA),
     )
-    outs2 = llm.generate([p + t for p, t in zip(texts, thinks)], sp2, lora_request=lora_request)
+    outs2 = llm.generate(
+        [p + t for p, t in zip(texts, thinks)], sp2, lora_request=lora_request
+    )
     return [think + out.outputs[0].text for think, out in zip(thinks, outs2)]
 
 
@@ -116,28 +112,33 @@ def wic_metrics(preds, golds):
     y_true = [g for _, g in scored]
     if n:
         prec, rec, f1, _ = precision_recall_fscore_support(
-            y_true, y_pred, average="binary", pos_label=True, zero_division=0,
+            y_true,
+            y_pred,
+            average="binary",
+            pos_label=True,
+            zero_division=0,
         )
         acc = accuracy_score(y_true, y_pred)
     else:
         prec = rec = f1 = acc = 0.0
     return {
-        "n": len(preds), "n_scored": n, "empty": len(preds) - n,
+        "n": len(preds),
+        "n_scored": n,
+        "empty": len(preds) - n,
         "accuracy": float(acc),
-        "precision": float(prec), "recall": float(rec), "f1": float(f1),
+        "precision": float(prec),
+        "recall": float(rec),
+        "f1": float(f1),
     }
 
 
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--model", type=str, required=True)
-    ap.add_argument("--lora", default=None,
-                    help="LoRA adapter dir to apply on top of --model (which must then be "
-                         "the adapter's base model, not a merged checkpoint)")
+    ap.add_argument("--lora", default=None)
     ap.add_argument("--split", default="test")
     ap.add_argument("--max-samples", type=int, default=0, help="0 = full split")
-    ap.add_argument("--force-json", action="store_true",
-                    help="constrain the answer region to schema-valid JSON (xgrammar)")
+    ap.add_argument("--force-json", action="store_true")
     ap.add_argument("--max-model-len", type=int, default=4096)
     ap.add_argument("--gpu-memory-utilization", type=float, default=0.85)
     ap.add_argument("--output", default=None)
@@ -158,7 +159,9 @@ def main():
         data = data[: args.max_samples]
 
     texts = [build_prompt(r, tokenizer) for r in data]
-    decoded_all = generate_all(llm, texts, force_json=args.force_json, lora_request=lora_req)
+    decoded_all = generate_all(
+        llm, texts, force_json=args.force_json, lora_request=lora_req
+    )
 
     hyps, refs, records = [], [], []
     for rec, decoded in zip(data, decoded_all):
@@ -169,26 +172,35 @@ def main():
         # the output file feeds prepare_data.py --data via load_teacher_traces.
         think, closed, _ = decoded.partition("</think>")
         answer = sd.parse_wic_answer(decoded)
-        records.append({
-            "lemma": rec["lemma"], "pos": rec["pos"],
-            "sentence1": rec["sentence1"], "sentence2": rec["sentence2"],
-            "label": gold,
-            "prediction": hyp,
-            "votes": [hyp],
-            "answers": [json.dumps(answer, ensure_ascii=False)] if answer is not None else [],
-            "reasonings": [think.replace("<think>", "").strip()] if closed else [],
-        })
+        records.append(
+            {
+                "lemma": rec["lemma"],
+                "pos": rec["pos"],
+                "sentence1": rec["sentence1"],
+                "sentence2": rec["sentence2"],
+                "label": gold,
+                "prediction": hyp,
+                "votes": [hyp],
+                "answers": [json.dumps(answer, ensure_ascii=False)]
+                if answer is not None
+                else [],
+                "reasonings": [think.replace("<think>", "").strip()] if closed else [],
+            }
+        )
 
     metrics = wic_metrics(hyps, refs)
-    print(f"\n[wic] n={metrics['n']}  acc={metrics['accuracy']:.3f}  "
-          f"f1={metrics['f1']:.3f}  P={metrics['precision']:.3f}  "
-          f"R={metrics['recall']:.3f}  empty={metrics['empty']}")
+    print(
+        f"\n[wic] n={metrics['n']}  acc={metrics['accuracy']:.3f}  "
+        f"f1={metrics['f1']:.3f}  P={metrics['precision']:.3f}  "
+        f"R={metrics['recall']:.3f}  empty={metrics['empty']}"
+    )
 
     print("\nExamples (first 10):")
     print(f"{'lemma':<18}  {'gold':<10}  {'prediction':<10}")
     for rec in records[:10]:
         pred = "—" if rec["prediction"] is None else str(rec["prediction"])
-        print(f"{rec['lemma']:<18}  {str(rec['label']):<10}  {pred:<10}")
+        label = "—" if rec["label"] is None else str(rec["label"])
+        print(f"{rec['lemma']:<18}  {label:<10}  {pred:<10}")
 
     # Bare list in the call_api.py teacher schema — directly consumable by
     # prepare_data.py --data. Metrics are printed above, not saved.

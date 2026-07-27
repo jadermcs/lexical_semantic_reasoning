@@ -19,8 +19,6 @@ Data sources:
   where the teacher's self-consistency vote matched the gold label. These add a
   distilled ``think`` trace and the teacher's two sense glosses.
 
-This module imports neither torch nor trl, so the data can be built and inspected
-on the laptop; the training scripts import the heavy stack.
 """
 
 import json
@@ -31,9 +29,6 @@ from rapidfuzz import fuzz, process
 
 DATA_DIR = Path("data")
 
-# --------------------------------------------------------------------------- #
-# Prompt (shared by SFT / GRPO / eval so train and inference match exactly)
-# --------------------------------------------------------------------------- #
 WIC_SYSTEM = (
     "You are an expert lexicographer. You are given two sentences, each using the same "
     "target word (marked with <t> tags). Inside <think> tags, work out what the target "
@@ -46,9 +41,6 @@ WIC_SYSTEM = (
 )
 
 
-# --------------------------------------------------------------------------- #
-# Target marking
-# --------------------------------------------------------------------------- #
 def mark_target(sentence: str, word: str, fuzzy_threshold: float = 70.0) -> str:
     """Wrap the best match for *word* in *sentence* with <t> tags (handles inflection)."""
     pattern = rf"\b({re.escape(word)}\w*)\b"
@@ -70,9 +62,6 @@ def mark_target(sentence: str, word: str, fuzzy_threshold: float = 70.0) -> str:
     return sentence + f" <t> {word} </t>"
 
 
-# --------------------------------------------------------------------------- #
-# Data loading
-# --------------------------------------------------------------------------- #
 def pair_key(rec: dict) -> tuple:
     """Stable identity of a WiC pair, shared across every loader.
 
@@ -83,32 +72,13 @@ def pair_key(rec: dict) -> tuple:
     return (rec["lemma"], rec["pos"], rec["sentence1"], rec["sentence2"])
 
 
-def load_mclwic(
-    split: str, data_dir: Path = DATA_DIR, exclude_pairs=None
-) -> list[dict]:
-    """Load the MCL-WiC benchmark split as internal wic records.
-
-    MCL-WiC is a gold word-in-context dataset: two sentences, the target word's
-    surface form in each, and a same/different label (1 = same sense, 0 =
-    different) kept here as a boolean, matching the ``same_sense`` answer key.
-    It carries no glosses, so only
-    the verifiable same/different verdict can be scored — there is no gold gloss to
-    reward the reasoning against. The two sentences aren't pre-tagged, so the
-    surface form (``word1``/``word2``) is wrapped with <t> tags here to match the
-    ``wic_messages`` prompt format.
-
-    ``exclude_pairs`` is an optional set of ``pair_key`` tuples to drop — used to
-    hold the SFT-consumed pairs out of the GRPO rollout set (avoiding rolling out on
-    pairs the policy already memorised during SFT warm-start).
-    """
+def load_mclwic(split: str, data_dir: Path = DATA_DIR) -> list[dict]:
     raw = json.loads((data_dir / f"mcl-wic.{split}.json").read_text())
     recs = [
         {
             "lemma": r["lemma"],
             "pos": r["pos"],
             "label": bool(r["label"]),
-            # raw sentences kept so eval predictions can round-trip through
-            # load_teacher_traces (which re-marks the target from the lemma)
             "sentence1": r["sentence1"],
             "sentence2": r["sentence2"],
             "usage1": mark_target(r["sentence1"], r["word1"]),
@@ -116,23 +86,10 @@ def load_mclwic(
         }
         for r in raw
     ]
-    if exclude_pairs:
-        exclude_pairs = set(exclude_pairs)
-        recs = [r for r in recs if pair_key(r) not in exclude_pairs]
     return recs
 
 
 def _wic_candidates(rec: dict) -> list[dict]:
-    """Teacher samples whose own vote matches the majority prediction.
-
-    ``call_api.py`` records one reasoning per self-consistency sample alongside its
-    JSON answer (``{"sense1", "sense2", "same_sense"}``). Keeping only samples that
-    voted with the majority makes the distilled <think> block consistent with the
-    verdict we train toward. Each candidate carries the trimmed reasoning trace plus
-    the two sense glosses from that same sample's answer, so the JSON training target
-    can be reconstructed. Samples with an unparseable answer or an empty trace are
-    dropped; the returned list preserves sample order.
-    """
     pred = bool(rec["prediction"])
     cands = []
     for ans, rea in zip(rec.get("answers", []), rec.get("reasonings", [])):
@@ -161,39 +118,17 @@ def _select_candidate(cands, rec, strategy="first", scorer=None):
 
     ``first``   keep the original behaviour: the earliest surviving sample.
     ``longest`` the sample with the longest reasoning trace (most CoT).
-    ``entropy`` the sample the model is most uncertain about: ``scorer(rec, cands)``
-                returns a per-candidate score (the model's mean predictive entropy
-                over the trace) and the argmax wins. The scorer is supplied by the
-                caller (``sft_sense``) since it needs the loaded model/tokenizer.
     """
     if strategy == "first":
         return cands[0]
     if strategy == "longest":
         return max(cands, key=lambda c: len(c["think"]))
-    if strategy == "entropy":
-        if scorer is None:
-            raise ValueError("strategy='entropy' requires a scorer (pass one from sft_sense)")
-        scores = scorer(rec, cands)
-        return cands[max(range(len(cands)), key=scores.__getitem__)]
     raise ValueError(f"unknown reasoning-select strategy: {strategy!r}")
 
 
-def load_teacher_traces(path: str | Path, strategy: str = "first", scorer=None) -> list[dict]:
-    """Load teacher WiC predictions (from ``call_api.py``) as wic SFT records.
-
-    Distillation source: each record carries the teacher's chain-of-thought
-    (``reasonings``) and a self-consistency vote (``prediction``). Only pairs the
-    teacher got right (vote == gold ``label``) are kept, so no confidently-wrong
-    reasoning is distilled; the verdict trained toward is the gold label. Among the
-    samples whose own vote agrees with the majority (see ``_wic_candidates``) one is
-    picked per ``strategy`` (``first``/``longest``/``entropy`` — see
-    ``_select_candidate``; ``entropy`` needs ``scorer``). The picked trace
-    becomes the ``think`` field and its two sense glosses become ``sense1``/``sense2``
-    for the JSON target (see ``wic_answer``). The trace already carries the <t> tags
-    the teacher was shown, and the prompt sentences are re-marked from the lemma (the
-    raw file drops the surface forms). Records with an errored/absent prediction or no
-    usable trace are skipped.
-    """
+def load_teacher_traces(
+    path: str | Path, strategy: str = "first", scorer=None
+) -> list[dict]:
     raw = json.loads(Path(path).read_text())
     out = []
     for r in raw:
@@ -225,15 +160,11 @@ def load_teacher_traces(path: str | Path, strategy: str = "first", scorer=None) 
     return out
 
 
-# --------------------------------------------------------------------------- #
-# Prompt / target formatting (chat messages)
-# --------------------------------------------------------------------------- #
 def think_block(rec) -> str:
     """The distilled teacher trace, wrapped in <think> tags (shared by all tasks)."""
     return f"<think>\n{rec['think']}\n</think>"
 
 
-# Kept as an alias for backward compatibility with earlier imports.
 wic_think = think_block
 
 
@@ -275,9 +206,6 @@ def wic_messages(rec, with_target=False):
     return msgs
 
 
-# Dispatch a record to its task's message builder via the ``task`` tag, so the SFT
-# pipeline (``sft_sense.py``) stays task-agnostic and new tasks only need an entry
-# here plus a loader above.
 MESSAGE_BUILDERS = {"wic": wic_messages}
 
 
@@ -290,9 +218,6 @@ def build_messages(rec, with_target=False):
     return builder(rec, with_target=with_target)
 
 
-# --------------------------------------------------------------------------- #
-# Answer parsing
-# --------------------------------------------------------------------------- #
 WIC_ANSWER_KEYS = {"sense1", "sense2", "same_sense"}
 
 
@@ -301,14 +226,6 @@ def _tok(s: str) -> list[str]:
 
 
 def parse_wic_answer(text: str) -> dict | None:
-    """The JSON object in the answer region, or None if there isn't a parseable one.
-
-    The answer region is everything after ``</think>``; an unclosed <think> means
-    the reasoning ran past the budget with no answer at all. Only the object's
-    *syntax* is checked here — whether it carries the right keys, and whether
-    ``same_sense`` is a real boolean, is judged by the callers (``extract_wic_label``
-    is lenient about it; ``sense_rewards.reward_wic_json`` scores it).
-    """
     seg = text.split("</think>")[-1]
     if "<think>" in seg:  # unclosed <think>: reasoning ran on, no answer
         return None
@@ -323,14 +240,6 @@ def parse_wic_answer(text: str) -> dict | None:
 
 
 def extract_wic_label(text: str) -> bool | None:
-    """Return the same-sense verdict as a boolean, or None if unclear.
-
-    Prefer the JSON verdict (``{"same_sense": ...}``, coerced with ``bool`` so a
-    stringly-typed "true" still yields a verdict); fall back to a bare
-    same/different token for backward compatibility. Deliberately lenient: the
-    accuracy reward should score a *decision* wherever the model expressed one, and
-    the format/JSON rewards are what pay for expressing it in the required shape.
-    """
     obj = parse_wic_answer(text)
     if obj is not None:
         try:
