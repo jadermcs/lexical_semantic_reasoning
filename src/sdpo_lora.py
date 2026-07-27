@@ -4,12 +4,13 @@ import os
 from functools import partial, wraps
 from pathlib import Path
 
-from datasets import Dataset
+from datasets import Dataset, concatenate_datasets
 from transformers import AutoTokenizer
 from transformers.trainer_utils import get_last_checkpoint
 from trl.experimental.sdpo import SDPOConfig, SDPOTrainer
 from trl.rewards import get_repetition_penalty_reward, get_soft_overlong_punishment
 
+import semcor_pairs
 import sense_data as sd
 from grpo_lora import load_policy
 from sense_rewards import KEEP_COLS, REWARDS
@@ -47,8 +48,21 @@ def gold_feedback(rec):
 
 
 def format_prompt(rec, with_feedback=True):
-    out = {"prompt": sd.wic_messages(rec, with_target=False)}
-    if with_feedback:
+    """Render the prompt column, plus the hint the teacher is reprompted with.
+
+    ``privileged_context`` is always written, empty when there is no hint: Arrow needs
+    one schema across the concatenated MCL and SemCor sets, and the trainer's
+    ``has_feedback`` test (``isinstance(str) and strip() != ""``) reads ``""`` as "no
+    feedback" exactly as it reads a missing key.
+    """
+    out = {"prompt": sd.wic_messages(rec, with_target=False), "privileged_context": ""}
+    if rec.get("synset1") and rec.get("synset2"):
+        # A SemCor record carries gold senses, so its hint can name them. This is the
+        # feedback --semcor exists to supply, and --no-gold-feedback does not turn it
+        # off; see that flag's help.
+        out["privileged_context"] = semcor_pairs.gloss_feedback(rec)
+    elif with_feedback:
+        # MCL-WiC has only the label, so the best available hint is the one bit.
         out["privileged_context"] = gold_feedback(rec)
     return out
 
@@ -62,15 +76,39 @@ def as_text_reward(fn):
     return wrapper
 
 
-def build_dataset(split, cap=None, with_feedback=True):
-    recs = sd.load_mclwic(split)
+def _prepare(recs, cap=None, with_feedback=True, seed=42):
+    """Records → a Dataset carrying exactly KEEP_COLS + prompt + privileged_context.
+
+    Mapping each source to this fixed shape *before* concatenation is what lets the
+    two be merged: the raw records differ (SemCor adds ``synset1``/``synset2``), the
+    mapped ones do not.
+    """
     ds = Dataset.from_list(recs)
     if cap is not None:
-        ds = ds.shuffle(seed=42).select(range(min(cap, len(ds))))
+        ds = ds.shuffle(seed=seed).select(range(min(cap, len(ds))))
     drop = [c for c in ds.column_names if c not in KEEP_COLS]
     return ds.map(
         partial(format_prompt, with_feedback=with_feedback), remove_columns=drop
     )
+
+
+def build_dataset(split, cap=None, with_feedback=True, semcor=None):
+    """Rollout set for one split, optionally merging SemCor pairs into it.
+
+    ``semcor`` is a dict of ``semcor_pairs.build_pairs`` kwargs, or None.
+    """
+    parts = [_prepare(sd.load_mclwic(split), cap=cap, with_feedback=with_feedback)]
+
+    if semcor:
+        sc = semcor_pairs.build_pairs(**semcor)
+        print(f"[{split}] semcor: +{len(sc)} gloss-annotated pairs")
+        parts.append(_prepare(sc, cap=cap, with_feedback=with_feedback))
+
+    if len(parts) == 1:
+        return parts[0]
+    # Interleave the sources: each prompt forms its own rollout group, but leaving
+    # them in blocks would make every optimizer step see one source only.
+    return concatenate_datasets(parts).shuffle(seed=42)
 
 
 def main():
@@ -140,9 +178,47 @@ def main():
     ap.add_argument(
         "--no-gold-feedback",
         action="store_true",
-        help="Do not supply the gold verdict as privileged context; teach only from "
-        "successful sibling rollouts. Groups where every rollout fails then carry no "
-        "distillation signal (the GRPO failure mode SDPO is here to fix).",
+        help="Do not supply the gold verdict as privileged context on MCL-WiC pairs; "
+        "those groups then teach only from successful sibling rollouts, and groups "
+        "where every rollout fails carry no distillation signal (the GRPO failure mode "
+        "SDPO is here to fix). It does NOT suppress --semcor's gloss feedback, which "
+        "is a different and strictly more informative signal: combining the two gives "
+        "a rollout set where only the gold-sense pairs are hinted, which is the clean "
+        "way to ask what the gloss feedback is worth.",
+    )
+    # ---- SemCor rollout source (the gloss-feedback one) ----
+    ap.add_argument(
+        "--semcor",
+        action="store_true",
+        help="Merge SemCor-derived pairs into the train rollout set. These are the "
+        "only pairs carrying gold WordNet senses, so they are the only ones whose "
+        "SDPO hint can name what the word actually means in each sentence; MCL-WiC "
+        "pairs keep the one-bit verdict hint.",
+    )
+    ap.add_argument("--semcor-source", default=str(semcor_pairs.DEFAULT_SOURCE))
+    ap.add_argument(
+        "--semcor-max-per-lemma",
+        type=int,
+        default=4,
+        help="Cap per (lemma, pos) per label side. SemCor annotates a few lemmas "
+        "thousands of times (one synset has 10082 usages), so without a cap the "
+        "rollout set is mostly 'be' and 'have'.",
+    )
+    ap.add_argument(
+        "--semcor-min-confusability",
+        default=None,
+        choices=semcor_pairs.CONFUSABILITY,
+        help="Keep only different-sense pairs at least this hard. 'near' restricts to "
+        "the sibling/near strata, where the teacher measurably struggles (accuracy "
+        "fell 71.2%% → 56.8%% as gold synsets got closer).",
+    )
+    ap.add_argument(
+        "--semcor-keep-test-lemmas",
+        action="store_true",
+        help="Do NOT hold out lemmas occurring in mcl-wic.test from the SemCor pairs. "
+        "Off by default: SemCor and MCL-WiC share no pairs but share many lemmas, and "
+        "training on a test lemma's sense inventory turns the held-out score into "
+        "recall rather than generalisation.",
     )
     args = ap.parse_args()
 
@@ -170,7 +246,19 @@ def main():
     tokenizer.pad_token = tokenizer.eos_token
 
     with_feedback = not args.no_gold_feedback
-    train_ds = build_dataset("train", with_feedback=with_feedback)
+    semcor_cfg = (
+        dict(
+            path=args.semcor_source,
+            max_per_lemma=args.semcor_max_per_lemma,
+            min_confusability=args.semcor_min_confusability,
+            exclude_lemma_splits=() if args.semcor_keep_test_lemmas else ("test",),
+        )
+        if args.semcor
+        else None
+    )
+    train_ds = build_dataset("train", with_feedback=with_feedback, semcor=semcor_cfg)
+    # Dev stays pure MCL-WiC: it is the in-domain read on the benchmark, and mixing a
+    # second distribution into it would make the eval curve unreadable.
     dev_ds = build_dataset("dev", cap=200, with_feedback=with_feedback)
     print(train_ds[0])
 
