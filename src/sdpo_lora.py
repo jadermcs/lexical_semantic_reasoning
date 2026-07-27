@@ -4,12 +4,11 @@ import os
 from functools import partial, wraps
 from pathlib import Path
 
-import torch
 from datasets import Dataset
 from transformers import AutoTokenizer
 from transformers.trainer_utils import get_last_checkpoint
 from trl.experimental.sdpo import SDPOConfig, SDPOTrainer
-from trl.rewards import get_repetition_penalty_reward
+from trl.rewards import get_repetition_penalty_reward, get_soft_overlong_punishment
 
 import sense_data as sd
 from grpo_lora import load_policy
@@ -248,6 +247,12 @@ def main():
 
     reward_funcs = [as_text_reward(f) for f in REWARDS]
     reward_funcs.append(get_repetition_penalty_reward(ngram_size=3, max_penalty=-0.2))
+    reward_funcs.append(
+        get_soft_overlong_punishment(
+            max_completion_len=args.max_completion_length,
+            soft_punish_cache=args.soft_punish_cache,
+        )
+    )
 
     trainer = SDPOTrainer(
         model=model,
