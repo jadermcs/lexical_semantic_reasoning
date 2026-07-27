@@ -1,38 +1,23 @@
-"""Verifiable reward functions for the GRPO WiC task.
-
-Split out of ``grpo_sense`` so the rewards can be imported, unit-tested and
-eyeballed without the training stack: like ``sense_data``, this module imports
-neither torch nor trl.
-
-The reward has two halves:
-
-* **Correctness** — ``reward_wic_accuracy``. The gold same/different label is
-  known, so this is exact rather than a similarity estimate. It dominates
-  (+/-1.0) everything else.
-* **Shape** — ``reward_wic_format``, ``reward_wic_json``, ``reward_wic_consistency``,
-  ``reward_wic_wordnet`` and ``reward_think_length`` pay for the reasoning block and the
-  JSON answer contract the prompt asks for, and punish the ways models degenerate out of
-  it (a stubbed <think>, a prose answer, an unclosed reasoning block, a gloss pair that
-  contradicts the same_sense verdict). Their combined ceiling stays well under the
-  accuracy term, so being right always beats being tidy.
-
-``reward_wic_wordnet`` is the only term that consults anything outside the answer
-itself. That is deliberate: ``same_sense`` is one bit, so a trace that guesses it
-correctly is indistinguishable from one that reasoned to it, and no amount of
-self-referential shaping can tell them apart. WordNet has no stake in the pipeline,
-so snapping the emitted glosses to it is genuine outside information.
-"""
-
-import json
-import os
 import re
 from difflib import SequenceMatcher
-from pathlib import Path
 
 from sklearn.feature_extraction.text import ENGLISH_STOP_WORDS
 
-import gloss_wordnet
 import sense_data as sd
+
+# --------------------------------------------------------------------------- #
+# WiC (word-in-context): verifiable same/different-sense classification
+# --------------------------------------------------------------------------- #
+WIC_CORRECT = 1.0
+WIC_WRONG = -0.5
+WIC_ABSENT = -1.0
+WIC_JSON_PARSES = 0.1  # answer region holds a parseable JSON object
+WIC_JSON_KEYS = 0.1  # exactly the three required keys, nothing extra or missing
+WIC_JSON_BOOL = 0.1  # same_sense is a JSON boolean, not "true" / 1 / "same"
+WIC_JSON_MALFORMED = -0.2  # said something after </think>, but no JSON object in it
+WIC_INCONSISTENT = -0.3
+THINK_MIN_WORDS = 6  # below this many content words, reasoning is treated as a stub
+THINK_MIN_PENALTY = -0.3
 
 
 def _content_word_count(text):
@@ -40,11 +25,6 @@ def _content_word_count(text):
 
 
 def _answer_region(text):
-    """The whole answer the model emits: all text after </think>.
-
-    An unclosed <think> means the reasoning ran past the length budget and there is
-    no answer region at all.
-    """
     seg = text.split("</think>")[-1]
     if "<think>" in seg:
         return ""
@@ -52,11 +32,6 @@ def _answer_region(text):
 
 
 def _think_answer_format_reward(completions, extractor):
-    """Reward a present <think> block (0.1) and an extractable answer (0.1).
-
-    Extractability is judged with ``is not None`` — a boolean False verdict is a
-    perfectly good answer, not a missing one.
-    """
     out = []
     for c in completions:
         r = 0.0
@@ -73,40 +48,17 @@ def _extract_think(text):
     return m.group(1).strip() if m else ""
 
 
-THINK_MIN_WORDS = 6      # below this many content words, reasoning is treated as a stub
-THINK_MIN_PENALTY = -0.3
-
-
 def reward_think_length(completions, **kwargs):
-    """Punish degenerate reasoning: a missing, truncated, or near-empty <think> block.
-
-    Catches the model collapsing the reasoning step — whether by dropping the
-    block entirely (no penalty elsewhere, so this is the only force keeping it),
-    truncating it past the length budget (no closing tag, so `_extract_think`
-    returns ""), or stubbing it (e.g. "<think>ok</think>") to farm the format
-    reward's presence bonus without doing any real reasoning.
-    """
     out = []
     for c in completions:
         think = _extract_think(c)
-        out.append(THINK_MIN_PENALTY if _content_word_count(think) < THINK_MIN_WORDS else 0.0)
+        out.append(
+            THINK_MIN_PENALTY if _content_word_count(think) < THINK_MIN_WORDS else 0.0
+        )
     return out
 
 
-# --------------------------------------------------------------------------- #
-# WiC (word-in-context): verifiable same/different-sense classification
-# --------------------------------------------------------------------------- #
-WIC_CORRECT = 1.0
-WIC_WRONG = -0.5
-WIC_ABSENT = -1.0
-
-
 def reward_wic_accuracy(completions, **kwargs):
-    """+1 for the right same/different verdict, -1 for the wrong one or for none.
-
-    This is the verifiable signal: the gold label is known, so the reward is exact
-    rather than a similarity estimate.
-    """
     out = []
     for c, label in zip(completions, kwargs["label"]):
         pred = sd.extract_wic_label(c)
@@ -122,30 +74,7 @@ def reward_wic_format(completions, **kwargs):
     return _think_answer_format_reward(completions, sd.extract_wic_label)
 
 
-# Graded credit for the answer *shape* the prompt asks for: a single JSON object
-# with exactly {"sense1", "sense2", "same_sense"} and a real boolean verdict.
-# Graded rather than all-or-nothing so a group that is only partway there still has
-# reward variance for GRPO to push on; the ceiling (0.3) stays well under the +/-1
-# accuracy reward so being right always dominates being well-formatted.
-WIC_JSON_PARSES = 0.1      # answer region holds a parseable JSON object
-WIC_JSON_KEYS = 0.1        # exactly the three required keys, nothing extra or missing
-WIC_JSON_BOOL = 0.1        # same_sense is a JSON boolean, not "true" / 1 / "same"
-WIC_JSON_MALFORMED = -0.2  # said something after </think>, but no JSON object in it
-
-
 def reward_wic_json(completions, **kwargs):
-    """Score the answer region's JSON structure, in [WIC_JSON_MALFORMED, 0.3].
-
-    ``reward_wic_format`` only pays for a verdict being *extractable*, and
-    ``sd.extract_wic_label`` deliberately falls back to a bare same/different token —
-    so on its own it lets the model collect format credit while never emitting JSON.
-    This reward is the strict counterpart, and it is what makes the JSON contract
-    (which the SFT warm-start teaches, see ``sd.wic_answer``) survive RL.
-
-    A completion that answers in prose is penalised; a blank or unclosed <think>
-    stays at 0, since ``reward_think_length`` already punishes that failure and
-    double-charging it would drown out the accuracy signal.
-    """
     out = []
     for c in completions:
         obj = sd.parse_wic_answer(c)
@@ -161,115 +90,32 @@ def reward_wic_json(completions, **kwargs):
     return out
 
 
-# The answer states the verdict twice: once as the sense1/sense2 gloss pair and
-# once as the boolean. An answer whose glosses contradict its verdict (dissimilar
-# glosses with same_sense=true, or near-identical glosses with same_sense=false)
-# got the JSON shape right while being internally incoherent — punish it, graded
-# by *how far* the glosses are from the verdict they claim.
-WIC_INCONSISTENT = -0.3
-
-
 def _gloss_similarity(s1, s2):
-    """Token-sequence similarity of two glosses, in [0, 1].
-
-    A normalised edit-distance ratio (``difflib.SequenceMatcher`` over the tokens
-    ``sd._tok`` yields, so it inherits the same case/punctuation folding) — 1.0
-    for token-identical glosses, ~0 for glosses with nothing in common.
-    """
     return SequenceMatcher(None, sd._tok(s1), sd._tok(s2)).ratio()
 
 
 def reward_wic_consistency(completions, **kwargs):
-    """Punish a same_sense verdict that contradicts the emitted glosses, graded.
-
-    The SFT target (see ``sd.wic_answer``) writes the *same* gloss string into
-    sense1 and sense2 when the senses match, and different glosses when they
-    don't. The penalty is asymmetric by verdict:
-
-    * **same_sense=true** — the glosses should agree, so the penalty scales with
-      their *dis*similarity, ``WIC_INCONSISTENT * (1 - sim)``. Rather than an exact
-      match (which fired the full penalty on a genuine paraphrase — two wordings of
-      one sense — as hard as on a real contradiction), a paraphrase is barely
-      touched while glosses that genuinely disagree pay close to the full penalty.
-    * **same_sense=false** — different senses of one lemma routinely share generic
-      words ("a short *story*" vs "a false *story*"), so incidental token overlap
-      is *not* incoherence. This branch keeps the strict rule: penalise only when
-      the glosses are token-identical, which the model does not do in practice.
-
-    Anything unparseable, missing a piece, or with a non-boolean verdict scores 0:
-    ``reward_wic_json`` already charges for those, and double-charging would drown
-    the accuracy signal.
-    """
     out = []
     for c in completions:
         r = 0.0
         obj = sd.parse_wic_answer(c)
         if obj is not None:
-            s1, s2, verdict = obj.get("sense1"), obj.get("sense2"), obj.get("same_sense")
-            if isinstance(s1, str) and isinstance(s2, str) and isinstance(verdict, bool) \
-                    and s1.strip() and s2.strip():
+            s1, s2, verdict = (
+                obj.get("sense1"),
+                obj.get("sense2"),
+                obj.get("same_sense"),
+            )
+            if (
+                isinstance(s1, str)
+                and isinstance(s2, str)
+                and isinstance(verdict, bool)
+                and s1.strip()
+                and s2.strip()
+            ):
                 if verdict:
                     r = WIC_INCONSISTENT * (1.0 - _gloss_similarity(s1, s2))
                 elif sd._tok(s1) == sd._tok(s2):
                     r = WIC_INCONSISTENT
-        out.append(r)
-    return out
-
-
-# --------------------------------------------------------------------------- #
-# WordNet: the semantic counterpart of the consistency reward's false branch
-# --------------------------------------------------------------------------- #
-WIC_WN_MERGED = -0.25
-
-
-def reward_wic_wordnet(completions, **kwargs):
-    """Punish a "different senses" verdict whose two glosses name one WordNet sense.
-
-    ``reward_wic_consistency``'s ``same_sense=false`` branch only fires on
-    *token-identical* glosses — a case its own docstring notes the model does not
-    produce. Snapping each gloss to the best-matching synset of its ``(lemma, pos)``
-    catches the same failure worded differently: measured over the SFT model's 1000
-    test records, on the 422 traces claiming *different* for a gold-different pair
-    the string rule fires 6 times and this one 163, a strict superset of it.
-
-    Every one of those 163 is a *label-correct* trace, which is the whole point.
-    They are the lucky guesses a one-bit verifier cannot separate from real sense
-    discrimination, so they carry the same accuracy reward as a trace that did the
-    work — which is what flattens the GRPO advantage on hard pairs.
-
-    Label-free, exactly like the reward it upgrades: it scores whether the glosses
-    support the verdict the answer *claims*, not whether that verdict is right.
-    ``reward_wic_accuracy`` already charges for being wrong, and double-charging it
-    here would just widen the accuracy term under another name.
-
-    Only the *merge* direction is checked. The converse — a ``same`` verdict whose
-    glosses snap to different synsets — is anti-correlated with quality (the API
-    teacher trips it more often than the SFT model does, because two good
-    paraphrases of one sense routinely land on neighbouring synsets), which is why
-    ``gloss_wordnet.check`` keeps it behind ``strict=True``. That module's docstring
-    has the calibration; do not symmetrise this without redoing it.
-
-    Scores 0.0 when the answer does not parse and when the lemma is absent from
-    WordNet — absence of evidence is not evidence of a merged gloss.
-
-    ``gloss_wordnet`` opens the lexicon on first use, so a missing Open English
-    WordNet download surfaces here as a ``LookupError`` carrying the command to fix
-    it, not as a silently disabled reward term.
-    """
-    out = []
-    for c, lemma, pos in zip(completions, kwargs["lemma"], kwargs["pos"]):
-        r = 0.0
-        obj = sd.parse_wic_answer(c)
-        if obj is not None:
-            s1, s2, verdict = obj.get("sense1"), obj.get("sense2"), obj.get("same_sense")
-            if verdict is False and isinstance(s1, str) and isinstance(s2, str) \
-                    and s1.strip() and s2.strip():
-                syn1, _ = gloss_wordnet.snap(s1, lemma, pos)
-                syn2, _ = gloss_wordnet.snap(s2, lemma, pos)
-                # `snap` returns None for a lemma WordNet does not have; two Nones
-                # are not a merged gloss.
-                if syn1 is not None and syn1 == syn2:
-                    r = WIC_WN_MERGED
         out.append(r)
     return out
 
@@ -279,50 +125,7 @@ REWARDS = [
     reward_wic_format,
     reward_wic_json,
     reward_wic_consistency,
-    reward_wic_wordnet,
     reward_think_length,
 ]
 
-# Gold columns the reward fns (and the trace saver) read off the dataset.
-# ``pos`` is required by reward_wic_wordnet: `gloss_wordnet` keys its synset lookup
-# on (lemma, pos), and adjectives have to query both 'a' and 's'.
 KEEP_COLS = ["lemma", "pos", "label"]
-
-
-# --------------------------------------------------------------------------- #
-# Self-distillation: log successful reasoning traces for later SFT
-# --------------------------------------------------------------------------- #
-def make_trace_saver(path, threshold):
-    """Pass-through reward fn that appends high-reward completions to a JSONL.
-
-    Returns all-zero rewards, so it never perturbs training (a constant reward
-    yields zero advantage after GRPO's group normalisation). "Successful" means the
-    verifiable verdict was correct, so ``reward_wic_accuracy`` is what gates the
-    write. It records the prompt + generated reasoning/verdict + score + gold
-    columns; a downstream builder can turn the best generations into an SFT dataset.
-
-    Writes one file per process rank to avoid interleaved appends under
-    multi-GPU launches.
-    """
-    rank = os.environ.get("RANK") or os.environ.get("LOCAL_RANK") or "0"
-    out_path = Path(f"{path}.rank{rank}.jsonl")
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-
-    def save_successful_traces(completions, **kwargs):
-        scores = reward_wic_accuracy(completions, **kwargs)
-        prompts = kwargs.get("prompts")
-        with out_path.open("a", encoding="utf-8") as f:
-            for i, (c, s) in enumerate(zip(completions, scores)):
-                if s < threshold:
-                    continue
-                rec = {"score": round(float(s), 4), "completion": c}
-                if prompts is not None:
-                    rec["prompt"] = prompts[i]
-                for col in KEEP_COLS:
-                    rec[col] = kwargs[col][i]
-                f.write(json.dumps(rec, ensure_ascii=False) + "\n")
-        return [0.0] * len(completions)
-
-    # GRPOTrainer logs/derives metric names from the fn name.
-    save_successful_traces.__name__ = "save_successful_traces"
-    return save_successful_traces
