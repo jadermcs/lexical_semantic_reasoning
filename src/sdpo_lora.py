@@ -109,7 +109,6 @@ def main():
     ap.add_argument("--vllm-gpu-mem", type=float, default=0.3)
     ap.add_argument("--distill-threshold", type=float, default=0.5)
     ap.add_argument("--max-completion-length", type=int, default=512)
-    ap.add_argument("--soft-punish-cache", type=int, default=128)
     ap.add_argument("--beta", type=float, default=0.0)
     ap.add_argument(
         "--distillation-weight",
@@ -247,12 +246,6 @@ def main():
 
     reward_funcs = [as_text_reward(f) for f in REWARDS]
     reward_funcs.append(get_repetition_penalty_reward(ngram_size=3, max_penalty=-0.2))
-    reward_funcs.append(
-        get_soft_overlong_punishment(
-            max_completion_len=args.max_completion_length,
-            soft_punish_cache=args.soft_punish_cache,
-        )
-    )
 
     trainer = SDPOTrainer(
         model=model,
