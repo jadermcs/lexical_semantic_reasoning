@@ -213,6 +213,50 @@ schema** (one greedy sample per pair: single-element `answers`/`reasonings`), so
 the file plugs straight into `sft_sense.py --data`. Metrics are printed, not
 saved.
 
+### Gloss quality against gold definitions (`eval_gloss.py`)
+
+`same_sense` is the only thing the pipeline verifies; `sense1`/`sense2` are never
+checked against anything. `eval_gloss.py` scores them directly, given a
+definition-modelling file — one record per usage:
+
+```json
+[{"lemma": "bank", "word": "banks", "pos": "noun",
+  "usage": "The river banks were flooded.",
+  "definition": "sloping land beside a body of water"}]
+```
+
+`lemma`, `word`, `usage`, `definition` are required (`word` is the surface form
+in `usage`, and it is what gets `<t>`-tagged); `pos` falls back to
+`--default-pos`.
+
+**The prompt adaptation.** The policy only knows *pairs*, so a lone usage is off
+distribution. Each record is rendered as **sentence 1** of an ordinary WiC prompt
+and **sentence 2 is a constant filler** — "bank" in its financial-institution
+sense (`--filler-usage` / `--filler-word`). Only `sense1` is scored; `sense2` and
+the verdict are discarded. Because the filler never varies, a `sense1` that
+matches its gloss is the model ignoring sentence 1 — reported as
+`filler_echo_rate` (records whose own gold sense is the filler's are excluded
+from it).
+
+```bash
+uv run --with sacrebleu python src/eval_gloss.py \
+    --model ./qwen-sense-grpo-wic --data data/gloss_eval.json
+uv run --with sacrebleu python src/eval_gloss.py \
+    --score-only gloss_eval_predictions.json     # re-score on CPU, no vLLM
+```
+
+| Metric | What it says |
+|--------|--------------|
+| `f1` | content-token F1 vs the gold definition — same tokens/stoplist `gloss_wordnet` snaps with, so it is comparable to the verifier and to `analysis/gloss_quality.py` |
+| `bleu` / `chrf` | sentence-level means + corpus BLEU (`sacrebleu`). Very noisy on ~10-token definitions: read the gap between checkpoints, never the absolute number |
+| `cos` | sentence-transformer cosine — the only metric that survives full paraphrase (`--no-sbert` to skip) |
+| `sense_acc` | among gold definitions sharing the record's (lemma, pos), is its own the nearest to the generated gloss? Scored only on lemmas with 2+ senses in the file — this is what catches a definition-shaped gloss of the *wrong* sense |
+| `filler_echo_rate` | leak check, above |
+| `empty` | no parseable gloss (0 unless `--no-force-json`, which turns off the constrained decode) |
+
+Output is `{"summary": ..., "records": [...]}` with per-record scores, so a run
+can be re-scored or diffed without regenerating.
+
 ---
 
 ## 5. Self-distillation
@@ -253,7 +297,9 @@ the wired one.
 | `src/semcor_pairs.py` | Builds gold-sense WiC pairs from `data/semcor_en.json.gz` (glosses + candidate sense inventory) |
 | `src/sense_rewards.py` | The reward functions |
 | `src/eval_sense.py` | Test-split generation + accuracy/F1; emits teacher-schema predictions |
+| `src/eval_gloss.py` | Gloss generation vs gold definitions (F1 / BLEU / chrF / SBERT / sense accuracy) |
 | `tests/test_sense_rewards.py` | Reward contracts (runs on CPU in a second) |
+| `tests/test_eval_gloss.py` | Gloss-eval prompt adaptation + metrics (CPU) |
 | `run_train.sh` / `run_infer.sh` | Launchers for the GRPO trainer and the vLLM rollout server |
 
 ```bash

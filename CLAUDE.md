@@ -21,6 +21,8 @@ uv run python src/prepare_data.py --data data/mcl_semcor_filtered.json --reasoni
 uv run python src/sft_sense.py --data data/sft_wic
 uv run python src/grpo_sense.py --model ./qwen-sense-sft-sft_wic
 uv run python src/eval_sense.py --model ./qwen-sense-grpo-wic --force-json
+# gloss quality vs gold definitions (lemma/word/usage/definition records)
+uv run --with sacrebleu python src/eval_gloss.py --model ./qwen-sense-grpo-wic --data data/gloss_eval.json
 ```
 
 The heavy stack (torch, trl, vLLM) runs on the servers via `run_train.sh` (GRPO trainer) and `run_infer.sh` (`trl vllm-serve` rollout server); data prep and tests run locally. Both scripts `uv sync` from the shared `uv.lock`, and torch/vLLM resolve from the cu130 wheel index pinned in `pyproject.toml` to keep CUDA ABIs compatible.
