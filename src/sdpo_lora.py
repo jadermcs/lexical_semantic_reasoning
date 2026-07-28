@@ -6,9 +6,11 @@ from pathlib import Path
 
 from datasets import Dataset, concatenate_datasets
 from transformers import AutoTokenizer
+from transformers.trainer_callback import TrainerCallback
 from transformers.trainer_utils import get_last_checkpoint
 from trl.experimental.sdpo import SDPOConfig, SDPOTrainer
-from trl.rewards import get_repetition_penalty_reward, get_soft_overlong_punishment
+from trl.experimental.sdpo.sdpo_trainer import SuccessfulRolloutTeacherContextBuilder
+from trl.rewards import get_repetition_penalty_reward
 
 import semcor_pairs
 import sense_data as sd
@@ -65,6 +67,112 @@ def format_prompt(rec, with_feedback=True):
         # MCL-WiC has only the label, so the best available hint is the one bit.
         out["privileged_context"] = gold_feedback(rec)
     return out
+
+
+class FailedRolloutContextBuilder(SuccessfulRolloutTeacherContextBuilder):
+    """Restrict self-distillation to rollouts that actually failed.
+
+    ``dont_reprompt_on_self_success`` reads as if it already did this ("Skip
+    reprompting when model generates correct response"), but its implementation
+    (``sdpo_trainer.py``, the ``if dont_reprompt_self and j == i`` line) only bars a
+    rollout from being its *own* demonstration: a rollout that scored above
+    ``success_reward_threshold`` still gets a *sibling's* demonstration and is still
+    distilled. At ~0.65 train accuracy over 8 rollouts almost every group has a
+    success, which is why ``success_sample_fraction`` logged 0.95 and
+    ``reprompt_sample_fraction`` logged 1.0 — every token in the batch was pulled
+    toward the frozen SFT teacher, including the correct rollouts GRPO was busy
+    reinforcing. The two objectives then fight, and the reward term loses (see
+    --distillation-weight).
+
+    Zeroing the mask on successful rollouts restores the intended semantics: the
+    policy gradient owns the rollouts that worked, distillation only densifies the
+    ones that failed.
+    """
+
+    def __init__(self, trainer, failures_only=True):
+        super().__init__(trainer)
+        self.failures_only = failures_only
+
+    def build(self, output, prompts, rewards, feedbacks=None):
+        ctx = super().build(output, prompts, rewards, feedbacks=feedbacks)
+        # ``rewards`` and the returned mask are both already sliced to this process.
+        # Stash them for RolloutDumpCallback: the trainer fires
+        # on_self_distillation_batch_prepared a few lines after this returns, but does
+        # not pass rewards along, and this is the last place they are in scope.
+        self.trainer._last_rollout_rewards = rewards.detach().clone()
+        if not self.failures_only:
+            return ctx
+        failed = (rewards < self.trainer.args.success_reward_threshold).float()
+        mask = ctx["self_distillation_mask"] * failed
+        ctx["self_distillation_mask"] = mask
+        self.last_metrics["self_distillation/reprompt_sample_fraction"] = (
+            self.trainer.accelerator.gather(mask).mean().item()
+        )
+        return ctx
+
+
+class RolloutDumpCallback(TrainerCallback):
+    """Write rollout text to disk, since SDPO has nowhere to log it.
+
+    ``SDPOConfig`` subclasses ``_BaseConfig``, not ``GRPOConfig``, so it has no
+    ``log_completions``/``num_completions_to_print`` — the knobs grpo_lora.py sets.
+    Every SDPO run so far therefore produced reward curves with no rollout text to
+    explain them. ``SDPOTrainer`` instead exposes its own hooks via
+    ``_dispatch_self_distillation_callback``, which calls any same-named method on a
+    registered callback; ``on_self_distillation_batch_prepared`` is the one that fires
+    once the rollouts, the teacher reprompts and the distillation mask all exist.
+
+    Each record pairs the student's completion with the teacher reprompt actually built
+    for it, so a run can be read as "what did the policy say, what was the teacher shown
+    instead, and was this rollout in the distillation set".
+    """
+
+    def __init__(self, trainer, path, every=25, per_step=8):
+        self.trainer = trainer
+        self.path = Path(path)
+        self.every = every
+        self.per_step = per_step
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+
+    def on_self_distillation_batch_prepared(
+        self,
+        args=None,
+        state=None,
+        model=None,
+        processing_class=None,
+        prompt_ids=None,
+        completion_ids=None,
+        teacher_input_ids=None,
+        self_distillation_mask=None,
+        **kwargs,
+    ):
+        # Eval fires this too, with num_generations_eval=1 and no gradient; only the
+        # training rollouts are worth the disk.
+        if not model.training or state.global_step % self.every:
+            return
+        if not state.is_world_process_zero:
+            # Every tensor here is this rank's slice, so on multi-GPU each rank would
+            # dump a different, equally valid shard. Keep one file.
+            return
+
+        pad = processing_class.pad_token_id
+        rewards = getattr(self.trainer, "_last_rollout_rewards", None)
+        mask = self_distillation_mask
+
+        def text(ids):
+            return processing_class.decode(ids[ids != pad], skip_special_tokens=True)
+
+        with self.path.open("a") as fh:
+            for i in range(min(self.per_step, completion_ids.size(0))):
+                rec = {
+                    "step": state.global_step,
+                    "reward": None if rewards is None else round(rewards[i].item(), 4),
+                    "distilled": None if mask is None else bool(mask[i].item()),
+                    "prompt": text(prompt_ids[i]),
+                    "completion": text(completion_ids[i]),
+                    "teacher_reprompt": text(teacher_input_ids[i]),
+                }
+                fh.write(json.dumps(rec) + "\n")
 
 
 def as_text_reward(fn):
@@ -131,7 +239,7 @@ def main():
     ap.add_argument(
         "--generation-batch",
         type=int,
-        default=64,
+        default=256,
         help="Completions per optimizer step; grad-accum is derived from it as "
         "(this // --batch-size). Prompt groups per step = this // --num-generations, "
         "and that is what the gradient averages over. Deriving grad-accum this way "
@@ -145,24 +253,85 @@ def main():
     ap.add_argument("--vllm-server-host", default=None)
     ap.add_argument("--vllm-server-port", type=int, default=8000)
     ap.add_argument("--vllm-gpu-mem", type=float, default=0.3)
-    ap.add_argument("--distill-threshold", type=float, default=0.5)
     ap.add_argument("--max-completion-length", type=int, default=512)
     ap.add_argument("--beta", type=float, default=0.0)
     ap.add_argument(
         "--distillation-weight",
         type=float,
-        default=0.3,
+        default=0.1,
         help="Convex blend: loss = (1-w)*policy_grad + w*self_distillation. 1.0 is "
-        "pure SDPO, 0.0 collapses to GRPO. Keep it a minority of the loss so the "
-        "verifiable reward drives the update and the teacher only densifies the "
-        "zero-variance groups: at 0.55 distillation outvoted the reward, and since the "
-        "distillation term is masked by completion_mask alone (no reward gating — see "
-        "sdpo_trainer._compute_self_distillation_loss) it kept training on runaway "
-        "rollouts that the reward had already condemned.",
+        "pure SDPO, 0.0 collapses to GRPO. 0.1 is the paper's value: SDPO section 4.5 "
+        "writes the hybrid as lambda*A_GRPO + (1-lambda)*A_SDPO with lambda=0.9, i.e. "
+        "w = 1 - lambda = 0.1, and Figure 11 measures it on Qwen3-0.6B specifically, "
+        "where the hybrid beats pure SDPO because 'in a weaker model the SDPO "
+        "advantages are less reliable'. w is NOT the effective share of the gradient: "
+        "the policy term is bounded by |advantage| (~0.02/token as logged) while the "
+        "distillation term is |student_logp - teacher_logp| against a teacher shown "
+        "the answer (~0.14/token as logged), a ~7x gap. At the old default of 0.3 "
+        "distillation therefore carried ~2x the policy gradient and dev accuracy fell "
+        "monotonically (0.82 -> 0.75 over 300 steps) while the same run at w=0.0 held "
+        "0.80-0.85 for 2000 steps. Compare self_distillation/policy_loss against "
+        "self_distillation/distillation_loss in wandb when retuning.",
     )
-    ap.add_argument("--teacher-kind", default="base", choices=["base", "live", "ema"])
     ap.add_argument(
-        "--teacher-update-rate", type=float, default=0.05, help="EMA teacher rate."
+        "--distill-failures-only",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Apply the distillation term only to rollouts that scored below "
+        "--success-reward-threshold. On by default because TRL's "
+        "dont_reprompt_on_self_success does not do it (see FailedRolloutContextBuilder) "
+        "and without it the teacher overrides the reward on rollouts that were already "
+        "correct.",
+    )
+    ap.add_argument(
+        "--no-successful-teacher",
+        action="store_true",
+        help="Do not reprompt the teacher with a successful sibling rollout, leaving "
+        "the privileged context as the only teacher conditioning. This is the flag to "
+        "use when the question is what the feedback is worth: with the demonstration "
+        "path on, environment_feedback_only_without_solution routes ~95%% of samples "
+        "to a sibling's answer and only ~5%% to the hint, so the run measures "
+        "demonstration copying, not feedback.",
+    )
+    ap.add_argument(
+        "--teacher-kind",
+        default="ema",
+        choices=["base", "live", "ema"],
+        help="SDPO Table 4 ranks these on best/avg accuracy: trust-region 50.6/45.6 > "
+        "ema 49.3/45.3 > frozen-at-init 48.8/44.4 >> unregularized live 36.1/29.8, "
+        "which diverges. 'base' is the frozen-at-init row (the merged SFT weights, "
+        "reached by disabling the adapter); it works, but caps the student at what the "
+        "SFT model can recognise, and the paper's bootstrapping claim (Figure 10 right: "
+        "the student surpasses the initial teacher) rests on the teacher improving too. "
+        "Switching costs nothing at step 0: trl builds the EMA teacher as a second LoRA "
+        "adapter initialised to zero, and a zero LoRA *is* the base model, so 'ema' "
+        "starts identical to 'base' and only diverges as the EMA fills in. Never "
+        "'live' — Table 4's unregularized teacher diverges.",
+    )
+    ap.add_argument(
+        "--teacher-update-rate",
+        type=float,
+        default=0.01,
+        help="EMA teacher rate. SDPO Table 12 uses 0.01 for the with-feedback setup "
+        "(0.05 is their no-feedback value); Table 4's regularized teachers use 0.01.",
+    )
+    ap.add_argument(
+        "--temperature",
+        type=float,
+        default=0.6,
+        help="Rollout temperature. SDPO trains at 1.0 and only validates at 0.6/0.95 "
+        "(Table 12); 0.6 here matches the repo's eval convention, but it is also why "
+        "success_group_fraction sits at ~0.95 — low-temperature rollouts rarely "
+        "disagree, so few groups are hard enough for the distillation term to matter.",
+    )
+    ap.add_argument(
+        "--distillation-topk",
+        type=int,
+        default=20,
+        help="Support size for logit-level distillation. SDPO Figure 10 finds "
+        "logit-level > token-level > sequence-level credit assignment, and Table 12 "
+        "uses K=20 for the with-feedback setup (K=100 without). Set to 0 to fall back "
+        "to TRL's token-level 'sampled_token' mode.",
     )
     ap.add_argument(
         "--success-reward-threshold",
@@ -173,6 +342,46 @@ def main():
         "/ -1.0 no verdict), whose ceiling puts a perfectly-formed wrong answer at "
         "0.0, so 1.0 means 'correct verdict and reasonably well formed' and no "
         "incorrect rollout can qualify.",
+    )
+    ap.add_argument(
+        "--dump-rollouts",
+        type=int,
+        default=25,
+        metavar="EVERY_N_STEPS",
+        help="Append rollout text to <output-dir>/rollouts.jsonl every N steps (0 "
+        "disables). SDPOConfig has no log_completions — it subclasses _BaseConfig, not "
+        "GRPOConfig — so this is the only way to see what the policy actually wrote; "
+        "each record carries the reward, whether the rollout was in the distillation "
+        "set, the completion, and the teacher reprompt built for it.",
+    )
+    ap.add_argument(
+        "--eval-prompts",
+        type=int,
+        default=0,
+        help="Dev prompts per eval; 0 uses the whole 1000-pair dev split. The eval "
+        "subset is FIXED (shuffle(seed=42).select), so the wobble between evals is "
+        "pure sampling noise, sd ~= sqrt(p(1-p)/(prompts * generations)). At the old "
+        "200x1 that floor was ~0.037 in reward units against an observed 0.062. "
+        "Spending a fixed generation budget on more prompts beats spending it on more "
+        "generations: both cut variance by the same 1/(n*k), but more prompts also "
+        "kills the bias of scoring a 200-pair slice of dev.",
+    )
+    ap.add_argument(
+        "--num-generations-eval",
+        type=int,
+        default=1,
+        help="Rollouts per dev prompt. SDPO Table 12 validates with 4 (with-feedback "
+        "setup) at temp 0.6/top-p 0.95. Raise --eval-prompts first; this only helps "
+        "once you are already scoring all of dev. Must divide --batch-size, which trl "
+        "uses as the eval batch (grpo_config.py:1082).",
+    )
+    ap.add_argument(
+        "--eval-steps",
+        type=int,
+        default=200,
+        help="Optimizer steps between evals. Scoring all of dev costs ~5x the old "
+        "200-prompt eval, so this moves 50 -> 200 to hold the overhead near 9%% of "
+        "wall-clock rather than 36%%.",
     )
     ap.add_argument("--resume", nargs="?", const=True, default=None)
     ap.add_argument(
@@ -234,6 +443,13 @@ def main():
             f"--generation-batch ({args.generation_batch}) must be divisible by "
             f"--num-generations ({args.num_generations})"
         )
+    if args.batch_size % args.num_generations_eval:
+        # trl raises this only after the datasets are built (grpo_config.py:1082); an
+        # eval config error should not cost a SemCor build first.
+        ap.error(
+            f"--batch-size ({args.batch_size}) is the eval batch and must be divisible "
+            f"by --num-generations-eval ({args.num_generations_eval})"
+        )
     grad_accum = args.generation_batch // args.batch_size
     prompt_groups = args.generation_batch // args.num_generations
     print(
@@ -259,7 +475,9 @@ def main():
     train_ds = build_dataset("train", with_feedback=with_feedback, semcor=semcor_cfg)
     # Dev stays pure MCL-WiC: it is the in-domain read on the benchmark, and mixing a
     # second distribution into it would make the eval curve unreadable.
-    dev_ds = build_dataset("dev", cap=200, with_feedback=with_feedback)
+    dev_ds = build_dataset(
+        "dev", cap=args.eval_prompts or None, with_feedback=with_feedback
+    )
     print(train_ds[0])
 
     model, peft_config = load_policy(
@@ -267,7 +485,15 @@ def main():
         dict(r=args.lora_r, lora_alpha=args.lora_alpha, lora_dropout=args.lora_dropout),
     )
 
-    prompt_headroom = 512
+    # Longest rendered prompt measured over the sources this script can build:
+    # MCL-WiC tops out at 399 tokens, but SemCor sentences are untrimmed corpus
+    # sentences and reach 667. At the old headroom of 512 the vLLM context was
+    # 512+512=1024, so ~0.1% of SemCor prompts left less than max_completion_length
+    # of room; vLLM clamps rather than errors, so those rollouts came back truncated
+    # and mask_truncated_completions silently dropped them. 768 clears the measured
+    # max with margin. max_reprompt_len derives from it and stays far above the
+    # longest teacher reprompt (1213 tokens: prompt + a full-length demonstration).
+    prompt_headroom = 768
     if args.vllm_server_host:
         vllm_kwargs = dict(
             use_vllm=True,
@@ -283,18 +509,30 @@ def main():
             vllm_max_model_length=prompt_headroom + args.max_completion_length,
         )
 
+    if args.distillation_topk:
+        # Logit-level SDPO. The tail bucket is the "term capturing the tail
+        # probability" of the paper's top-K approximation (their Appendix A.3);
+        # without it the divergence is over the renormalised top-K only.
+        distill_mode_kwargs = dict(
+            distillation_mode="topk_logits",
+            distillation_topk=args.distillation_topk,
+            distillation_add_tail=True,
+        )
+    else:
+        distill_mode_kwargs = dict(distillation_mode="sampled_token")
+
     run_name = "qwen-lora-sdpo-wic"
     output_dir = f"./{run_name}"
     training_args = SDPOConfig(
         output_dir=output_dir,
         num_generations=args.num_generations,
-        num_generations_eval=1,
+        num_generations_eval=args.num_generations_eval,
         max_completion_length=args.max_completion_length,
         mask_truncated_completions=True,
         beta=args.beta,
         disable_dropout=True,
         optim="paged_adamw_8bit",
-        temperature=0.6,
+        temperature=args.temperature,
         top_p=0.95,
         top_k=20,
         min_p=0.0,
@@ -307,7 +545,7 @@ def main():
         lr_scheduler_type="cosine",
         bf16=True,
         eval_strategy="steps",
-        eval_steps=50,
+        eval_steps=args.eval_steps,
         save_strategy="steps",
         save_steps=100,
         save_total_limit=6,
@@ -315,12 +553,14 @@ def main():
         report_to="wandb",
         run_name=run_name,
         scale_rewards="none",
-        distillation_mode="sampled_token",
+        # Reverse-KL is SDPO Table 12's with-feedback divergence (Jensen-Shannon is
+        # their no-feedback one). alpha=1.0 is reverse KL in trl's parameterisation.
         distillation_alpha=1.0,
+        **distill_mode_kwargs,
         distillation_weight=args.distillation_weight,
         teacher_model_kind=args.teacher_kind,
         teacher_update_rate=args.teacher_update_rate,
-        use_successful_as_teacher=True,
+        use_successful_as_teacher=not args.no_successful_teacher,
         success_reward_threshold=args.success_reward_threshold,
         dont_reprompt_on_self_success=True,
         include_environment_feedback=with_feedback,
@@ -344,6 +584,19 @@ def main():
         eval_dataset=dev_ds,
         peft_config=peft_config,
     )
+
+    # Installed unconditionally: even with --no-distill-failures-only it is what stashes
+    # the rewards RolloutDumpCallback reads back.
+    trainer.teacher_context_builder = FailedRolloutContextBuilder(
+        trainer, failures_only=args.distill_failures_only
+    )
+
+    if args.dump_rollouts:
+        dump_path = Path(output_dir) / "rollouts.jsonl"
+        trainer.add_callback(
+            RolloutDumpCallback(trainer, dump_path, every=args.dump_rollouts)
+        )
+        print(f"dumping rollout text every {args.dump_rollouts} steps → {dump_path}")
 
     if args.resume:
         ckpt = (
