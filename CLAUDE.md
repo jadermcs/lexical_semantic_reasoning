@@ -35,7 +35,9 @@ Pipeline flow: `call_api.py` (teacher self-consistency, k=3) → `filter_reasoni
 
 `src/sense_data.py` holds record loading, the shared prompts, per-task message builders, and answer parsing used by everything downstream. Scripts import siblings as top-level modules (`import sense_data`), so `pythonpath = ["src"]` in pyproject makes tests resolve the same way.
 
-**Reward invariant** (`src/sense_rewards.py`, importable without torch/trl): the accuracy term (±1.0) dominates the shaping terms (JSON validity, format, think-length), so being right always beats being tidy. A test in `tests/test_sense_rewards.py` pins this — don't rescale terms without checking it.
+**Reward invariant** (`src/sense_rewards.py`, importable without torch/trl): the accuracy term (±1.0) dominates the shaping terms (JSON validity, format, think-length, gloss grounding), so being right always beats being tidy. A test in `tests/test_sense_rewards.py` pins this — don't rescale terms without checking it. Shaping currently spans 1.4 against an accuracy gap of 1.5, so a new term costs at most 0.1 unless an existing one shrinks.
+
+**Gold-gloss grounding.** `src/semcor_pairs.py` turns `data/semcor_en.json.gz` into WiC pairs that carry a gold gloss per usage plus `senses`, the lemma's full WordNet 3.0 gloss inventory (`uv run python src/semcor_pairs.py` → `data/semcor_wic.json`; mix in with `grpo_lora.py --semcor-pairs`). `reward_wic_gloss` scores an emitted gloss by its token-F1 *margin* over the lemma's rival senses, never by absolute similarity to gold — WordNet's wording is terse enough that a level punishes valid paraphrase. Everything stays inside WordNet 3.0; never compare a synset ID against `gloss_wordnet`'s OEWN ones, the ID spaces are disjoint.
 
 Model output contract: `<think>...</think>` followed by `{"sense1": ..., "sense2": ..., "same_sense": bool}`. Only `same_sense` is scored; the glosses force per-usage commitment.
 

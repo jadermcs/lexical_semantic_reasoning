@@ -197,13 +197,127 @@ class TestThinkLength:
 
 
 # --------------------------------------------------------------------------- #
+# Gold-gloss grounding (SemCor pairs)
+# --------------------------------------------------------------------------- #
+BANK_SENSES = [
+    "sloping land (especially the slope beside a body of water)",
+    "a financial institution that accepts deposits and channels the money into lending activities",
+    "a long ridge or pile",
+]
+
+
+def gloss_kwargs(gold1, gold2, senses=BANK_SENSES):
+    return {"gloss1": [gold1], "gloss2": [gold2], "senses": [senses]}
+
+
+class TestWicGloss:
+    def _score(self, sense1, sense2, gold1, gold2, senses=BANK_SENSES):
+        c = wrap(GOOD_THINK, json.dumps(
+            {"sense1": sense1, "sense2": sense2, "same_sense": False}
+        ))
+        [r] = R.reward_wic_gloss([c], **gloss_kwargs(gold1, gold2, senses))
+        return r
+
+    def test_glosses_naming_the_gold_senses_are_rewarded(self):
+        r = self._score(
+            "the sloping land beside a body of water",
+            "a financial institution that accepts deposits",
+            BANK_SENSES[0],
+            BANK_SENSES[1],
+        )
+        assert r == pytest.approx(R.GLOSS_MAX)
+
+    def test_glosses_naming_the_wrong_sense_of_the_lemma_are_punished(self):
+        # Both glosses are perfectly good English and the verdict could still be
+        # right -- they just describe the *other* sense. This is precisely what the
+        # binary verifier cannot see.
+        r = self._score(
+            "a financial institution that accepts deposits",
+            "the sloping land beside a body of water",
+            BANK_SENSES[0],
+            BANK_SENSES[1],
+        )
+        assert r == pytest.approx(-R.GLOSS_MAX)
+
+    def test_one_right_one_wrong_lands_between(self):
+        r = self._score(
+            "the sloping land beside a body of water",   # matches gold1
+            "a long ridge or pile",                      # gold2 is the financial sense
+            BANK_SENSES[0],
+            BANK_SENSES[1],
+        )
+        assert -R.GLOSS_MAX < r < R.GLOSS_MAX
+
+    def test_the_term_is_bounded_by_gloss_max(self):
+        # Bounded regardless of how lopsided the margin is, so the shaping budget the
+        # invariant tests below reserve cannot be overrun by an unusual lemma.
+        for r in (
+            self._score(BANK_SENSES[0], BANK_SENSES[1], BANK_SENSES[0], BANK_SENSES[1]),
+            self._score(BANK_SENSES[1], BANK_SENSES[0], BANK_SENSES[0], BANK_SENSES[1]),
+        ):
+            assert abs(r) <= R.GLOSS_MAX + 1e-9
+
+    def test_paraphrase_that_beats_every_rival_still_scores(self):
+        # Absolute overlap with gold is low (one content word), but no other sense of
+        # 'bank' fits at all -- a level-based score would punish this, a margin does not.
+        r = self._score(
+            "a place where money is kept",
+            "a place where money is kept",
+            BANK_SENSES[1],
+            BANK_SENSES[1],
+        )
+        assert r > 0
+
+    def test_gloss_sharing_no_content_word_with_any_sense_is_neutral(self):
+        # ~29% of glosses share zero content tokens with WordNet's terse wording;
+        # punishing them would reject almost indiscriminately (gloss_wordnet's
+        # gloss_unanchored calibration), so no evidence means no score.
+        assert self._score("qqq zzz", "qqq zzz", BANK_SENSES[0], BANK_SENSES[1]) == 0.0
+
+    def test_mclwic_rows_without_gold_glosses_are_neutral(self):
+        # Mixed rollout sets are the normal case: MCL-WiC carries the label only.
+        assert self._score("a river bank", "a place for money", "", "") == 0.0
+
+    def test_missing_gloss_columns_are_neutral(self):
+        c = wrap(GOOD_THINK, JSON_ANSWER)
+        assert R.reward_wic_gloss([c], label=[False]) == [0.0]
+
+    @pytest.mark.parametrize(
+        "answer",
+        [
+            "The two uses are different.",                        # no JSON at all
+            '{"sense1": "", "sense2": "", "same_sense": false}',   # empty glosses
+            '{"same_sense": false}',                              # no glosses
+        ],
+    )
+    def test_unscorable_answers_are_neutral(self, answer):
+        c = wrap(GOOD_THINK, answer)
+        [r] = R.reward_wic_gloss([c], **gloss_kwargs(BANK_SENSES[0], BANK_SENSES[1]))
+        assert r == 0.0
+
+    def test_monosemous_lemma_is_not_scored(self):
+        # One candidate sense means no rival to lose to, so the margin degenerates into
+        # the absolute similarity this term is built to avoid — and 19% of the SemCor
+        # pairs are such lemmas, which would be a lot of free reward for restating the
+        # only gloss there is.
+        r = self._score("a domestic dog", "a domestic dog", "a domestic dog",
+                        "a domestic dog", senses=["a domestic dog"])
+        assert r == 0.0
+
+
+# --------------------------------------------------------------------------- #
 # Registry wiring
 # --------------------------------------------------------------------------- #
+SHAPE_CEILING = (
+    0.2 + R.WIC_JSON_PARSES + R.WIC_JSON_KEYS + R.WIC_JSON_BOOL + R.GLOSS_MAX
+)
+SHAPE_FLOOR = R.THINK_MIN_PENALTY + R.WIC_INCONSISTENT - R.GLOSS_MAX
+
+
 def test_accuracy_dominates_the_shape_rewards():
     # Being right must always beat being merely well-formatted, or the policy can
     # farm the format terms while answering wrongly.
-    shape_ceiling = 0.2 + R.WIC_JSON_PARSES + R.WIC_JSON_KEYS + R.WIC_JSON_BOOL
-    assert shape_ceiling < R.WIC_CORRECT
+    assert SHAPE_CEILING < R.WIC_CORRECT
 
 
 def test_shape_range_cannot_close_the_accuracy_gap():
@@ -214,19 +328,35 @@ def test_shape_range_cannot_close_the_accuracy_gap():
     # the full shape *span* stays narrower than the accuracy gap — otherwise shaping
     # alone could rank a correct answer below a wrong one.
     #
-    # This is the constraint any new shaping term has to buy its way into. With
-    # reward_wic_wordnet removed the span is 1.1 against a gap of 1.5, so there is 0.4
-    # of headroom; a further penalty of more than that has to be paid for by shrinking
-    # an existing one.
-    shape_ceiling = 0.2 + R.WIC_JSON_PARSES + R.WIC_JSON_KEYS + R.WIC_JSON_BOOL
-    shape_floor = R.THINK_MIN_PENALTY + R.WIC_INCONSISTENT
-    assert shape_ceiling - shape_floor < R.WIC_CORRECT - R.WIC_WRONG
+    # This is the constraint any new shaping term has to buy its way into. The other
+    # terms span 1.1 against a gap of 1.5, so there was 0.4 of headroom;
+    # reward_wic_gloss spends 0.3 of it (±GLOSS_MAX), leaving 0.1. A further term of
+    # more than that has to be paid for by shrinking an existing one.
+    assert SHAPE_CEILING - SHAPE_FLOOR < R.WIC_CORRECT - R.WIC_WRONG
 
 
-def _total(completion, label, lemma="bank", pos="noun"):
+def _total(completion, label, lemma="bank", pos="noun", **extra):
     return sum(
-        f([completion], label=[label], lemma=[lemma], pos=[pos])[0] for f in R.REWARDS
+        f([completion], label=[label], lemma=[lemma], pos=[pos], **extra)[0]
+        for f in R.REWARDS
     )
+
+
+def test_a_correct_verdict_with_wrong_glosses_still_beats_a_wrong_verdict():
+    # The gloss term is grounded in gold, so it is the shaping term most tempted to
+    # overrule the verdict. It must not: worst-case gloss score on a correct answer
+    # still has to outrank best-case gloss score on a wrong one.
+    # The two completions are identical in shape and both take the same format, JSON
+    # and consistency credit, so flipping the gold label is what isolates the pair of
+    # terms under test: accuracy against gloss grounding.
+    kw = gloss_kwargs(BANK_SENSES[0], BANK_SENSES[1])
+    swapped = wrap(GOOD_THINK, json.dumps(
+        {"sense1": BANK_SENSES[1], "sense2": BANK_SENSES[0], "same_sense": False}
+    ))
+    grounded = wrap(GOOD_THINK, json.dumps(
+        {"sense1": BANK_SENSES[0], "sense2": BANK_SENSES[1], "same_sense": False}
+    ))
+    assert _total(swapped, False, **kw) > _total(grounded, True, **kw)
 
 
 def test_an_ugly_correct_answer_still_beats_a_pretty_wrong_one():
@@ -260,8 +390,11 @@ def test_every_reward_is_registered():
         R.reward_wic_json,
         R.reward_wic_consistency,
         R.reward_think_length,
+        R.reward_wic_gloss,
     ]
-    # build_dataset drops every column not listed here. No reward reads `pos` since
-    # reward_wic_wordnet was removed, but sense_data.wic_messages renders it into the
-    # prompt and pair_key is built from it, so it stays.
-    assert R.KEEP_COLS == ["lemma", "pos", "label"]
+    # build_dataset drops every column not listed here, so a reward kwarg missing from
+    # KEEP_COLS silently becomes "not scoreable". No reward reads `pos`, but
+    # sense_data.wic_messages renders it into the prompt and pair_key is built from it,
+    # so it stays.
+    assert R.KEEP_COLS == ["lemma", "pos", "label", "gloss1", "gloss2", "senses"]
+    assert set(R.GLOSS_COLS) <= set(R.KEEP_COLS)

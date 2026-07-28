@@ -48,6 +48,8 @@ emits its reasoning and then a single JSON verdict:
 | `data/mcl.json` | Teacher predictions over the MCL-WiC training pairs (8 000 pairs). |
 | `data/semcor.json` | Teacher predictions over WiC pairs constructed from SemCor's sense annotations (~10 000 pairs; built outside this repo). |
 | `data/mcl_semcor.json` | The two merged and label-balanced: 17 002 pairs, exactly 8 501 *same* / 8 501 *different*. Default SFT corpus. |
+| `data/semcor_en.json.gz` | Raw SemCor, built outside this repo: one record per sense-annotated token, with exact character offsets and the gold WordNet synset. |
+| `data/semcor_wic.json` | WiC pairs built from it by `src/semcor_pairs.py` — the only pairs carrying a **gold gloss per usage**, which is what `reward_wic_gloss` scores. |
 
 ### Teacher sampling (`call_api.py`)
 
@@ -155,10 +157,41 @@ Defined in `sense_rewards.py` (importable without torch/trl, unit-tested in
 | `reward_wic_accuracy` | ±1.0 | the verdict is right (exact — the gold label is known) |
 | `reward_wic_json` | −0.2 … +0.3 | a parseable JSON object, exactly the three keys, a real boolean verdict |
 | `reward_wic_format` | 0 … +0.2 | a `<think>` block and an extractable verdict |
+| `reward_wic_consistency` | −0.3 … 0 | punishes glosses that contradict the verdict (identical glosses called *different*, unrelated glosses called *same*) |
 | `reward_think_length` | −0.3 … 0 | punishes a stubbed, missing or unclosed `<think>` |
+| `reward_wic_gloss` | ±0.15 | the two glosses name the **gold** senses (SemCor pairs only) |
 
 The shape terms are capped well below the accuracy term, so **being right always
 beats being tidy** — a test pins that invariant.
+
+#### Gold-gloss grounding (`reward_wic_gloss`)
+
+The verdict is one bit, and a bit is a weak verifier: rejection sampling at k=100
+satisfies `same_sense` on nearly every pair, and it cannot see a trace that got
+the right answer while describing the wrong senses. SemCor is annotated against
+WordNet, so its pairs carry the gold synset of *each* usage — roughly 1.76 bits
+per gloss instead of one bit per pair. Build them once:
+
+```bash
+uv run python src/semcor_pairs.py --out data/semcor_wic.json   # 19 446 pairs, 84% gloss-scoreable
+uv run python src/grpo_lora.py --model ./qwen-sft-merged --semcor-pairs
+```
+
+Each record ships the two gold glosses plus `senses`, the whole WordNet 3.0 gloss
+inventory of its `(lemma, pos)`. The reward is a **margin**, not a similarity:
+token-F1 of the emitted gloss against the gold sense minus its best score against
+any rival sense of the same word. Absolute similarity would be the wrong measure —
+the API teacher's own *correct* glosses only reach token-F1 0.16 against gold, so
+a level would punish valid paraphrase; a margin instead asks whether the trace
+picked the right sense out of the ones that word actually has. No overlap with any
+sense, no gold gloss (every MCL-WiC row), or a monosemous lemma all score 0, so a
+mixed rollout set is graded only where grading means something. Measured over the
+16 331 scoreable pairs: gold glosses score +0.149 mean, a randomly chosen rival
+sense −0.149, the bare lemma ≈0.
+
+Lemmas occurring in `mcl-wic.test` are excluded from the pair set by default
+(`--keep-test-lemmas` opts out), so the held-out score still measures
+generalisation rather than recall of a sense inventory that was trained on.
 
 ---
 
@@ -217,6 +250,7 @@ the wired one.
 | `src/filter_reasoning.py` | Quality-filter the distilled traces (rules + LLM judge) |
 | `src/sft_sense.py` | SFT warm-start on the distilled traces |
 | `src/grpo_sense.py` | GRPO on the verifiable label |
+| `src/semcor_pairs.py` | Builds gold-sense WiC pairs from `data/semcor_en.json.gz` (glosses + candidate sense inventory) |
 | `src/sense_rewards.py` | The reward functions |
 | `src/eval_sense.py` | Test-split generation + accuracy/F1; emits teacher-schema predictions |
 | `tests/test_sense_rewards.py` | Reward contracts (runs on CPU in a second) |

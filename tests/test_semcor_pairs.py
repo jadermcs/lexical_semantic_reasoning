@@ -145,6 +145,48 @@ def test_pairs_are_well_formed_and_balanced():
         assert sd.pair_key(r)  # keyed like every other loader's records
 
 
+@needs_wordnet
+def test_sense_inventory_covers_the_lemmas_senses_and_dedups():
+    senses = sp.sense_inventory("bank", "noun")
+    assert len(senses) == len(set(senses))
+    assert sp.gloss("bank.n.01") in senses
+    assert sp.gloss("depository_financial_institution.n.01") in senses
+
+
+@needs_wordnet
+def test_sense_inventory_includes_adjective_satellites():
+    """SemCor annotates satellites, so a POS-blind or 'a'-only lookup would leave the
+    gold gloss out of its own candidate set — an unwinnable ranking."""
+    assert sp.gloss("direct.s.01") in sp.sense_inventory("direct", "adj")
+
+
+@needs_source
+@needs_wordnet
+def test_records_carry_gold_glosses_inside_their_candidate_set():
+    """The contract ``sense_rewards.reward_wic_gloss`` scores against: a gold gloss per
+    usage, and an inventory to rank it in that actually contains it."""
+    recs = sp.build_pairs(SOURCE, max_per_lemma=1)
+    scoreable, blanked = 0, 0
+    for r in recs:
+        for g in (r["gloss1"], r["gloss2"]):
+            assert not g or g in r["senses"]
+        if r["gloss1"]:
+            # A different-sense pair whose two synsets share one definition string
+            # would ask for a distinction WordNet does not make, so it is blanked
+            # rather than kept; anything still carrying glosses is the real gloss.
+            assert r["gloss1"] == sp.gloss(r["synset1"])
+            assert r["gloss2"] == sp.gloss(r["synset2"])
+            assert r["label"] == (r["gloss1"] == r["gloss2"])
+        else:
+            blanked += 1
+        scoreable += bool(r["gloss1"] and r["gloss2"] and len(r["senses"]) > 1)
+    assert blanked < 0.02 * len(recs)
+    # The rest of the shortfall is monosemous lemmas, which reward_wic_gloss skips for
+    # want of a rival sense (~19%). The bulk of the set still has to be scoreable or
+    # the reward is decoration.
+    assert scoreable > 0.75 * len(recs)
+
+
 @needs_source
 @needs_wordnet
 def test_min_confusability_restricts_the_hard_negatives():

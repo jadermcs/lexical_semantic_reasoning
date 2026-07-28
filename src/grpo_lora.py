@@ -5,20 +5,30 @@ from functools import partial, wraps
 from pathlib import Path
 
 import torch
-from datasets import Dataset
+from datasets import Dataset, concatenate_datasets
 from peft import LoraConfig
 from transformers import AutoModelForCausalLM, AutoTokenizer
+from transformers.trainer_utils import get_last_checkpoint
 from trl import GRPOConfig, GRPOTrainer
-from trl.rewards import get_repetition_penalty_reward
+from trl.rewards import get_repetition_penalty_reward, get_soft_overlong_punishment
 
+import semcor_pairs
 import sense_data as sd
-from sense_rewards import KEEP_COLS, REWARDS
+from sense_rewards import GLOSS_COLS, KEEP_COLS, REWARDS
 
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
 
 def format_prompt(rec):
+    """Render the prompt column, plus the gold-gloss columns reward_wic_gloss reads.
+
+    The gloss fields are always written, empty on MCL-WiC rows: Arrow needs one schema
+    across the concatenated sources, and an empty gold gloss is how that reward is told
+    this pair is not gloss-scoreable.
+    """
     out = {"prompt": sd.wic_messages(rec, with_target=False)}
+    for col, default in GLOSS_COLS.items():
+        out[col] = rec.get(col) or default
     return out
 
 
@@ -55,13 +65,32 @@ def load_policy(path, lora_kwargs):
     )
 
 
-def build_dataset(split, cap=None):
-    recs = sd.load_mclwic(split)
+def _prepare(recs, cap=None):
     ds = Dataset.from_list(recs)
     if cap is not None:
         ds = ds.shuffle(seed=42).select(range(min(cap, len(ds))))
     drop = [c for c in ds.column_names if c not in KEEP_COLS]
     return ds.map(partial(format_prompt), remove_columns=drop)
+
+
+def build_dataset(split, cap=None, semcor_path=None):
+    """Rollout set for one split, optionally mixing in the saved SemCor pairs.
+
+    ``semcor_path`` points at the file ``semcor_pairs.py`` writes. Those pairs carry a
+    gold gloss per usage, which is the only thing ``reward_wic_gloss`` can score; MCL-WiC
+    contributes the label and nothing else. Mixing rather than replacing keeps the
+    rollout distribution anchored on the benchmark the run is evaluated against.
+    """
+    parts = [_prepare(sd.load_mclwic(split), cap=cap)]
+    if semcor_path:
+        sc = semcor_pairs.load_pairs(semcor_path)
+        print(f"[{split}] semcor: +{len(sc)} gloss-annotated pairs")
+        parts.append(_prepare(sc, cap=cap))
+    if len(parts) == 1:
+        return parts[0]
+    # Interleave the sources: each prompt forms its own rollout group, but leaving them
+    # in blocks would make every optimizer step see one source only.
+    return concatenate_datasets(parts).shuffle(seed=42)
 
 
 def main():
@@ -78,13 +107,13 @@ def main():
     ap.add_argument(
         "--num-generations",
         type=int,
-        default=8,
+        default=16,
         help="Rollouts per prompt (the GRPO group size the advantage is centred on).",
     )
     ap.add_argument(
         "--generation-batch",
         type=int,
-        default=64,
+        default=256,
         help="Completions per optimizer step; grad-accum is derived from it as "
         "(this // --batch-size). Prompt groups per step = this // --num-generations, "
         "and that is what the gradient averages over. Deriving grad-accum this way "
@@ -98,9 +127,83 @@ def main():
     ap.add_argument("--vllm-server-host", default=None)
     ap.add_argument("--vllm-server-port", type=int, default=8000)
     ap.add_argument("--vllm-gpu-mem", type=float, default=0.3)
-    ap.add_argument("--distill-threshold", type=float, default=0.5)
     ap.add_argument("--max-completion-length", type=int, default=512)
     ap.add_argument("--beta", type=float, default=0.0)
+    ap.add_argument(
+        "--semcor-pairs",
+        nargs="?",
+        const=str(semcor_pairs.DEFAULT_PAIRS),
+        default=None,
+        help="Mix the saved SemCor pair set into the training rollouts (bare flag uses "
+        f"{semcor_pairs.DEFAULT_PAIRS}). These are the only pairs carrying a gold gloss "
+        "per usage, so they are the only ones reward_wic_gloss can score; build the file "
+        "with 'uv run python src/semcor_pairs.py'. The dev set stays pure MCL-WiC so the "
+        "eval curve remains comparable across runs.",
+    )
+    ap.add_argument(
+        "--gloss-reward-weight",
+        type=float,
+        default=1.0,
+        help="Weight on reward_wic_gloss. At 1.0 the term spans ±0.15, which is what "
+        "the shape/accuracy invariant in tests/test_sense_rewards.py was checked "
+        "against; raising it eats that headroom.",
+    )
+    # --- Dr. GRPO / DAPO -------------------------------------------------- #
+    # The two papers disagree only on how token losses are aggregated, so that axis
+    # is a flag; every other term below is shared and on by default.
+    ap.add_argument(
+        "--loss-type",
+        default="dr_grpo",
+        choices=["dr_grpo", "dapo", "grpo", "bnpo"],
+        help="Token-loss aggregation. 'dr_grpo' normalises by the constant "
+        "--max-completion-length (Dr. GRPO); 'dapo' normalises by the active-token "
+        "count of the whole accumulated batch. Both remove the length bias that "
+        "makes plain 'grpo' prefer short positive-advantage completions; they are "
+        "mutually exclusive, hence the choice.",
+    )
+    ap.add_argument(
+        "--scale-rewards",
+        default="none",
+        choices=["none", "group", "batch"],
+        help="Dr. GRPO's second correction: dividing the advantage by the group std "
+        "('group', TRL's default) up-weights prompts the policy already answers "
+        "consistently, which is a question-level difficulty bias. 'none' keeps the "
+        "mean-centred advantage only.",
+    )
+    ap.add_argument(
+        "--epsilon",
+        type=float,
+        default=0.2,
+        help="Lower PPO clip bound.",
+    )
+    ap.add_argument(
+        "--epsilon-high",
+        type=float,
+        default=0.28,
+        help="Upper PPO clip bound (DAPO 'clip-higher'). Decoupling it from "
+        "--epsilon gives low-probability tokens room to grow, which is what keeps "
+        "the policy from collapsing to a single sampled mode; 0.28 is the paper's "
+        "value. Pass the same value as --epsilon for symmetric clipping.",
+    )
+    ap.add_argument(
+        "--soft-punish-cache",
+        type=int,
+        default=128,
+        help="DAPO overlong reward shaping (their Eq. 13): completions in the last "
+        "N tokens before --max-completion-length take a linearly ramped penalty "
+        "instead of being truncated and silently discarded. Set 0 to fall back to "
+        "overlong *filtering* (mask_truncated_completions) instead — the two are "
+        "alternatives in the paper, not a stack.",
+    )
+    ap.add_argument(
+        "--overlong-penalty",
+        type=float,
+        default=0.2,
+        help="Weight on the overlong term. The raw reward bottoms out at -1.0, which "
+        "would blow the shape/accuracy invariant in sense_rewards (0.4 of headroom "
+        "against a 1.5 accuracy gap, already spent down to 0.2 by the repetition "
+        "penalty), so it is scaled to match the repetition penalty's magnitude.",
+    )
     ap.add_argument("--resume", nargs="?", const=True, default=None)
     args = ap.parse_args()
 
@@ -127,7 +230,7 @@ def main():
     tokenizer = AutoTokenizer.from_pretrained(args.model, trust_remote_code=True)
     tokenizer.pad_token = tokenizer.eos_token
 
-    train_ds = build_dataset("train")
+    train_ds = build_dataset("train", semcor_path=args.semcor_pairs)
     dev_ds = build_dataset("dev", cap=200)
     print(train_ds[0])
 
@@ -148,10 +251,39 @@ def main():
         vllm_kwargs = dict(
             use_vllm=True,
             vllm_mode="colocate",
-            vllm_importance_sampling_correction=False,
             vllm_gpu_memory_utilization=args.vllm_gpu_mem,
             vllm_max_model_length=prompt_headroom + args.max_completion_length,
         )
+
+    reward_funcs = [as_text_reward(f) for f in REWARDS]
+    reward_weights = [
+        args.gloss_reward_weight if f.__name__ == "reward_wic_gloss" else 1.0
+        for f in REWARDS
+    ]
+    reward_funcs.append(get_repetition_penalty_reward(ngram_size=3, max_penalty=-0.2))
+    reward_weights.append(1.0)
+    if args.soft_punish_cache > 0:
+        # Not wrapped in as_text_reward: this one scores completion_ids, not text.
+        reward_funcs.append(
+            get_soft_overlong_punishment(
+                max_completion_len=args.max_completion_length,
+                soft_punish_cache=args.soft_punish_cache,
+            )
+        )
+        reward_weights.append(args.overlong_penalty)
+    # Overlong shaping and overlong filtering are the two alternatives DAPO offers
+    # for truncated rollouts; masking on top of the shaping would zero the loss on
+    # exactly the completions the penalty is meant to teach from.
+    mask_truncated = args.soft_punish_cache == 0
+    print(
+        f"objective: loss_type={args.loss_type} scale_rewards={args.scale_rewards} "
+        f"clip=[{args.epsilon}, {args.epsilon_high}] beta={args.beta} "
+        + (
+            f"overlong=shape(cache={args.soft_punish_cache}, w={args.overlong_penalty})"
+            if not mask_truncated
+            else "overlong=mask"
+        )
+    )
 
     run_name = "qwen-lora-grpo-wic"
     output_dir = f"./{run_name}"
@@ -160,7 +292,12 @@ def main():
         num_generations=args.num_generations,
         num_generations_eval=1,
         max_completion_length=args.max_completion_length,
-        mask_truncated_completions=True,
+        mask_truncated_completions=mask_truncated,
+        loss_type=args.loss_type,
+        scale_rewards=args.scale_rewards,
+        epsilon=args.epsilon,
+        epsilon_high=args.epsilon_high,
+        reward_weights=reward_weights,
         beta=args.beta,
         disable_dropout=True,
         optim="paged_adamw_8bit",
@@ -188,9 +325,6 @@ def main():
         num_completions_to_print=3,
         **vllm_kwargs,
     )
-
-    reward_funcs = [as_text_reward(f) for f in REWARDS]
-    reward_funcs.append(get_repetition_penalty_reward(ngram_size=3, max_penalty=-0.2))
 
     trainer = GRPOTrainer(
         model=model,

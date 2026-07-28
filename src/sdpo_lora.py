@@ -10,12 +10,12 @@ from transformers.trainer_callback import TrainerCallback
 from transformers.trainer_utils import get_last_checkpoint
 from trl.experimental.sdpo import SDPOConfig, SDPOTrainer
 from trl.experimental.sdpo.sdpo_trainer import SuccessfulRolloutTeacherContextBuilder
-from trl.rewards import get_repetition_penalty_reward
+from trl.rewards import get_repetition_penalty_reward, get_soft_overlong_punishment
 
 import semcor_pairs
 import sense_data as sd
 from grpo_lora import load_policy
-from sense_rewards import KEEP_COLS, REWARDS
+from sense_rewards import GLOSS_COLS, KEEP_COLS, REWARDS
 
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
@@ -55,9 +55,12 @@ def format_prompt(rec, with_feedback=True):
     ``privileged_context`` is always written, empty when there is no hint: Arrow needs
     one schema across the concatenated MCL and SemCor sets, and the trainer's
     ``has_feedback`` test (``isinstance(str) and strip() != ""``) reads ``""`` as "no
-    feedback" exactly as it reads a missing key.
+    feedback" exactly as it reads a missing key. The gold-gloss columns
+    ``reward_wic_gloss`` scores ride along on the same rule.
     """
     out = {"prompt": sd.wic_messages(rec, with_target=False), "privileged_context": ""}
+    for col, default in GLOSS_COLS.items():
+        out[col] = rec.get(col) or default
     if rec.get("synset1") and rec.get("synset2"):
         # A SemCor record carries gold senses, so its hint can name them. This is the
         # feedback --semcor exists to supply, and --no-gold-feedback does not turn it
@@ -233,7 +236,7 @@ def main():
     ap.add_argument(
         "--num-generations",
         type=int,
-        default=8,
+        default=16,
         help="Rollouts per prompt (the GRPO group size the advantage is centred on).",
     )
     ap.add_argument(
@@ -473,10 +476,8 @@ def main():
         else None
     )
     train_ds = build_dataset("train", with_feedback=with_feedback, semcor=semcor_cfg)
-    # Dev stays pure MCL-WiC: it is the in-domain read on the benchmark, and mixing a
-    # second distribution into it would make the eval curve unreadable.
     dev_ds = build_dataset(
-        "dev", cap=args.eval_prompts or None, with_feedback=with_feedback
+        "dev", cap=args.eval_prompts, with_feedback=with_feedback
     )
     print(train_ds[0])
 
@@ -485,14 +486,6 @@ def main():
         dict(r=args.lora_r, lora_alpha=args.lora_alpha, lora_dropout=args.lora_dropout),
     )
 
-    # Longest rendered prompt measured over the sources this script can build:
-    # MCL-WiC tops out at 399 tokens, but SemCor sentences are untrimmed corpus
-    # sentences and reach 667. At the old headroom of 512 the vLLM context was
-    # 512+512=1024, so ~0.1% of SemCor prompts left less than max_completion_length
-    # of room; vLLM clamps rather than errors, so those rollouts came back truncated
-    # and mask_truncated_completions silently dropped them. 768 clears the measured
-    # max with margin. max_reprompt_len derives from it and stays far above the
-    # longest teacher reprompt (1213 tokens: prompt + a full-length demonstration).
     prompt_headroom = 768
     if args.vllm_server_host:
         vllm_kwargs = dict(
@@ -520,6 +513,32 @@ def main():
         )
     else:
         distill_mode_kwargs = dict(distillation_mode="sampled_token")
+    reward_funcs = [as_text_reward(f) for f in REWARDS]
+    reward_weights = [1.0] * len(reward_funcs)
+    reward_funcs.append(get_repetition_penalty_reward(ngram_size=3, max_penalty=-0.2))
+    reward_weights.append(1.0)
+    if args.soft_punish_cache > 0:
+        # Not wrapped in as_text_reward: this one scores completion_ids, not text.
+        reward_funcs.append(
+            get_soft_overlong_punishment(
+                max_completion_len=args.max_completion_length,
+                soft_punish_cache=args.soft_punish_cache,
+            )
+        )
+        reward_weights.append(args.overlong_penalty)
+    # Overlong shaping and overlong filtering are the two alternatives DAPO offers
+    # for truncated rollouts; masking on top of the shaping would zero the loss on
+    # exactly the completions the penalty is meant to teach from.
+    mask_truncated = args.soft_punish_cache == 0
+    print(
+        f"objective: loss_type={args.loss_type} scale_rewards={args.scale_rewards} "
+        f"clip=[{args.epsilon}, {args.epsilon_high}] beta={args.beta} "
+        + (
+            f"overlong=shape(cache={args.soft_punish_cache}, w={args.overlong_penalty})"
+            if not mask_truncated
+            else "overlong=mask"
+        )
+    )
 
     run_name = "qwen-lora-sdpo-wic"
     output_dir = f"./{run_name}"
@@ -529,6 +548,11 @@ def main():
         num_generations_eval=args.num_generations_eval,
         max_completion_length=args.max_completion_length,
         mask_truncated_completions=True,
+        loss_type=args.loss_type,
+        scale_rewards=args.scale_rewards,
+        epsilon=args.epsilon,
+        epsilon_high=args.epsilon_high,
+        reward_weights=reward_weights,
         beta=args.beta,
         disable_dropout=True,
         optim="paged_adamw_8bit",
@@ -571,9 +595,6 @@ def main():
         max_reprompt_len=prompt_headroom + 2 * args.max_completion_length,
         **vllm_kwargs,
     )
-
-    reward_funcs = [as_text_reward(f) for f in REWARDS]
-    reward_funcs.append(get_repetition_penalty_reward(ngram_size=3, max_penalty=-0.2))
 
     trainer = SDPOTrainer(
         model=model,

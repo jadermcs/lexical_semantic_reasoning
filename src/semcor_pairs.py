@@ -14,7 +14,8 @@ accuracy on different-sense pairs slid 71.2% → 64.0% → 60.9% → 56.8% as th
 synsets got closer in WordNet, which is exactly the slice ``--min-confusability``
 lets you oversample.
 
-**Source file.** ``data/semcor_en.json.gz``: one record per annotated token with
+**Source file.** ``data/semcor_en.json.gz``, produced outside this repo — nothing here
+builds it, this module only reads it. One record per annotated token with
 ``text``, ``sent_id``, character offsets ``start``/``end``, ``lemma``, ``pos`` and
 ``synsets``. The offsets are why this file supersedes the older ``data/semcor.json``
 pair set — that one had already thrown the sense keys away, and re-deriving them by
@@ -36,6 +37,19 @@ different lexicon from ``gloss_wordnet``'s Open English WordNet 2024 — that mo
 snaps free-text glosses and wants a maintained inventory, whereas a gold label must
 be read in the inventory it was written in. Mapping 3.0 → OEWN would inject
 alignment drift into the one signal here that is supposed to be ground truth.
+
+**What a record carries.** Beyond the WiC fields every loader shares, each pair keeps
+``synset1``/``synset2``, their gold glosses ``gloss1``/``gloss2``, and ``senses`` — the
+*whole* WordNet 3.0 gloss inventory of the ``(lemma, pos)``, gold entries included.
+That last field is what turns a gold gloss into a scoreable target: ``gloss1`` alone
+only supports "does the emitted gloss look like this string", which is a similarity
+measure with no scale (the teacher's own correct glosses overlap gold at token-F1
+0.16). Against the inventory, the question becomes *discriminative* — is the emitted
+gloss closer to the gold sense than to the other senses of the same word — which is
+the ~1.76 bits/gloss ``sense_rewards.reward_wic_gloss`` scores. Persisting the
+inventory alongside the pair also keeps that reward pure-Python at rollout time and
+keeps every comparison inside one lexicon, so no synset ID ever has to be mapped
+across WordNet versions.
 """
 
 from __future__ import annotations
@@ -99,6 +113,31 @@ def synset(name: str):
 def gloss(name: str) -> str | None:
     s = synset(name)
     return s.definition() if s is not None else None
+
+
+# NLTK's part-of-speech codes for this repo's POS spelling. Adjectives union 'a' and
+# 's' for the same reason ``gloss_wordnet._POS`` does: satellites are a separate,
+# disjoint POS, and SemCor annotates plenty of them.
+NLTK_POS = {"noun": ("n",), "verb": ("v",), "adj": ("a", "s"), "adv": ("r",)}
+
+
+@lru_cache(maxsize=16384)
+def sense_inventory(lemma: str, pos: str) -> tuple[str, ...]:
+    """Every WordNet 3.0 gloss of ``(lemma, pos)`` — the candidate set a gloss ranks in.
+
+    Deduplicated and order-stable. NLTK spells multiword lemmas with underscores (the
+    opposite of the `wn` package), so a lemma arriving with spaces is normalised.
+    """
+    wn = _wn()
+    key = str(lemma).replace(" ", "_")
+    out, seen = [], set()
+    for p in NLTK_POS.get(pos, ()) or (None,):
+        for s in wn.synsets(key, pos=p):
+            d = s.definition()
+            if d and d not in seen:
+                seen.add(d)
+                out.append(d)
+    return tuple(out)
 
 
 def confusability(name1: str, name2: str) -> str | None:
@@ -186,9 +225,30 @@ def index_usages(anns: list[dict]) -> dict:
 def _record(lemma, pos, u1, s1, u2, s2) -> dict:
     """One WiC record in the schema every loader in this repo shares.
 
-    ``synset1``/``synset2`` ride along beyond ``sense_data``'s fields; they are what
-    ``gloss_feedback`` reads and what makes this source worth more than MCL-WiC.
+    ``synset1``/``synset2`` and the gloss fields ride along beyond ``sense_data``'s;
+    they are what ``gloss_feedback`` and ``sense_rewards.reward_wic_gloss`` read, and
+    what makes this source worth more than MCL-WiC.
+
+    An unresolvable synset (an adjective satellite WordNet 3.0 will not name) yields
+    an empty gloss rather than dropping the pair: both consumers already degrade to
+    the label-only path when a gloss is missing.
+
+    So does a *different*-sense pair whose two synsets happen to carry byte-identical
+    definitions — WordNet has several (``precarious.s.01`` and ``unstable.s.02`` are
+    both "affording no ease or reassurance"; 26 of 9 678 sampled pairs). There is no
+    gloss that could tell those two apart, so the pair keeps its label and loses its
+    gloss supervision rather than asking for a distinction the inventory does not make.
     """
+    g1, g2 = gloss(s1) or "", gloss(s2) or ""
+    if s1 != s2 and g1 and g1 == g2:
+        g1 = g2 = ""
+    senses = list(sense_inventory(lemma, pos))
+    # The gold gloss must be *in* the candidate set, or ranking against it is
+    # unwinnable. It normally is; a lemma spelled differently in SemCor than in
+    # WordNet is the exception this covers.
+    for g in (g1, g2):
+        if g and g not in senses:
+            senses.append(g)
     return {
         "lemma": lemma,
         "pos": pos,
@@ -199,6 +259,9 @@ def _record(lemma, pos, u1, s1, u2, s2) -> dict:
         "usage2": mark_usage(u2),
         "synset1": s1,
         "synset2": s2,
+        "gloss1": g1,
+        "gloss2": g2,
+        "senses": senses,
     }
 
 
@@ -297,6 +360,32 @@ def build_pairs(
     return out
 
 
+DEFAULT_PAIRS = DATA_DIR / "semcor_wic.json"
+
+
+def load_pairs(path=DEFAULT_PAIRS) -> list[dict]:
+    """Read a pair set written by ``main`` back off disk.
+
+    Training reads the *saved* file rather than rebuilding: ``build_pairs`` samples
+    with an RNG and queries WordNet for every ``(lemma, pos)``, so materialising it
+    once is what makes a run reproducible and keeps NLTK off the training host's
+    critical path. Missing gloss fields are filled in so an older file still loads —
+    the pairs are then simply unscoreable by ``reward_wic_gloss``, not broken.
+    """
+    path = Path(path)
+    if not path.exists():
+        raise SystemExit(
+            f"{path} not found; build it first with:\n"
+            f"  uv run python src/semcor_pairs.py --out {path}"
+        )
+    recs = json.loads(path.read_text())
+    for r in recs:
+        r.setdefault("gloss1", "")
+        r.setdefault("gloss2", "")
+        r.setdefault("senses", [])
+    return recs
+
+
 # --------------------------------------------------------------------------- #
 # The privileged context SDPO reprompts the teacher with
 # --------------------------------------------------------------------------- #
@@ -364,7 +453,11 @@ def main():
         help="Do NOT hold out lemmas occurring in mcl-wic.test. Leaks the test "
         "vocabulary into the rollout set; the held-out score stops meaning much.",
     )
-    ap.add_argument("--out", default=None, help="Write the pairs as JSON.")
+    ap.add_argument(
+        "--out",
+        default=str(DEFAULT_PAIRS),
+        help="Where to write the pairs as JSON. Pass '' to only inspect them.",
+    )
     ap.add_argument("--show", type=int, default=3)
     args = ap.parse_args()
 
@@ -383,13 +476,25 @@ def main():
         confusability(r["synset1"], r["synset2"]) for r in recs if not r["label"]
     )
     print(f"different-sense confusability: {dict(levels)}")
+    # A pair is only scoreable by reward_wic_gloss if both gold glosses resolved and
+    # the lemma has a candidate set to rank them against, so report that coverage.
+    scoreable = sum(
+        1 for r in recs if r["gloss1"] and r["gloss2"] and len(r["senses"]) > 1
+    )
+    n_senses = [len(r["senses"]) for r in recs]
+    print(
+        f"gloss-scoreable: {scoreable}/{len(recs)} "
+        f"({scoreable / max(1, len(recs)):.1%})  |  candidate senses per pair: "
+        f"mean {sum(n_senses) / max(1, len(n_senses)):.1f}, max {max(n_senses, default=0)}"
+    )
     for r in recs[: args.show]:
         print(f"\n--- {r['lemma']}/{r['pos']}  label={r['label']}")
         print(f"  1: {r['usage1'][:120]}")
         print(f"  2: {r['usage2'][:120]}")
+        print(f"  gold: {r['gloss1']!r} | {r['gloss2']!r}  ({len(r['senses'])} senses)")
         print(f"  feedback: {gloss_feedback(r)}")
     if args.out:
-        Path(args.out).write_text(json.dumps(recs, ensure_ascii=False))
+        Path(args.out).write_text(json.dumps(recs, ensure_ascii=False, indent=2))
         print(f"\nwrote {len(recs)} pairs → {args.out}")
 
 
