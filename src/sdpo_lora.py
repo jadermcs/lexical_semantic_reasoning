@@ -63,8 +63,8 @@ def format_prompt(rec, with_feedback=True):
         out[col] = rec.get(col) or default
     if rec.get("synset1") and rec.get("synset2"):
         # A SemCor record carries gold senses, so its hint can name them. This is the
-        # feedback --semcor exists to supply, and --no-gold-feedback does not turn it
-        # off; see that flag's help.
+        # feedback --semcor-pairs exists to supply, and --no-gold-feedback does not
+        # turn it off; see that flag's help.
         out["privileged_context"] = semcor_pairs.gloss_feedback(rec)
     elif with_feedback:
         # MCL-WiC has only the label, so the best available hint is the one bit.
@@ -187,7 +187,7 @@ def as_text_reward(fn):
     return wrapper
 
 
-def _prepare(recs, cap=None, with_feedback=True, seed=42):
+def _prepare(recs, cap=None, with_feedback=True):
     """Records → a Dataset carrying exactly KEEP_COLS + prompt + privileged_context.
 
     Mapping each source to this fixed shape *before* concatenation is what lets the
@@ -196,25 +196,28 @@ def _prepare(recs, cap=None, with_feedback=True, seed=42):
     """
     ds = Dataset.from_list(recs)
     if cap is not None:
-        ds = ds.shuffle(seed=seed).select(range(min(cap, len(ds))))
+        ds = ds.shuffle(seed=42).select(range(min(cap, len(ds))))
     drop = [c for c in ds.column_names if c not in KEEP_COLS]
     return ds.map(
         partial(format_prompt, with_feedback=with_feedback), remove_columns=drop
     )
 
 
-def build_dataset(split, cap=None, with_feedback=True, semcor=None):
-    """Rollout set for one split, optionally merging SemCor pairs into it.
+def build_dataset(split, cap=None, with_feedback=True, semcor_path=None):
+    """Rollout set for one split, optionally mixing in the saved SemCor pairs.
 
-    ``semcor`` is a dict of ``semcor_pairs.build_pairs`` kwargs, or None.
+    ``semcor_path`` points at the file ``semcor_pairs.py`` writes, exactly as in
+    grpo_lora.py — the pair set is materialised once (``run_train.sh`` does it) rather
+    than resampled per run, which is what makes a run reproducible and keeps NLTK off
+    the training host. Those pairs are the only ones carrying gold senses, so they are
+    both the only ones ``reward_wic_gloss`` can score and the only ones whose SDPO hint
+    can name what the word actually means; MCL-WiC pairs keep the one-bit verdict hint.
     """
     parts = [_prepare(sd.load_mclwic(split), cap=cap, with_feedback=with_feedback)]
-
-    if semcor:
-        sc = semcor_pairs.build_pairs(**semcor)
+    if semcor_path:
+        sc = semcor_pairs.load_pairs(semcor_path)
         print(f"[{split}] semcor: +{len(sc)} gloss-annotated pairs")
         parts.append(_prepare(sc, cap=cap, with_feedback=with_feedback))
-
     if len(parts) == 1:
         return parts[0]
     # Interleave the sources: each prompt forms its own rollout group, but leaving
@@ -224,6 +227,10 @@ def build_dataset(split, cap=None, with_feedback=True, semcor=None):
 
 def main():
     ap = argparse.ArgumentParser()
+    # --- everything down to --resume mirrors grpo_lora.py knob for knob ---------- #
+    # SDPO is that objective plus an on-policy distillation term, so a comparison is
+    # only readable if the GRPO half is configured identically. The SDPO-only flags
+    # start at --distillation-weight.
     ap.add_argument("--model", default="Qwen/Qwen3-0.6B")
     ap.add_argument(
         "--batch-size",
@@ -255,9 +262,88 @@ def main():
     ap.add_argument("--lora-dropout", type=float, default=0.05)
     ap.add_argument("--vllm-server-host", default=None)
     ap.add_argument("--vllm-server-port", type=int, default=8000)
-    ap.add_argument("--vllm-gpu-mem", type=float, default=0.3)
+    ap.add_argument("--vllm-gpu-mem", type=float, default=0.4)
     ap.add_argument("--max-completion-length", type=int, default=512)
     ap.add_argument("--beta", type=float, default=0.0)
+    ap.add_argument(
+        "--semcor-pairs",
+        nargs="?",
+        const=str(semcor_pairs.DEFAULT_PAIRS),
+        default=None,
+        help="Mix the saved SemCor pair set into the training rollouts (bare flag uses "
+        f"{semcor_pairs.DEFAULT_PAIRS}). Build the file with 'uv run python "
+        "src/semcor_pairs.py', whose CLI carries the sampling knobs (--max-per-lemma, "
+        "--min-confusability, --keep-test-lemmas). Under SDPO these pairs do double "
+        "duty: reward_wic_gloss can score them, and their hint names the gold sense "
+        "instead of just the verdict bit. The dev set stays pure MCL-WiC so the eval "
+        "curve remains comparable across runs.",
+    )
+    ap.add_argument(
+        "--gloss-reward-weight",
+        type=float,
+        default=1.0,
+        help="Weight on reward_wic_gloss. At 1.0 the term spans ±0.15, which is what "
+        "the shape/accuracy invariant in tests/test_sense_rewards.py was checked "
+        "against; raising it eats that headroom.",
+    )
+    # --- Dr. GRPO / DAPO -------------------------------------------------- #
+    # The two papers disagree only on how token losses are aggregated, so that axis
+    # is a flag; every other term below is shared and on by default.
+    ap.add_argument(
+        "--loss-type",
+        default="dr_grpo",
+        choices=["dr_grpo", "dapo", "grpo", "bnpo"],
+        help="Token-loss aggregation. 'dr_grpo' normalises by the constant "
+        "--max-completion-length (Dr. GRPO); 'dapo' normalises by the active-token "
+        "count of the whole accumulated batch. Both remove the length bias that "
+        "makes plain 'grpo' prefer short positive-advantage completions; they are "
+        "mutually exclusive, hence the choice.",
+    )
+    ap.add_argument(
+        "--scale-rewards",
+        default="none",
+        choices=["none", "group", "batch"],
+        help="Dr. GRPO's second correction: dividing the advantage by the group std "
+        "('group', TRL's default) up-weights prompts the policy already answers "
+        "consistently, which is a question-level difficulty bias. 'none' keeps the "
+        "mean-centred advantage only.",
+    )
+    ap.add_argument(
+        "--epsilon",
+        type=float,
+        default=0.2,
+        help="Lower PPO clip bound.",
+    )
+    ap.add_argument(
+        "--epsilon-high",
+        type=float,
+        default=0.28,
+        help="Upper PPO clip bound (DAPO 'clip-higher'). Decoupling it from "
+        "--epsilon gives low-probability tokens room to grow, which is what keeps "
+        "the policy from collapsing to a single sampled mode; 0.28 is the paper's "
+        "value. Pass the same value as --epsilon for symmetric clipping.",
+    )
+    ap.add_argument(
+        "--soft-punish-cache",
+        type=int,
+        default=128,
+        help="DAPO overlong reward shaping (their Eq. 13): completions in the last "
+        "N tokens before --max-completion-length take a linearly ramped penalty "
+        "instead of being truncated and silently discarded. Set 0 to fall back to "
+        "overlong *filtering* (mask_truncated_completions) instead — the two are "
+        "alternatives in the paper, not a stack.",
+    )
+    ap.add_argument(
+        "--overlong-penalty",
+        type=float,
+        default=0.2,
+        help="Weight on the overlong term. The raw reward bottoms out at -1.0, which "
+        "would blow the shape/accuracy invariant in sense_rewards (0.4 of headroom "
+        "against a 1.5 accuracy gap, already spent down to 0.2 by the repetition "
+        "penalty), so it is scaled to match the repetition penalty's magnitude.",
+    )
+    ap.add_argument("--resume", nargs="?", const=True, default=None)
+    # --- SDPO: on-policy distillation from a reprompted teacher ------------- #
     ap.add_argument(
         "--distillation-weight",
         type=float,
@@ -322,10 +408,11 @@ def main():
         "--temperature",
         type=float,
         default=0.6,
-        help="Rollout temperature. SDPO trains at 1.0 and only validates at 0.6/0.95 "
-        "(Table 12); 0.6 here matches the repo's eval convention, but it is also why "
-        "success_group_fraction sits at ~0.95 — low-temperature rollouts rarely "
-        "disagree, so few groups are hard enough for the distillation term to matter.",
+        help="Rollout temperature; 0.6 is the GRPO run's value and the repo's eval "
+        "convention. SDPO trains at 1.0 and only validates at 0.6/0.95 (Table 12), and "
+        "0.6 is also why success_group_fraction sits at ~0.95 — low-temperature "
+        "rollouts rarely disagree, so few groups are hard enough for the distillation "
+        "term to matter. Raise it only when the GRPO baseline is not the comparison.",
     )
     ap.add_argument(
         "--distillation-topk",
@@ -347,6 +434,17 @@ def main():
         "incorrect rollout can qualify.",
     )
     ap.add_argument(
+        "--no-gold-feedback",
+        action="store_true",
+        help="Do not supply the gold verdict as privileged context on MCL-WiC pairs; "
+        "those groups then teach only from successful sibling rollouts, and groups "
+        "where every rollout fails carry no distillation signal (the GRPO failure mode "
+        "SDPO is here to fix). It does NOT suppress --semcor-pairs' gloss feedback, "
+        "which is a different and strictly more informative signal: combining the two "
+        "gives a rollout set where only the gold-sense pairs are hinted, which is the "
+        "clean way to ask what the gloss feedback is worth.",
+    )
+    ap.add_argument(
         "--dump-rollouts",
         type=int,
         default=25,
@@ -355,82 +453,39 @@ def main():
         "disables). SDPOConfig has no log_completions — it subclasses _BaseConfig, not "
         "GRPOConfig — so this is the only way to see what the policy actually wrote; "
         "each record carries the reward, whether the rollout was in the distillation "
-        "set, the completion, and the teacher reprompt built for it.",
+        "set, the completion, and the teacher reprompt built for it. This is the SDPO "
+        "stand-in for grpo_lora.py's log_completions=True.",
     )
+    # --- eval: grpo_lora.py's settings, exposed because SDPO evals cost more --- #
     ap.add_argument(
         "--eval-prompts",
         type=int,
-        default=0,
-        help="Dev prompts per eval; 0 uses the whole 1000-pair dev split. The eval "
-        "subset is FIXED (shuffle(seed=42).select), so the wobble between evals is "
-        "pure sampling noise, sd ~= sqrt(p(1-p)/(prompts * generations)). At the old "
-        "200x1 that floor was ~0.037 in reward units against an observed 0.062. "
-        "Spending a fixed generation budget on more prompts beats spending it on more "
-        "generations: both cut variance by the same 1/(n*k), but more prompts also "
-        "kills the bias of scoring a 200-pair slice of dev.",
+        default=200,
+        help="Dev prompts per eval; 0 uses the whole 1000-pair dev split. 200 matches "
+        "grpo_lora.py's hard-coded cap, so the two runs' eval curves are the same "
+        "measurement. The subset is FIXED (shuffle(seed=42).select), so the wobble "
+        "between evals is pure sampling noise, sd ~= sqrt(p(1-p)/(prompts * "
+        "generations)) — at 200x1 that floor is ~0.037 in reward units against an "
+        "observed 0.062. Spending a fixed generation budget on more prompts beats "
+        "spending it on more generations: both cut variance by the same 1/(n*k), but "
+        "more prompts also kills the bias of scoring a 200-pair slice of dev.",
     )
     ap.add_argument(
         "--num-generations-eval",
         type=int,
         default=1,
-        help="Rollouts per dev prompt. SDPO Table 12 validates with 4 (with-feedback "
-        "setup) at temp 0.6/top-p 0.95. Raise --eval-prompts first; this only helps "
-        "once you are already scoring all of dev. Must divide --batch-size, which trl "
-        "uses as the eval batch (grpo_config.py:1082).",
+        help="Rollouts per dev prompt, as in grpo_lora.py. SDPO Table 12 validates "
+        "with 4 (with-feedback setup) at temp 0.6/top-p 0.95. Raise --eval-prompts "
+        "first; this only helps once you are already scoring all of dev. Must divide "
+        "--batch-size, which trl uses as the eval batch (grpo_config.py:1082).",
     )
     ap.add_argument(
         "--eval-steps",
         type=int,
-        default=200,
-        help="Optimizer steps between evals. Scoring all of dev costs ~5x the old "
-        "200-prompt eval, so this moves 50 -> 200 to hold the overhead near 9%% of "
-        "wall-clock rather than 36%%.",
-    )
-    ap.add_argument("--resume", nargs="?", const=True, default=None)
-    ap.add_argument(
-        "--no-gold-feedback",
-        action="store_true",
-        help="Do not supply the gold verdict as privileged context on MCL-WiC pairs; "
-        "those groups then teach only from successful sibling rollouts, and groups "
-        "where every rollout fails carry no distillation signal (the GRPO failure mode "
-        "SDPO is here to fix). It does NOT suppress --semcor's gloss feedback, which "
-        "is a different and strictly more informative signal: combining the two gives "
-        "a rollout set where only the gold-sense pairs are hinted, which is the clean "
-        "way to ask what the gloss feedback is worth.",
-    )
-    # ---- SemCor rollout source (the gloss-feedback one) ----
-    ap.add_argument(
-        "--semcor",
-        action="store_true",
-        help="Merge SemCor-derived pairs into the train rollout set. These are the "
-        "only pairs carrying gold WordNet senses, so they are the only ones whose "
-        "SDPO hint can name what the word actually means in each sentence; MCL-WiC "
-        "pairs keep the one-bit verdict hint.",
-    )
-    ap.add_argument("--semcor-source", default=str(semcor_pairs.DEFAULT_SOURCE))
-    ap.add_argument(
-        "--semcor-max-per-lemma",
-        type=int,
-        default=4,
-        help="Cap per (lemma, pos) per label side. SemCor annotates a few lemmas "
-        "thousands of times (one synset has 10082 usages), so without a cap the "
-        "rollout set is mostly 'be' and 'have'.",
-    )
-    ap.add_argument(
-        "--semcor-min-confusability",
-        default=None,
-        choices=semcor_pairs.CONFUSABILITY,
-        help="Keep only different-sense pairs at least this hard. 'near' restricts to "
-        "the sibling/near strata, where the teacher measurably struggles (accuracy "
-        "fell 71.2%% → 56.8%% as gold synsets got closer).",
-    )
-    ap.add_argument(
-        "--semcor-keep-test-lemmas",
-        action="store_true",
-        help="Do NOT hold out lemmas occurring in mcl-wic.test from the SemCor pairs. "
-        "Off by default: SemCor and MCL-WiC share no pairs but share many lemmas, and "
-        "training on a test lemma's sense inventory turns the held-out score into "
-        "recall rather than generalisation.",
+        default=50,
+        help="Optimizer steps between evals; 50 matches grpo_lora.py. Raise it if you "
+        "raise --eval-prompts to the full split — scoring all of dev costs ~5x the "
+        "200-prompt eval, which is ~36%% of wall-clock here against ~9%% at 200.",
     )
     args = ap.parse_args()
 
@@ -448,7 +503,7 @@ def main():
         )
     if args.batch_size % args.num_generations_eval:
         # trl raises this only after the datasets are built (grpo_config.py:1082); an
-        # eval config error should not cost a SemCor build first.
+        # eval config error should not cost a dataset build first.
         ap.error(
             f"--batch-size ({args.batch_size}) is the eval batch and must be divisible "
             f"by --num-generations-eval ({args.num_generations_eval})"
@@ -465,19 +520,11 @@ def main():
     tokenizer.pad_token = tokenizer.eos_token
 
     with_feedback = not args.no_gold_feedback
-    semcor_cfg = (
-        dict(
-            path=args.semcor_source,
-            max_per_lemma=args.semcor_max_per_lemma,
-            min_confusability=args.semcor_min_confusability,
-            exclude_lemma_splits=() if args.semcor_keep_test_lemmas else ("test",),
-        )
-        if args.semcor
-        else None
+    train_ds = build_dataset(
+        "train", with_feedback=with_feedback, semcor_path=args.semcor_pairs
     )
-    train_ds = build_dataset("train", with_feedback=with_feedback, semcor=semcor_cfg)
     dev_ds = build_dataset(
-        "dev", cap=args.eval_prompts, with_feedback=with_feedback
+        "dev", cap=args.eval_prompts or None, with_feedback=with_feedback
     )
     print(train_ds[0])
 
@@ -486,6 +533,9 @@ def main():
         dict(r=args.lora_r, lora_alpha=args.lora_alpha, lora_dropout=args.lora_dropout),
     )
 
+    # Wider than grpo_lora.py's 512: the teacher reprompt is the student prompt plus a
+    # successful sibling completion plus the hint, and max_reprompt_len below budgets
+    # from the same number.
     prompt_headroom = 768
     if args.vllm_server_host:
         vllm_kwargs = dict(
@@ -513,8 +563,12 @@ def main():
         )
     else:
         distill_mode_kwargs = dict(distillation_mode="sampled_token")
+
     reward_funcs = [as_text_reward(f) for f in REWARDS]
-    reward_weights = [1.0] * len(reward_funcs)
+    reward_weights = [
+        args.gloss_reward_weight if f.__name__ == "reward_wic_gloss" else 1.0
+        for f in REWARDS
+    ]
     reward_funcs.append(get_repetition_penalty_reward(ngram_size=3, max_penalty=-0.2))
     reward_weights.append(1.0)
     if args.soft_punish_cache > 0:
@@ -539,6 +593,14 @@ def main():
             else "overlong=mask"
         )
     )
+    print(
+        f"distillation: w={args.distillation_weight} teacher={args.teacher_kind}"
+        f"(rate={args.teacher_update_rate}) "
+        f"mode={distill_mode_kwargs['distillation_mode']} "
+        f"failures_only={args.distill_failures_only} "
+        f"successful_teacher={not args.no_successful_teacher} "
+        f"gold_feedback={with_feedback}"
+    )
 
     run_name = "qwen-lora-sdpo-wic"
     output_dir = f"./{run_name}"
@@ -547,7 +609,7 @@ def main():
         num_generations=args.num_generations,
         num_generations_eval=args.num_generations_eval,
         max_completion_length=args.max_completion_length,
-        mask_truncated_completions=True,
+        mask_truncated_completions=mask_truncated,
         loss_type=args.loss_type,
         scale_rewards=args.scale_rewards,
         epsilon=args.epsilon,
@@ -576,7 +638,7 @@ def main():
         logging_steps=25,
         report_to="wandb",
         run_name=run_name,
-        scale_rewards="none",
+        # --- SDPO-only: everything above this line matches grpo_lora.py ---------- #
         # Reverse-KL is SDPO Table 12's with-feedback divergence (Jensen-Shannon is
         # their no-feedback one). alpha=1.0 is reverse KL in trl's parameterisation.
         distillation_alpha=1.0,

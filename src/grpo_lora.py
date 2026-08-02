@@ -126,7 +126,7 @@ def main():
     ap.add_argument("--lora-dropout", type=float, default=0.05)
     ap.add_argument("--vllm-server-host", default=None)
     ap.add_argument("--vllm-server-port", type=int, default=8000)
-    ap.add_argument("--vllm-gpu-mem", type=float, default=0.3)
+    ap.add_argument("--vllm-gpu-mem", type=float, default=0.4)
     ap.add_argument("--max-completion-length", type=int, default=512)
     ap.add_argument("--beta", type=float, default=0.0)
     ap.add_argument(
