@@ -20,8 +20,12 @@ def wrap(think, answer):
     return f"<think>\n{think}\n</think>\n{answer}"
 
 
-GOOD_THINK = "the first usage names a financial institution while the second names a river edge"
-JSON_ANSWER = json.dumps({"sense1": "a financial institution", "sense2": "sloping land", "same_sense": False})
+GOOD_THINK = (
+    "the first usage names a financial institution while the second names a river edge"
+)
+JSON_ANSWER = json.dumps(
+    {"sense1": "a financial institution", "sense2": "sloping land", "same_sense": False}
+)
 
 
 # --------------------------------------------------------------------------- #
@@ -38,31 +42,37 @@ class TestWicJson:
         # {"same_sense": "true"} parses and has the right keys, but the verdict is
         # not a JSON boolean, so it forfeits WIC_JSON_BOOL.
         c = wrap(GOOD_THINK, '{"sense1": "a", "sense2": "b", "same_sense": "true"}')
-        assert R.reward_wic_json([c]) == [pytest.approx(R.WIC_JSON_PARSES + R.WIC_JSON_KEYS)]
+        assert R.reward_wic_json([c]) == [
+            pytest.approx(R.WIC_JSON_PARSES + R.WIC_JSON_KEYS)
+        ]
 
     def test_integer_verdict_loses_the_boolean_credit(self):
         # 1 is truthy and bool(1) is True, so extract_wic_label still reads a
         # verdict off it -- the JSON reward is what makes it a real boolean.
         c = wrap(GOOD_THINK, '{"sense1": "a", "sense2": "b", "same_sense": 1}')
-        assert R.reward_wic_json([c]) == [pytest.approx(R.WIC_JSON_PARSES + R.WIC_JSON_KEYS)]
+        assert R.reward_wic_json([c]) == [
+            pytest.approx(R.WIC_JSON_PARSES + R.WIC_JSON_KEYS)
+        ]
 
     @pytest.mark.parametrize(
         "answer",
         [
-            '{"same_sense": true}',                                              # missing sense keys
-            '{"sense1": "a", "sense2": "b", "same_sense": true, "conf": 0.9}',   # extra key
+            '{"same_sense": true}',  # missing sense keys
+            '{"sense1": "a", "sense2": "b", "same_sense": true, "conf": 0.9}',  # extra key
         ],
     )
     def test_wrong_key_set_loses_the_keys_credit(self, answer):
         c = wrap(GOOD_THINK, answer)
-        assert R.reward_wic_json([c]) == [pytest.approx(R.WIC_JSON_PARSES + R.WIC_JSON_BOOL)]
+        assert R.reward_wic_json([c]) == [
+            pytest.approx(R.WIC_JSON_PARSES + R.WIC_JSON_BOOL)
+        ]
 
     @pytest.mark.parametrize(
         "answer",
         [
-            "The two uses are different.",                 # prose, no JSON at all
-            '{"sense1": "a", "same_sense": tru',           # truncated / unparseable
-            "same",                                        # bare verdict token
+            "The two uses are different.",  # prose, no JSON at all
+            '{"sense1": "a", "same_sense": tru',  # truncated / unparseable
+            "same",  # bare verdict token
         ],
     )
     def test_non_json_answer_is_penalised(self, answer):
@@ -73,7 +83,7 @@ class TestWicJson:
         "completion",
         [
             "<think>the reasoning ran past the budget and never closed",  # unclosed
-            wrap(GOOD_THINK, ""),                                         # nothing after </think>
+            wrap(GOOD_THINK, ""),  # nothing after </think>
         ],
     )
     def test_no_answer_region_is_neutral_not_penalised(self, completion):
@@ -86,53 +96,88 @@ class TestWicConsistency:
     def test_fully_different_glosses_with_same_verdict_is_fully_penalised(self):
         # No token overlap ⇒ similarity 0, so a same_sense=true verdict pays the
         # full WIC_INCONSISTENT (the graded penalty's floor).
-        c = wrap(GOOD_THINK, json.dumps(
-            {"sense1": "a financial institution", "sense2": "sloping land", "same_sense": True}
-        ))
+        c = wrap(
+            GOOD_THINK,
+            json.dumps(
+                {
+                    "sense1": "a financial institution",
+                    "sense2": "sloping land",
+                    "same_sense": True,
+                }
+            ),
+        )
         assert R.reward_wic_consistency([c]) == [R.WIC_INCONSISTENT]
 
     def test_identical_glosses_with_different_verdict_is_fully_penalised(self):
         # Similarity 1 against a same_sense=false verdict ⇒ full penalty.
-        c = wrap(GOOD_THINK, json.dumps(
-            {"sense1": "a financial institution", "sense2": "a financial institution", "same_sense": False}
-        ))
+        c = wrap(
+            GOOD_THINK,
+            json.dumps(
+                {
+                    "sense1": "a financial institution",
+                    "sense2": "a financial institution",
+                    "same_sense": False,
+                }
+            ),
+        )
         assert R.reward_wic_consistency([c]) == [R.WIC_INCONSISTENT]
 
     def test_paraphrased_glosses_with_same_verdict_are_barely_penalised(self):
         # A genuine paraphrase of one sense under same_sense=true: high similarity,
         # so the graded penalty is a small nudge, strictly milder than a real
         # contradiction — this is the case exact-match used to over-punish.
-        c = wrap(GOOD_THINK, json.dumps(
-            {"sense1": "relating to clergy, in an administrative context",
-             "sense2": "relating to clergy or religious matters, in an administrative context",
-             "same_sense": True}
-        ))
+        c = wrap(
+            GOOD_THINK,
+            json.dumps(
+                {
+                    "sense1": "relating to clergy, in an administrative context",
+                    "sense2": "relating to clergy or religious matters, in an administrative context",
+                    "same_sense": True,
+                }
+            ),
+        )
         [r] = R.reward_wic_consistency([c])
         assert R.WIC_INCONSISTENT < r < 0.0
-        assert r > R.WIC_INCONSISTENT / 2   # closer to 0 than to the full penalty
+        assert r > R.WIC_INCONSISTENT / 2  # closer to 0 than to the full penalty
 
-    @pytest.mark.parametrize("verdict, sense2", [(False, "sloping land"), (True, "a financial institution")])
+    @pytest.mark.parametrize(
+        "verdict, sense2", [(False, "sloping land"), (True, "a financial institution")]
+    )
     def test_coherent_answers_are_not_penalised(self, verdict, sense2):
-        c = wrap(GOOD_THINK, json.dumps(
-            {"sense1": "a financial institution", "sense2": sense2, "same_sense": verdict}
-        ))
+        c = wrap(
+            GOOD_THINK,
+            json.dumps(
+                {
+                    "sense1": "a financial institution",
+                    "sense2": sense2,
+                    "same_sense": verdict,
+                }
+            ),
+        )
         assert R.reward_wic_consistency([c]) == [0.0]
 
     def test_gloss_equality_ignores_case_and_punctuation(self):
         # "Sloping land." and "sloping land" are the same gloss; punishing the
         # match would teach the model to game equality with cosmetic edits.
-        c = wrap(GOOD_THINK, json.dumps(
-            {"sense1": "Sloping land.", "sense2": "sloping land", "same_sense": True}
-        ))
+        c = wrap(
+            GOOD_THINK,
+            json.dumps(
+                {
+                    "sense1": "Sloping land.",
+                    "sense2": "sloping land",
+                    "same_sense": True,
+                }
+            ),
+        )
         assert R.reward_wic_consistency([c]) == [0.0]
 
     @pytest.mark.parametrize(
         "answer",
         [
-            "The two uses are different.",                                    # no JSON
-            '{"sense1": "a", "sense2": "b", "same_sense": "true"}',           # non-boolean verdict
-            '{"sense1": "", "sense2": "b", "same_sense": false}',             # empty gloss
-            '{"sense2": "b", "same_sense": false}',                           # missing gloss
+            "The two uses are different.",  # no JSON
+            '{"sense1": "a", "sense2": "b", "same_sense": "true"}',  # non-boolean verdict
+            '{"sense1": "", "sense2": "b", "same_sense": false}',  # empty gloss
+            '{"sense2": "b", "same_sense": false}',  # missing gloss
         ],
     )
     def test_unscorable_answers_are_neutral(self, answer):
@@ -146,8 +191,12 @@ class TestWicConsistency:
 # --------------------------------------------------------------------------- #
 class TestWicAccuracy:
     def test_correct_and_wrong_verdicts(self):
-        right = wrap(GOOD_THINK, json.dumps({"sense1": "a", "sense2": "b", "same_sense": True}))
-        wrong = wrap(GOOD_THINK, json.dumps({"sense1": "a", "sense2": "b", "same_sense": False}))
+        right = wrap(
+            GOOD_THINK, json.dumps({"sense1": "a", "sense2": "b", "same_sense": True})
+        )
+        wrong = wrap(
+            GOOD_THINK, json.dumps({"sense1": "a", "sense2": "b", "same_sense": False})
+        )
         assert R.reward_wic_accuracy([right, wrong], label=[True, True]) == [
             R.WIC_CORRECT,
             R.WIC_WRONG,
@@ -190,7 +239,9 @@ class TestThinkLength:
     def test_unclosed_think_is_penalised(self):
         # No closing tag -> _extract_think returns "" -> treated as a stub, which is
         # what stops the model from farming the format bonus with runaway reasoning.
-        assert R.reward_think_length(["<think>" + "reasoning " * 50]) == [R.THINK_MIN_PENALTY]
+        assert R.reward_think_length(["<think>" + "reasoning " * 50]) == [
+            R.THINK_MIN_PENALTY
+        ]
 
     def test_real_reasoning_is_not_penalised(self):
         assert R.reward_think_length([wrap(GOOD_THINK, JSON_ANSWER)]) == [0.0]
@@ -210,108 +261,8 @@ def gloss_kwargs(gold1, gold2, senses=BANK_SENSES):
     return {"gloss1": [gold1], "gloss2": [gold2], "senses": [senses]}
 
 
-class TestWicGloss:
-    def _score(self, sense1, sense2, gold1, gold2, senses=BANK_SENSES):
-        c = wrap(GOOD_THINK, json.dumps(
-            {"sense1": sense1, "sense2": sense2, "same_sense": False}
-        ))
-        [r] = R.reward_wic_gloss([c], **gloss_kwargs(gold1, gold2, senses))
-        return r
-
-    def test_glosses_naming_the_gold_senses_are_rewarded(self):
-        r = self._score(
-            "the sloping land beside a body of water",
-            "a financial institution that accepts deposits",
-            BANK_SENSES[0],
-            BANK_SENSES[1],
-        )
-        assert r == pytest.approx(R.GLOSS_MAX)
-
-    def test_glosses_naming_the_wrong_sense_of_the_lemma_are_punished(self):
-        # Both glosses are perfectly good English and the verdict could still be
-        # right -- they just describe the *other* sense. This is precisely what the
-        # binary verifier cannot see.
-        r = self._score(
-            "a financial institution that accepts deposits",
-            "the sloping land beside a body of water",
-            BANK_SENSES[0],
-            BANK_SENSES[1],
-        )
-        assert r == pytest.approx(-R.GLOSS_MAX)
-
-    def test_one_right_one_wrong_lands_between(self):
-        r = self._score(
-            "the sloping land beside a body of water",   # matches gold1
-            "a long ridge or pile",                      # gold2 is the financial sense
-            BANK_SENSES[0],
-            BANK_SENSES[1],
-        )
-        assert -R.GLOSS_MAX < r < R.GLOSS_MAX
-
-    def test_the_term_is_bounded_by_gloss_max(self):
-        # Bounded regardless of how lopsided the margin is, so the shaping budget the
-        # invariant tests below reserve cannot be overrun by an unusual lemma.
-        for r in (
-            self._score(BANK_SENSES[0], BANK_SENSES[1], BANK_SENSES[0], BANK_SENSES[1]),
-            self._score(BANK_SENSES[1], BANK_SENSES[0], BANK_SENSES[0], BANK_SENSES[1]),
-        ):
-            assert abs(r) <= R.GLOSS_MAX + 1e-9
-
-    def test_paraphrase_that_beats_every_rival_still_scores(self):
-        # Absolute overlap with gold is low (one content word), but no other sense of
-        # 'bank' fits at all -- a level-based score would punish this, a margin does not.
-        r = self._score(
-            "a place where money is kept",
-            "a place where money is kept",
-            BANK_SENSES[1],
-            BANK_SENSES[1],
-        )
-        assert r > 0
-
-    def test_gloss_sharing_no_content_word_with_any_sense_is_neutral(self):
-        # ~29% of glosses share zero content tokens with WordNet's terse wording;
-        # punishing them would reject almost indiscriminately (gloss_wordnet's
-        # gloss_unanchored calibration), so no evidence means no score.
-        assert self._score("qqq zzz", "qqq zzz", BANK_SENSES[0], BANK_SENSES[1]) == 0.0
-
-    def test_mclwic_rows_without_gold_glosses_are_neutral(self):
-        # Mixed rollout sets are the normal case: MCL-WiC carries the label only.
-        assert self._score("a river bank", "a place for money", "", "") == 0.0
-
-    def test_missing_gloss_columns_are_neutral(self):
-        c = wrap(GOOD_THINK, JSON_ANSWER)
-        assert R.reward_wic_gloss([c], label=[False]) == [0.0]
-
-    @pytest.mark.parametrize(
-        "answer",
-        [
-            "The two uses are different.",                        # no JSON at all
-            '{"sense1": "", "sense2": "", "same_sense": false}',   # empty glosses
-            '{"same_sense": false}',                              # no glosses
-        ],
-    )
-    def test_unscorable_answers_are_neutral(self, answer):
-        c = wrap(GOOD_THINK, answer)
-        [r] = R.reward_wic_gloss([c], **gloss_kwargs(BANK_SENSES[0], BANK_SENSES[1]))
-        assert r == 0.0
-
-    def test_monosemous_lemma_is_not_scored(self):
-        # One candidate sense means no rival to lose to, so the margin degenerates into
-        # the absolute similarity this term is built to avoid — and 19% of the SemCor
-        # pairs are such lemmas, which would be a lot of free reward for restating the
-        # only gloss there is.
-        r = self._score("a domestic dog", "a domestic dog", "a domestic dog",
-                        "a domestic dog", senses=["a domestic dog"])
-        assert r == 0.0
-
-
-# --------------------------------------------------------------------------- #
-# Registry wiring
-# --------------------------------------------------------------------------- #
-SHAPE_CEILING = (
-    0.2 + R.WIC_JSON_PARSES + R.WIC_JSON_KEYS + R.WIC_JSON_BOOL + R.GLOSS_MAX
-)
-SHAPE_FLOOR = R.THINK_MIN_PENALTY + R.WIC_INCONSISTENT - R.GLOSS_MAX
+SHAPE_CEILING = 0.2 + R.WIC_JSON_PARSES + R.WIC_JSON_KEYS + R.WIC_JSON_BOOL
+SHAPE_FLOOR = R.THINK_MIN_PENALTY + R.WIC_INCONSISTENT
 
 
 def test_accuracy_dominates_the_shape_rewards():
@@ -350,12 +301,18 @@ def test_a_correct_verdict_with_wrong_glosses_still_beats_a_wrong_verdict():
     # and consistency credit, so flipping the gold label is what isolates the pair of
     # terms under test: accuracy against gloss grounding.
     kw = gloss_kwargs(BANK_SENSES[0], BANK_SENSES[1])
-    swapped = wrap(GOOD_THINK, json.dumps(
-        {"sense1": BANK_SENSES[1], "sense2": BANK_SENSES[0], "same_sense": False}
-    ))
-    grounded = wrap(GOOD_THINK, json.dumps(
-        {"sense1": BANK_SENSES[0], "sense2": BANK_SENSES[1], "same_sense": False}
-    ))
+    swapped = wrap(
+        GOOD_THINK,
+        json.dumps(
+            {"sense1": BANK_SENSES[1], "sense2": BANK_SENSES[0], "same_sense": False}
+        ),
+    )
+    grounded = wrap(
+        GOOD_THINK,
+        json.dumps(
+            {"sense1": BANK_SENSES[0], "sense2": BANK_SENSES[1], "same_sense": False}
+        ),
+    )
     assert _total(swapped, False, **kw) > _total(grounded, True, **kw)
 
 
@@ -370,9 +327,12 @@ def test_an_ugly_correct_answer_still_beats_a_pretty_wrong_one():
     ugly_correct = "<think>ok</think>" + json.dumps(
         {"sense1": "a river bank", "sense2": "a place for money", "same_sense": True}
     )
-    pretty_wrong = wrap(GOOD_THINK, json.dumps(
-        {"sense1": "a river bank", "sense2": "a river bank", "same_sense": True}
-    ))
+    pretty_wrong = wrap(
+        GOOD_THINK,
+        json.dumps(
+            {"sense1": "a river bank", "sense2": "a river bank", "same_sense": True}
+        ),
+    )
     assert _total(ugly_correct, True) > _total(pretty_wrong, False)
 
 
@@ -390,11 +350,8 @@ def test_every_reward_is_registered():
         R.reward_wic_json,
         R.reward_wic_consistency,
         R.reward_think_length,
-        R.reward_wic_gloss,
     ]
     # build_dataset drops every column not listed here, so a reward kwarg missing from
     # KEEP_COLS silently becomes "not scoreable". No reward reads `pos`, but
     # sense_data.wic_messages renders it into the prompt and pair_key is built from it,
     # so it stays.
-    assert R.KEEP_COLS == ["lemma", "pos", "label", "gloss1", "gloss2", "senses"]
-    assert set(R.GLOSS_COLS) <= set(R.KEEP_COLS)

@@ -4,16 +4,21 @@ The one test that matters most here is ``test_no_test_lemma_leakage``: the whole
 point of a held-out MCL-WiC test score is that the policy has not been trained on
 those lemmas' sense inventories, and SemCor shares vocabulary with MCL-WiC even
 though it shares no pairs.
+
+The detokenizer itself is pinned in ``test_utils``; what is pinned here is that
+``mark_usage`` runs it, so the pair file is prose and its sentences stay one edit
+from their marked form.
 """
 
 import json
+import re
 
 import pytest
 
 import semcor_pairs as sp
 import sense_data as sd
 
-pytest.importorskip("nltk")
+pytest.importorskip("wn")
 
 SOURCE = sp.DEFAULT_SOURCE
 needs_source = pytest.mark.skipif(
@@ -30,7 +35,7 @@ def _wordnet_available():
 
 
 needs_wordnet = pytest.mark.skipif(
-    not _wordnet_available(), reason="NLTK WordNet corpus not downloaded"
+    not _wordnet_available(), reason=f"the {sp.LEXICON} lexicon is not downloaded"
 )
 
 
@@ -47,6 +52,26 @@ def test_mark_usage_spacing_matches_sense_data():
     """A SemCor prompt and an MCL-WiC prompt must be indistinguishable in shape."""
     ann = {"text": "The bank was closed.", "start": 4, "end": 8}
     assert sp.mark_usage(ann) == sd.mark_target("The bank was closed.", "bank")
+
+
+def test_mark_usage_undoes_ptb_tokenization():
+    """SemCor's parser spacing is a source tell in a mixed rollout batch, so the
+    pair file carries prose — not ``the league 's teams``. The target span survives
+    the rewrite byte-exact because the offsets mark it *before* detokenizing."""
+    text = "the league 's teams were `` fine , '' he said ."
+    ann = {"text": text, "start": 4, "end": 10}
+    assert text[4:10] == "league"
+    assert sp.mark_usage(ann) == "the <t> league </t>'s teams were \"fine,\" he said."
+
+
+def test_records_store_one_marked_sentence_per_side():
+    """One field per side, already marked — no bare/marked pair to drift apart, and
+    ``sense_data.pair_key`` needs the markers to tell two occurrences of one sentence
+    pair apart."""
+    ann = {"text": "the bank 's vault was n't locked .", "start": 4, "end": 8}
+    rec = sp._record("bank", "noun", ann, "bank.n.01", ann, "bank.n.01")
+    assert rec["sentence1"] == "the <t> bank </t>'s vault wasn't locked."
+    assert "usage1" not in rec and "usage2" not in rec
 
 
 def test_pos_uses_repo_spelling_not_wordnet_long_form():
@@ -140,7 +165,7 @@ def test_pairs_are_well_formed_and_balanced():
     assert sum(r["label"] for r in recs) * 2 == len(recs)
     for r in recs:
         assert r["sentence1"] != r["sentence2"]
-        assert "<t>" in r["usage1"] and "<t>" in r["usage2"]
+        assert "<t>" in r["sentence1"] and "<t>" in r["sentence2"]
         assert r["label"] == (r["synset1"] == r["synset2"])
         assert sd.pair_key(r)  # keyed like every other loader's records
 
@@ -185,6 +210,41 @@ def test_records_carry_gold_glosses_inside_their_candidate_set():
     # want of a rival sense (~19%). The bulk of the set still has to be scoreable or
     # the reward is decoration.
     assert scoreable > 0.75 * len(recs)
+
+
+@needs_source
+@needs_wordnet
+def test_every_semcor_synset_resolves():
+    """The reason this module reads WordNet through ``wn`` and not NLTK.
+
+    SemCor stores Princeton's canonical names, which are exactly what omw-en carries
+    in its ``identifier`` metadata, so coverage is total. NLTK's per-lemma index does
+    not list 247 of them (all adjective satellites) and silently returns a *different*
+    synset for several hundred more.
+    """
+    names = {s for r in sp.load_annotations(SOURCE) for s in [r["synset"]]}
+    unresolved = {n for n in names if sp.synset(n) is None}
+    assert not unresolved
+
+
+@needs_source
+@needs_wordnet
+def test_pairs_carry_no_treebank_spacing():
+    """No PTB tell survives into the pair file — that is the whole point of doing the
+    detokenization here rather than downstream.
+
+    ``stranded`` is punctuation standing alone as its own token, which is what the
+    tokenizer leaves behind. It deliberately does not match ``a .130 batting
+    average``: the corpus really does contain decimals written that way.
+    """
+    stranded = re.compile(r" [.,;:?!](?=\s|$)")
+    recs = sp.build_pairs(SOURCE, max_per_lemma=1)
+    for r in recs:
+        for side in (1, 2):
+            text = r[f"sentence{side}"]
+            assert " 's" not in text and " n't" not in text
+            assert "``" not in text and "''" not in text
+            assert not stranded.search(text), text
 
 
 @needs_source
