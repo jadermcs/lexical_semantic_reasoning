@@ -94,18 +94,33 @@ def load_gloss_records(path, default_pos="noun"):
         if missing:
             raise ValueError(f"record {i}: missing/empty {', '.join(missing)}")
         usage = r["usage"]
-        recs.append(
-            {
-                "lemma": r["lemma"],
-                "word": r["word"],
-                "pos": r.get("pos") or default_pos,
-                "usage": usage,
-                "definition": r["definition"],
-                # already-tagged inputs are left alone, so a curated file can
-                # override the fuzzy matcher's choice of span
-                "marked": usage if "<t>" in usage else sd.mark_target(usage, r["word"]),
-            }
-        )
+        rec = {
+            "lemma": r["lemma"],
+            "word": r["word"],
+            "pos": r.get("pos") or default_pos,
+            "usage": usage,
+            "definition": r["definition"],
+            # already-tagged inputs are left alone, so a curated file can
+            # override the fuzzy matcher's choice of span
+            "marked": usage if "<t>" in usage else sd.mark_target(usage, r["word"]),
+        }
+        # Optional second usage of the *same* target word. When present it
+        # replaces the constant filler in sentence 2, which is the shape the
+        # policy was actually trained on: two real contexts to triangulate from.
+        # `definition2` lets the second usage carry its own gold (a contrast
+        # pair, where the two usages are different senses).
+        if str(r.get("usage2", "")).strip():
+            u2 = r["usage2"]
+            rec["usage2"] = u2
+            rec["marked2"] = u2 if "<t>" in u2 else sd.mark_target(u2, r.get("word2") or r["word"])
+        if r.get("definition2"):
+            rec["definition2"] = r["definition2"]
+        # the lemma's full sense inventory, when the source knows it -- lets the
+        # gloss be ranked against real rival senses instead of whatever other
+        # senses happen to be in this file
+        if r.get("senses"):
+            rec["senses"] = list(r["senses"])
+        recs.append(rec)
     return recs
 
 
@@ -115,18 +130,24 @@ def build_wic_rec(rec, filler_usage=FILLER_USAGE, filler_word=FILLER_WORD):
     The target-word line names the record's own lemma, because sentence 1 is the
     only half being scored; the filler occupies sentence 2 unannounced, which is
     what keeps the surface form of the prompt identical to training.
+
+    When the record carries its own ``marked2`` -- a second real usage of the same
+    target word -- that takes sentence 2 instead. Nothing else about the prompt
+    changes, so the two conditions are a clean ablation on the second sentence.
     """
-    marked_filler = (
-        filler_usage
-        if "<t>" in filler_usage
-        else sd.mark_target(filler_usage, filler_word)
-    )
+    second = rec.get("marked2")
+    if not second:
+        second = (
+            filler_usage
+            if "<t>" in filler_usage
+            else sd.mark_target(filler_usage, filler_word)
+        )
     return {
         "task": "wic",
         "lemma": rec["lemma"],
         "pos": rec["pos"],
         "usage1": rec["marked"],
-        "usage2": marked_filler,
+        "usage2": second,
     }
 
 
@@ -153,6 +174,83 @@ def parse_glosses(decoded):
     )
 
 
+def parse_verdict(decoded):
+    """The ``same_sense`` boolean, or None when the answer did not parse.
+
+    Only meaningful in the paired conditions, where sentence 2 is a real usage:
+    there the verdict is the policy's actual trained task, and it is verifiable
+    against whether the pair was built same-sense or contrast.
+    """
+    obj = sd.parse_wic_answer(decoded) or {}
+    val = obj.get("same_sense") if isinstance(obj, dict) else None
+    return bool(val) if isinstance(val, bool) else None
+
+
+def inventory_metrics(rows, sim):
+    """Rank each gloss against the lemma's *real* sense inventory.
+
+    `sense_accuracy` can only compare against whatever other senses happen to
+    share a lemma inside the eval file. When the source ships ``senses`` -- the
+    lemma's full WordNet inventory -- the rivals are the actual competing senses,
+    which is a much stricter test. ``margin`` mirrors ``reward_wic_gloss``:
+    similarity to gold *minus* the best rival, so a gloss that is vaguely
+    definition-shaped scores near zero rather than positive.
+    """
+    scored = [
+        r
+        for r in rows
+        if r.get("gloss") and r.get("senses") and r["definition"] in r["senses"]
+    ]
+    n = hit = 0
+    margins = []
+    for row in scored:
+        rivals = [s for s in row["senses"] if s != row["definition"]]
+        if not rivals:
+            continue
+        n += 1
+        gold_sim = sim(row["gloss"], row["definition"])
+        best_rival = max(sim(row["gloss"], s) for s in rivals)
+        row["inv_correct"] = gold_sim > best_rival
+        row["inv_margin"] = gold_sim - best_rival
+        hit += row["inv_correct"]
+        margins.append(row["inv_margin"])
+    return {
+        "inv_acc": (hit / n) if n else float("nan"),
+        "inv_margin": _mean(margins),
+        "n_inv_scored": n,
+    }
+
+
+def paired_metrics(rows):
+    """Metrics that only exist when sentence 2 is a real usage.
+
+    ``agree`` is the token-F1 between the policy's two emitted glosses. In the
+    filler condition that same quantity is a *leak* detector; here it is the
+    opposite -- two usages of one sense should be glossed alike -- so it is
+    reported under its own name to keep the two readings from being confused.
+    """
+    paired = [r for r in rows if r.get("usage2")]
+    if not paired:
+        return {}
+    scored = [r for r in paired if r.get("gloss")]
+    for row in scored:
+        g2 = row.get("filler_gloss", "")
+        row["agree"] = token_f1(row["gloss"], g2) if g2 else float("nan")
+        gold2 = row.get("definition2") or row["definition"]
+        row["gloss2_f1"] = token_f1(g2, gold2) if g2 else float("nan")
+    verdicts = [r for r in paired if r.get("same_pred") is not None and "same_gold" in r]
+    return {
+        "n_paired": len(paired),
+        "agree": _mean([r["agree"] for r in scored if r.get("agree") == r.get("agree")]),
+        "gloss2_f1": _mean(
+            [r["gloss2_f1"] for r in scored if r.get("gloss2_f1") == r.get("gloss2_f1")]
+        ),
+        # the policy's own trained verdict, scored against how the pair was built
+        "verdict_acc": _mean([float(r["same_pred"] == r["same_gold"]) for r in verdicts]),
+        "n_verdict": len(verdicts),
+    }
+
+
 class _Sbert:
     """Lazy sentence-transformer, kept off the GPU vLLM is holding by default."""
 
@@ -172,6 +270,32 @@ class _Sbert:
             return []
         ea, eb = self.encode(a), self.encode(b)
         return [float((x * y).sum()) for x, y in zip(ea, eb)]
+
+
+def _bertscore(hyps, refs, model=None, device="cuda", rescale=True):
+    """BERTScore F1, the metric the definition-modelling literature reports.
+
+    This is what makes our numbers comparable to a published card: FLAN-T5's
+    reports BERT-F1 92.16 (wordnet) / 89.75 (oxford), and the unrescaled mean
+    here reproduces both. ``rescale`` additionally returns the baseline-rescaled
+    score, because raw BERTScore is badly compressed -- on these corpora the
+    whole span from "definition of an unrelated word" to the best model is about
+    0.84 to 0.93, which makes raw differences look far smaller than they are.
+
+    Returns ``(raw_f1_list, rescaled_f1_list)``; ``(None, None)`` if unavailable.
+    """
+    try:
+        from bert_score import BERTScorer
+    except ImportError:
+        print("[warn] bert-score not installed - skipping BERTScore "
+              "(uv pip install --no-deps bert-score, then run with --no-sync)")
+        return None, None
+    kw = dict(lang="en", device=device, batch_size=64)
+    raw = BERTScorer(rescale_with_baseline=False, **kw).score(hyps, refs, verbose=False)[2]
+    if not rescale:
+        return [float(x) for x in raw], None
+    res = BERTScorer(rescale_with_baseline=True, **kw).score(hyps, refs, verbose=False)[2]
+    return [float(x) for x in raw], [float(x) for x in res]
 
 
 def _bleu_chrf():
@@ -216,7 +340,7 @@ def _mean(xs):
     return statistics.mean(xs) if xs else float("nan")
 
 
-def score_rows(rows, sbert=None):
+def score_rows(rows, sbert=None, bertscore=False, bertscore_device="cuda"):
     """Attach per-row scores and roll them up. Pure CPU; no vLLM in sight."""
     bleu, chrf = _bleu_chrf()
     for row in rows:  # tolerate hand-written / older files under --score-only
@@ -236,12 +360,27 @@ def score_rows(rows, sbert=None):
     if sbert is not None:
         for row, c in zip(scored, sbert.cos(hyps, refs)):
             row["cos"] = c
+    if bertscore and scored:
+        b_raw, b_res = _bertscore(hyps, refs, device=bertscore_device)
+        if b_raw is not None:
+            for i, row in enumerate(scored):
+                row["bert_f1"] = b_raw[i]
+                if b_res is not None:
+                    row["bert_f1_rescaled"] = b_res[i]
 
     if sbert is None:
         sim = token_f1
     else:
-        # one encode pass over every distinct string, then sim is a dot product
-        vocab = list({t for r in scored for t in (r["gloss"], r["definition"])})
+        # one encode pass over every distinct string, then sim is a dot product.
+        # The sense inventories have to be in here too: `inventory_metrics` calls
+        # sim against rival senses, which are not otherwise any row's gloss.
+        vocab = list(
+            {
+                t
+                for r in scored
+                for t in (r["gloss"], r["definition"], *r.get("senses", ()))
+            }
+        )
         vecs = dict(zip(vocab, sbert.encode(vocab)))
         sim = lambda g, d: float((vecs[g] * vecs[d]).sum())  # noqa: E731
     echoes = [
@@ -260,6 +399,10 @@ def score_rows(rows, sbert=None):
         "bleu_corpus": bleu.corpus_score(hyps, [refs]).score
         if bleu is not None and hyps
         else float("nan"),
+        "bert_f1": _mean([r["bert_f1"] for r in scored if "bert_f1" in r]),
+        "bert_f1_rescaled": _mean(
+            [r["bert_f1_rescaled"] for r in scored if "bert_f1_rescaled" in r]
+        ),
         "len_gloss": _mean([len(gw._toks(r["gloss"])) for r in scored]),
         "len_gold": _mean([len(gw._toks(r["definition"])) for r in scored]),
         # sentence 2 is the same sentence every time, so a sense1 that matches
@@ -271,23 +414,54 @@ def score_rows(rows, sbert=None):
         "n_echo_scored": len(echoes),
     }
     summary.update(sense_accuracy(scored, sim))
+    summary.update(inventory_metrics(scored, sim))
+    summary.update(paired_metrics(rows))
     return summary
 
 
 def print_summary(summary, rows, k=10):
+    # the filler line only means anything when sentence 2 *is* the constant
+    # filler; in a paired run it would read as an echo rate against a real usage
+    filler = (
+        ""
+        if summary.get("n_paired")
+        else (
+            f"  filler_f1={summary['filler_f1']:.3f}"
+            f"  filler_echo={summary['filler_echo_rate']:.3f}"
+            f" (n={summary['n_echo_scored']})"
+        )
+    )
+    # BERTScore is the metric the definition-modelling papers report, so it leads
+    # its own line when present; raw is the comparable-to-published number and
+    # rescaled is the legible one
+    bert = (
+        f"\n        bertF1={summary['bert_f1']:.4f} "
+        f"(rescaled {summary['bert_f1_rescaled']:+.4f})"
+        if summary.get("bert_f1") == summary.get("bert_f1")
+        else ""
+    )
     print(
         f"\n[gloss] n={summary['n']}  scored={summary['n_scored']}  "
         f"empty={summary['empty']}\n"
         f"        f1={summary['f1']:.3f}  cos={summary['cos']:.3f}  "
         f"bleu={summary['bleu']:.2f} (corpus {summary['bleu_corpus']:.2f})  "
-        f"chrf={summary['chrf']:.2f}\n"
+        f"chrf={summary['chrf']:.2f}{bert}\n"
         f"        sense_acc={summary['sense_acc']:.3f} "
-        f"(n={summary['n_sense_scored']})  "
-        f"filler_f1={summary['filler_f1']:.3f}  "
-        f"filler_echo={summary['filler_echo_rate']:.3f} "
-        f"(n={summary['n_echo_scored']})\n"
+        f"(n={summary['n_sense_scored']}){filler}\n"
         f"        len: gloss={summary['len_gloss']:.1f} gold={summary['len_gold']:.1f}"
     )
+    if summary.get("n_inv_scored"):
+        print(
+            f"        inv_acc={summary['inv_acc']:.3f} "
+            f"margin={summary['inv_margin']:+.3f} (n={summary['n_inv_scored']}, "
+            "vs the lemma's real WordNet inventory)"
+        )
+    if summary.get("n_paired"):
+        print(
+            f"        paired: agree={summary['agree']:.3f}  "
+            f"gloss2_f1={summary['gloss2_f1']:.3f}  "
+            f"verdict_acc={summary['verdict_acc']:.3f} (n={summary['n_verdict']})"
+        )
     print(f"\nExamples (first {k}):")
     for row in rows[:k]:
         print(f"  {row['lemma']} ({row['pos']})  f1={row.get('f1', float('nan')):.2f}")
@@ -315,6 +489,9 @@ def main():
         help="free-form decode; unparseable answers then count as empty",
     )
     ap.add_argument("--no-sbert", action="store_true")
+    ap.add_argument("--bertscore", action="store_true",
+                    help="report BERTScore F1 (roberta-large), raw + baseline-rescaled")
+    ap.add_argument("--bertscore-device", default="cuda")
     ap.add_argument("--sbert-model", default="sentence-transformers/all-MiniLM-L6-v2")
     ap.add_argument("--sbert-device", default="cpu")
     ap.add_argument("--max-model-len", type=int, default=4096)
@@ -358,21 +535,30 @@ def main():
         rows = []
         for rec, decoded in zip(data, decoded_all):
             gloss, filler_gloss, think = parse_glosses(decoded)
-            rows.append(
-                {
-                    "lemma": rec["lemma"],
-                    "word": rec["word"],
-                    "pos": rec["pos"],
-                    "usage": rec["usage"],
-                    "definition": rec["definition"],
-                    "gloss": gloss,
-                    "filler_gloss": filler_gloss,
-                    "think": think,
-                }
-            )
+            row = {
+                "lemma": rec["lemma"],
+                "word": rec["word"],
+                "pos": rec["pos"],
+                "usage": rec["usage"],
+                "definition": rec["definition"],
+                "gloss": gloss,
+                "filler_gloss": filler_gloss,
+                "think": think,
+            }
+            for key in ("usage2", "definition2", "senses"):
+                if key in rec:
+                    row[key] = rec[key]
+            if "usage2" in rec:
+                row["same_pred"] = parse_verdict(decoded)
+                # a contrast pair is exactly one that carries its own gold for
+                # sentence 2, so how the pair was built is recoverable here
+                row["same_gold"] = "definition2" not in rec
+            rows.append(row)
 
     sbert = None if args.no_sbert else _Sbert(args.sbert_model, args.sbert_device)
-    summary = score_rows(rows, sbert=sbert)
+    summary = score_rows(
+        rows, sbert=sbert, bertscore=args.bertscore, bertscore_device=args.bertscore_device
+    )
     print_summary(summary, rows)
 
     # --score-only never writes over the file it read unless asked to

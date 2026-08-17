@@ -1,59 +1,3 @@
-"""WiC pairs built from SemCor's gold sense annotations — the source of SDPO feedback.
-
-MCL-WiC carries a label and nothing else, so the only privileged context SDPO can
-supply on it is the gold verdict (``sdpo_lora.gold_feedback``) — one bit, and the
-same bit the reward already encodes. SemCor is sense-annotated against WordNet, so
-every usage here comes with the *gold synset*, and the hint can say what the word
-actually means in each sentence. Measured against the API teacher's own glosses on
-``data/semcor.json``, the gold gloss overlaps them at token-F1 0.16 (46.5% share no
-content token at all), so this is genuinely new information rather than a restatement
-of what the policy already produces.
-
-It also pays off where the policy is weakest. On that same file the teacher's
-accuracy on different-sense pairs slid 71.2% → 64.0% → 60.9% → 56.8% as the two gold
-synsets got closer in WordNet, which is exactly the slice ``--min-confusability``
-lets you oversample.
-
-**Source file.** ``data/semcor_en.json.gz``, produced outside this repo — nothing here
-builds it, this module only reads it. One record per annotated token with
-``text``, ``sent_id``, character offsets ``start``/``end``, ``lemma``, ``pos`` and
-``synsets``. The offsets are why this file supersedes the older ``data/semcor.json``
-pair set — that one had already thrown the sense keys away, and re-deriving them by
-matching sentences back to NLTK SemCor left 9.1% of multi-occurrence sentences
-ambiguous about *which* occurrence was the target. Here the span is exact, so
-``mark_usage`` never has to guess and ``sense_data.mark_target``'s fuzzy fallback is
-bypassed entirely.
-
-**POS spelling matters.** Pairs are emitted with ``noun``/``verb``/``adj``/``adv`` —
-the vocabulary MCL-WiC uses and the one ``gloss_wordnet._POS`` keys on. The old
-pair file spelled these ``adjective``/``adverb``, which ``_POS.get(pos, ()) or
-(None,)`` silently degrades to a POS-blind synset lookup, so ``reward_wic_wordnet``
-was scoring adjectives against noun and verb synsets too.
-
-**Lexicon.** Gold glosses are read from NLTK's WordNet 3.0, because that is the
-inventory SemCor's annotations *refer to*; 99.05% of the synset names in the file
-resolve there (the 247 that don't are adjective satellites). This is deliberately a
-different lexicon from ``gloss_wordnet``'s Open English WordNet 2024 — that module
-snaps free-text glosses and wants a maintained inventory, whereas a gold label must
-be read in the inventory it was written in. Mapping 3.0 → OEWN would inject
-alignment drift into the one signal here that is supposed to be ground truth.
-
-**What a record carries.** Beyond the WiC fields every loader shares, each pair keeps
-``synset1``/``synset2``, their gold glosses ``gloss1``/``gloss2``, and ``senses`` — the
-*whole* WordNet 3.0 gloss inventory of the ``(lemma, pos)``, gold entries included.
-That last field is what turns a gold gloss into a scoreable target: ``gloss1`` alone
-only supports "does the emitted gloss look like this string", which is a similarity
-measure with no scale (the teacher's own correct glosses overlap gold at token-F1
-0.16). Against the inventory, the question becomes *discriminative* — is the emitted
-gloss closer to the gold sense than to the other senses of the same word — which is
-the ~1.76 bits/gloss ``sense_rewards.reward_wic_gloss`` scores. Persisting the
-inventory alongside the pair also keeps that reward pure-Python at rollout time and
-keeps every comparison inside one lexicon, so no synset ID ever has to be mapped
-across WordNet versions.
-"""
-
-from __future__ import annotations
-
 import gzip
 import json
 import random
@@ -61,53 +5,94 @@ from collections import defaultdict
 from functools import lru_cache
 from pathlib import Path
 
+from utils import detokenize, target_of  # noqa: F401  (re-exported)
+
 DATA_DIR = Path("data")
 DEFAULT_SOURCE = DATA_DIR / "semcor_en.json.gz"
 
-# Universal POS in the source file → the repo's spelling (MCL-WiC's, and the keys
-# gloss_wordnet._POS looks up). Anything else in the file is dropped.
 POS_MAP = {"NOUN": "noun", "VERB": "verb", "ADJ": "adj", "ADV": "adv"}
 
-# Confusability of two synsets of one lemma, hardest first. Ordering is what
-# ``--min-confusability`` thresholds on, so it is defined once here.
 CONFUSABILITY = ["siblings", "near", "far", "unrelated", "cross-pos"]
 
-
-def _wn():
-    """Import NLTK's WordNet lazily, with an actionable error if the corpus is absent.
-
-    Mirrors ``gloss_wordnet._wordnet``: the package is a dependency, the corpus data
-    is a separate one-time download, and importing this module must not pay for it.
-    """
-    from nltk.corpus import wordnet
-
-    try:
-        wordnet.synsets("dog")
-    except LookupError as e:
-        raise LookupError(
-            "NLTK's WordNet corpus is not installed; run:\n"
-            "  uv run python -c \"import nltk; nltk.download('wordnet')\""
-        ) from e
-    return wordnet
+# WordNet 3.0 as the `wn` package ships it: same 117 659 synsets and same offsets as
+# Princeton's release (`pwn:3.0` is no longer indexed and redirects here). Not to be
+# confused with ``gloss_wordnet``'s ``oewn:2024``, which is a *newer* inventory.
+LEXICON = "omw-en:1.4"
 
 
 @lru_cache(maxsize=1)
-def _synset_getter():
-    wn = _wn()
-    return wn.synset
+def _wn():
+    """The WordNet 3.0 handle, with an actionable error if the lexicon is absent.
+
+    Mirrors ``gloss_wordnet._wordnet``: the package is a dependency, the lexicon data
+    is a separate one-time download, and importing this module must not pay for it.
+    """
+    import wn
+
+    try:
+        w = wn.Wordnet(LEXICON)
+        if w.synsets("dog", pos="n"):
+            return w
+    except wn.Error:
+        pass
+    raise LookupError(
+        f"the {LEXICON} WordNet lexicon is not installed; run:\n"
+        f"  uv run python -c \"import wn; wn.download('{LEXICON}')\""
+    )
+
+
+@lru_cache(maxsize=1)
+def _canonical() -> dict:
+    """``lemma.pos.NN`` → synset, from the lexicon's own identifier metadata.
+
+    ``wn`` keys synsets by offset (``omw-en-09213565-n``), not by the dotted names
+    SemCor stores, but every omw-en synset carries its Princeton name in
+    ``metadata()['identifier']``. Inverting that is one pass over the lexicon (117 659
+    names, no collisions, ~0.6 s) and resolves *every* name in the corpus — where
+    NLTK fails on 247 of them (780 annotations), all adjective satellites its
+    per-lemma index does not list.
+    """
+    out: dict = {}
+    for s in _wn().synsets():
+        name = (s.metadata() or {}).get("identifier")
+        if name:
+            out.setdefault(name, s)
+    return out
+
+
+def _alias(name: str):
+    """Resolve a *non-canonical* name — ``bank.n.02`` for ``depository_...n.01``.
+
+    WordNet names a synset after its first lemma, so only that lemma's spelling is a
+    canonical name; NLTK additionally accepts any other lemma of the synset with that
+    lemma's own sense number. SemCor never uses those, but hand-written call sites and
+    tests do, so they resolve by walking the word's senses in index order. That order
+    reproduces NLTK on 98.7% of aliases and misreads a few adjective satellites — a
+    fallback worth having, not a path the corpus takes.
+    """
+    try:
+        lemma, pos, num = name.rsplit(".", 2)
+        i = int(num) - 1
+    except ValueError:
+        return None
+    # index.adj is shared by adjectives and their satellites, so both number into it.
+    words = _wn().words(lemma.replace("_", " "), pos="a" if pos == "s" else pos)
+    if not words or i < 0:
+        return None
+    senses = words[0].senses()
+    return senses[i].synset() if i < len(senses) else None
 
 
 @lru_cache(maxsize=65536)
 def synset(name: str):
     """WordNet 3.0 synset for a SemCor synset name, or None if it does not resolve.
 
-    Returns None rather than raising: the ~1% of names that miss are adjective
-    satellites, and one unresolvable synset should cost that pair, not the run.
+    Returns None rather than raising: one unresolvable synset should cost that pair,
+    not the run.
     """
-    try:
-        return _synset_getter()(name)
-    except Exception:
+    if not name:
         return None
+    return _canonical().get(name) or _alias(name)
 
 
 def gloss(name: str) -> str | None:
@@ -115,24 +100,24 @@ def gloss(name: str) -> str | None:
     return s.definition() if s is not None else None
 
 
-# NLTK's part-of-speech codes for this repo's POS spelling. Adjectives union 'a' and
-# 's' for the same reason ``gloss_wordnet._POS`` does: satellites are a separate,
+# WordNet's part-of-speech codes for this repo's POS spelling. Adjectives union 'a'
+# and 's' for the same reason ``gloss_wordnet._POS`` does: satellites are a separate,
 # disjoint POS, and SemCor annotates plenty of them.
-NLTK_POS = {"noun": ("n",), "verb": ("v",), "adj": ("a", "s"), "adv": ("r",)}
+WN_POS = {"noun": ("n",), "verb": ("v",), "adj": ("a", "s"), "adv": ("r",)}
 
 
 @lru_cache(maxsize=16384)
 def sense_inventory(lemma: str, pos: str) -> tuple[str, ...]:
     """Every WordNet 3.0 gloss of ``(lemma, pos)`` — the candidate set a gloss ranks in.
 
-    Deduplicated and order-stable. NLTK spells multiword lemmas with underscores (the
-    opposite of the `wn` package), so a lemma arriving with spaces is normalised.
+    Deduplicated and order-stable. SemCor spells multiword lemmas with underscores
+    (the opposite of the `wn` package), so they are normalised to spaces on the way in.
     """
-    wn = _wn()
-    key = str(lemma).replace(" ", "_")
+    w = _wn()
+    key = str(lemma).replace("_", " ")
     out, seen = [], set()
-    for p in NLTK_POS.get(pos, ()) or (None,):
-        for s in wn.synsets(key, pos=p):
+    for p in WN_POS.get(pos, ()) or (None,):
+        for s in w.synsets(key, pos=p):
             d = s.definition()
             if d and d not in seen:
                 seen.add(d)
@@ -152,13 +137,17 @@ def confusability(name1: str, name2: str) -> str | None:
     a, b = synset(name1), synset(name2)
     if a is None or b is None:
         return None
-    if a.pos() != b.pos():
+    if a.pos != b.pos:
         return "cross-pos"
     common = a.lowest_common_hypernyms(b)
     if common and common[0] in a.hypernyms() and common[0] in b.hypernyms():
         return "siblings"
-    dist = a.shortest_path_distance(b)
-    if dist is None:
+    try:
+        # ``wn``'s path excludes the start synset, so its length is the edge count —
+        # NLTK's ``shortest_path_distance`` with no ``-1``. It raises where NLTK
+        # returned None.
+        dist = len(a.shortest_path(b))
+    except Exception:
         return "unrelated"
     return "near" if dist <= 4 else "far"
 
@@ -203,15 +192,14 @@ def load_annotations(path=DEFAULT_SOURCE) -> list[dict]:
     ]
 
 
-def mark_usage(ann: dict) -> str:
-    """The sentence with the annotated span wrapped in <t> tags.
+@lru_cache(maxsize=65536)
+def _detok(marked: str) -> str:
+    return detokenize(marked)
 
-    Spacing matches ``sense_data.mark_target``'s ``"<t> word </t>"`` output exactly,
-    so a SemCor prompt and an MCL-WiC prompt are token-identical in shape and the
-    two can be mixed in one rollout batch without the policy seeing a tell.
-    """
+
+def mark_usage(ann: dict) -> str:
     text, i, j = ann["text"], ann["start"], ann["end"]
-    return f"{text[:i]}<t> {text[i:j]} </t>{text[j:]}"
+    return _detok(f"{text[:i]}<t> {text[i:j]} </t>{text[j:]}")
 
 
 def index_usages(anns: list[dict]) -> dict:
@@ -229,9 +217,9 @@ def _record(lemma, pos, u1, s1, u2, s2) -> dict:
     they are what ``gloss_feedback`` and ``sense_rewards.reward_wic_gloss`` read, and
     what makes this source worth more than MCL-WiC.
 
-    An unresolvable synset (an adjective satellite WordNet 3.0 will not name) yields
-    an empty gloss rather than dropping the pair: both consumers already degrade to
-    the label-only path when a gloss is missing.
+    An unresolvable synset yields an empty gloss rather than dropping the pair: both
+    consumers already degrade to the label-only path when a gloss is missing. Under
+    ``omw-en:1.4`` nothing in SemCor is unresolvable, but a hand-built record can be.
 
     So does a *different*-sense pair whose two synsets happen to carry byte-identical
     definitions — WordNet has several (``precarious.s.01`` and ``unstable.s.02`` are
@@ -253,10 +241,10 @@ def _record(lemma, pos, u1, s1, u2, s2) -> dict:
         "lemma": lemma,
         "pos": pos,
         "label": s1 == s2,
-        "sentence1": u1["text"],
-        "sentence2": u2["text"],
-        "usage1": mark_usage(u1),
-        "usage2": mark_usage(u2),
+        # Stored marked. One field per side, not a marked/unmarked pair: nothing
+        # downstream wants the bare sentence, and carrying both invited them to drift.
+        "sentence1": mark_usage(u1),
+        "sentence2": mark_usage(u2),
         "synset1": s1,
         "synset2": s2,
         "gloss1": g1,
@@ -426,10 +414,10 @@ def gloss_feedback(rec: dict) -> str:
 
     a, b = synset(rec["synset1"]), synset(rec["synset2"])
     contrast = ""
-    if a is not None and b is not None and a.pos() == b.pos():
+    if a is not None and b is not None and a.pos == b.pos:
         common = a.lowest_common_hypernyms(b)
-        if common:
-            genus = common[0].lemma_names()[0].replace("_", " ")
+        if common and common[0].lemmas():
+            genus = common[0].lemmas()[0]
             contrast = f" Both are kinds of {genus}, so the contrast is fine-grained."
     return (
         f'Hint: in sentence 1, "{lemma}" means "{g1}"; in sentence 2 it means '
@@ -442,7 +430,9 @@ def main():
     import argparse
     from collections import Counter
 
-    ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
+    ap = argparse.ArgumentParser(
+        description="Build WiC pairs from SemCor's gold sense annotations."
+    )
     ap.add_argument("--source", default=str(DEFAULT_SOURCE))
     ap.add_argument("--max-per-lemma", type=int, default=4)
     ap.add_argument("--min-confusability", default=None, choices=CONFUSABILITY)
@@ -489,8 +479,8 @@ def main():
     )
     for r in recs[: args.show]:
         print(f"\n--- {r['lemma']}/{r['pos']}  label={r['label']}")
-        print(f"  1: {r['usage1'][:120]}")
-        print(f"  2: {r['usage2'][:120]}")
+        print(f"  1: {r['sentence1'][:120]}")
+        print(f"  2: {r['sentence2'][:120]}")
         print(f"  gold: {r['gloss1']!r} | {r['gloss2']!r}  ({len(r['senses'])} senses)")
         print(f"  feedback: {gloss_feedback(r)}")
     if args.out:

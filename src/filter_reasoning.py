@@ -3,8 +3,8 @@
 Each record holds up to three ``reasonings`` (one per vote). Many are unusable:
 some are ``null``, some were emitted in Chinese, a few degenerate into repetition
 loops or truncate to a stub. The rest need a judgement call that only a model can
-make -- does the trace actually argue for the gold label, and does it support the
-sense JSON it was paired with?
+make -- does the trace actually argue for the sense JSON it was paired with, or
+does it merely land next to it?
 
 So filtering runs in two stages:
 
@@ -20,11 +20,19 @@ So filtering runs in two stages:
   defaults to the judge). Roughly half of all slots die here and never reach
   the GPU.
 * **Stage 2 (LLM judge).** Everything that survives -- i.e. only traces that
-  landed on the right answer -- is scored by a local Gemma 4 12B (QAT W4A16)
-  served with vLLM, on four axes chosen to match the ways these traces actually
-  go wrong: ``english``, ``coherent``, ``consistent`` (trace supports its paired
-  ``answers`` JSON), and ``faithful``, which now only fires when the trace's
-  prose argues against the very JSON verdict it was paired with.
+  landed on the right answer -- is scored by a local Qwen3.5-9B (AWQ int4)
+  served with vLLM, on three axes: ``english``, ``coherent``, and
+  ``consistent`` (the trace's prose actually supports its paired ``answers``
+  JSON).
+
+  There is deliberately no ``faithful`` axis. It used to ask whether the
+  trace's conclusion matched the gold label, but ``vote_check`` already
+  guarantees that exactly and for free, so every trace reaching the judge is
+  faithful by construction. Over 20,804 judgements the axis fired 346 times --
+  all of them judge errors -- and dragged ``consistent`` along with it (345 of
+  the 347 ``consistent`` failures were the same slots), because the prompt
+  showed the model the gold label before asking both questions. The gold label
+  is now withheld, which leaves ``consistent`` to make an independent call.
 
 The script *annotates* rather than deletes: it writes every reasoning back with
 its verdict and a ``keep`` flag, so the accept threshold can be retuned without
@@ -45,7 +53,12 @@ import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 
-DEFAULT_MODEL = "google/gemma-4-12B-it-qat-w4a16-ct"
+DEFAULT_MODEL = "cyankiwi/Qwen3.5-9B-AWQ-4bit"
+
+# Bumped whenever the judge schema or prompt changes. Every checkpointed verdict
+# carries it, so a resume never mixes scores from two different judge
+# definitions -- stale lines are re-judged instead of silently replayed.
+JUDGE_VERSION = 2
 
 # Any character from a writing system these traces should never contain. The
 # corpus is English-only; a single CJK codepoint means the model switched
@@ -139,7 +152,7 @@ def sense_check(rec: dict, slot: int, strict_gloss: bool = False) -> str | None:
     try:
         answer = json.loads(answers[slot])
         sense1, sense2 = answer["sense1"], answer["sense2"]
-    except (json.JSONDecodeError, KeyError, TypeError):
+    except json.JSONDecodeError, KeyError, TypeError:
         return None  # unparseable answers already die in vote_check
     same_gloss = _normalize_gloss(str(sense1)) == _normalize_gloss(str(sense2))
     if same_gloss and not bool(rec["label"]):
@@ -149,15 +162,12 @@ def sense_check(rec: dict, slot: int, strict_gloss: bool = False) -> str | None:
     return None
 
 
+JUDGE_AXES = ["english", "coherent", "consistent"]
+
 JUDGE_SCHEMA = {
     "type": "object",
-    "properties": {
-        "english": {"type": "boolean"},
-        "coherent": {"type": "boolean"},
-        "faithful": {"type": "boolean"},
-        "consistent": {"type": "boolean"},
-    },
-    "required": ["english", "coherent", "faithful", "consistent"],
+    "properties": {axis: {"type": "boolean"} for axis in JUDGE_AXES},
+    "required": JUDGE_AXES,
     "additionalProperties": False,
 }
 
@@ -170,8 +180,6 @@ Target word: {lemma} ({pos})
 Sentence 1: {sentence1}
 Sentence 2: {sentence2}
 
-GOLD ANSWER (ground truth): same_sense = {gold}
-
 The sense JSON the trace was paired with:
 {answer}
 
@@ -180,21 +188,24 @@ The reasoning trace to grade:
 {reasoning}
 \"\"\"
 
-Grade the trace on exactly four independent criteria:
+Grade the trace on exactly three independent criteria:
 
 - "english": the trace is written entirely in fluent English. false if any \
 other language appears, even partially.
 - "coherent": the trace is a well-formed, on-topic argument about the sense of \
 the target word. false if it is truncated mid-thought, repeats itself, rambles, \
 or never actually discusses the target word.
-- "faithful": the conclusion the trace reaches agrees with the GOLD ANSWER above. \
-false if the trace concludes the senses are the same when gold says different, \
-or vice versa. Grade only the conclusion, not the elegance of the argument.
 - "consistent": the trace's argument actually supports the sense JSON it was \
-paired with. false if the trace's glosses contradict sense1/sense2, or its \
-stated conclusion contradicts the JSON's same_sense field.
+paired with. false if the glosses the trace argues for contradict sense1/sense2, \
+or if the conclusion its prose reaches contradicts the JSON's same_sense field.
 
-Reply with ONLY a JSON object with these four boolean keys."""
+You are NOT being asked whether the JSON is correct. Assume it is, and judge \
+only whether the trace argues for it. A trace that reaches the right verdict by \
+an argument that contradicts its own glosses is inconsistent; a trace that \
+argues cleanly for the JSON it was given is consistent even if you would have \
+answered differently.
+
+Reply with ONLY a JSON object with these three boolean keys."""
 
 
 def build_prompt(rec: dict, slot: int) -> str:
@@ -205,7 +216,6 @@ def build_prompt(rec: dict, slot: int) -> str:
         pos=rec["pos"],
         sentence1=rec["sentence1"],
         sentence2=rec["sentence2"],
-        gold=bool(rec["label"]),
         answer=answer,
         reasoning=rec["reasonings"][slot],
     )
@@ -261,12 +271,6 @@ def main() -> int:
         help="traces per judge call; verdicts are checkpointed after each chunk",
     )
     ap.add_argument(
-        "--checkpoint",
-        type=Path,
-        default=Path("data/reasoning_verdicts.jsonl"),
-        help="resumable verdict log; delete it to re-judge from scratch",
-    )
-    ap.add_argument(
         "--limit",
         type=int,
         default=None,
@@ -288,8 +292,8 @@ def main() -> int:
     ap.add_argument(
         "--require",
         nargs="+",
-        default=["english", "coherent", "faithful", "consistent"],
-        choices=["english", "coherent", "faithful", "consistent"],
+        default=list(JUDGE_AXES),
+        choices=JUDGE_AXES,
         help="judge axes that must all be true for a trace to be kept",
     )
     args = ap.parse_args()
@@ -327,13 +331,28 @@ def main() -> int:
 
         # Resume: replay any verdicts a previous run already checkpointed.
         done: dict[tuple[int, int], dict] = {}
+        stale = 0
         if args.checkpoint.exists():
             for line in args.checkpoint.read_text().splitlines():
                 if not line.strip():
                     continue
                 v = json.loads(line)
+                # Verdicts from an older schema/prompt scored axes that no
+                # longer exist (or scored the surviving ones with the gold label
+                # in view). Re-judge them rather than mix two definitions.
+                if v.get("v") != JUDGE_VERSION:
+                    stale += 1
+                    continue
                 done[(v["record"], v["slot"])] = v
-            print(f"resuming: {len(done)} verdicts already checkpointed", file=sys.stderr)
+            print(
+                f"resuming: {len(done)} verdicts already checkpointed", file=sys.stderr
+            )
+            if stale:
+                print(
+                    f"  ignoring {stale} verdicts from an older judge version "
+                    f"(< v{JUDGE_VERSION}); they will be re-judged",
+                    file=sys.stderr,
+                )
 
         # A checkpoint may predate the current rule set, so it can hold verdicts
         # for slots the rules now reject outright; replay only what is still due.
@@ -355,19 +374,25 @@ def main() -> int:
                 max_model_len=args.max_model_len,
                 gpu_memory_utilization=args.gpu_memory_utilization,
                 max_num_seqs=args.max_num_seqs,
+                # Qwen3.5 ships a 451M-param vision tower this judge never uses,
+                # and the quant leaves it in bf16 (0.90GB of the 9.07GB
+                # checkpoint). Zeroing every modality makes vLLM skip loading the
+                # tower outright, not merely decline to profile for images --
+                # that memory becomes KV cache instead.
+                limit_mm_per_prompt={"image": 0, "video": 0},
             )
             sp = make_sampling_params(args.max_tokens)
 
             with args.checkpoint.open("a") as ckpt:
                 for start in range(0, len(todo), args.chunk_size):
                     chunk = todo[start : start + args.chunk_size]
-                    # Gemma's chat template has no system role -- everything
-                    # goes in the user turn.
                     convos = [
                         [{"role": "user", "content": build_prompt(data[i], j)}]
                         for i, j in chunk
                     ]
-                    outs = llm.chat(convos, sp)
+                    outs = llm.chat(
+                        convos, sp, chat_template_kwargs={"enable_thinking": False}
+                    )
 
                     for (i, j), out in zip(chunk, outs):
                         raw = out.outputs[0].text.strip()
@@ -385,6 +410,7 @@ def main() -> int:
                         ckpt.write(
                             json.dumps(
                                 {
+                                    "v": JUDGE_VERSION,
                                     "record": v.record,
                                     "slot": v.slot,
                                     "keep": v.keep,
@@ -411,12 +437,14 @@ def main() -> int:
     judged = [v for v in verdicts if v.stage == "judge" and v.reason == "judged"]
     if judged:
         print("\njudge axis failures:", file=sys.stderr)
-        for axis in ["english", "coherent", "faithful", "consistent"]:
+        for axis in JUDGE_AXES:
             n = sum(1 for v in judged if not v.scores.get(axis))
             print(f"  {axis:<12} false: {n:>6} / {len(judged)}", file=sys.stderr)
 
     kept = sum(1 for v in verdicts if v.keep)
-    print(f"\nkept {kept} / {total} reasoning slots ({kept / total:.1%})", file=sys.stderr)
+    print(
+        f"\nkept {kept} / {total} reasoning slots ({kept / total:.1%})", file=sys.stderr
+    )
 
     by_slot = {(v.record, v.slot): v for v in verdicts}
     for i, rec in enumerate(data):
@@ -443,7 +471,9 @@ def main() -> int:
             rec = {k: v for k, v in rec.items() if k != "reasoning_quality"}
             rec["reasonings"] = good
             filtered.append(rec)
-        args.emit_filtered.write_text(json.dumps(filtered, indent=2, ensure_ascii=False))
+        args.emit_filtered.write_text(
+            json.dumps(filtered, indent=2, ensure_ascii=False)
+        )
         print(
             f"wrote {args.emit_filtered}: {len(filtered)} / {len(data)} records retain "
             f"at least one good reasoning",

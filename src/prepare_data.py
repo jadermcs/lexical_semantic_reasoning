@@ -53,10 +53,6 @@ def balance_wic_labels(recs, seed=42):
 def build_records(wic_data, strategy="first", balance=False, seed=42):
     """Distilled, task-tagged SFT records, plus per-task counts."""
     recs = sd.load_teacher_traces(wic_data, strategy=strategy)
-    if balance:
-        before = len(recs)
-        recs = balance_wic_labels(recs, seed=seed)
-        print(f"[prepare] balanced wic labels: {before} → {len(recs)} pairs (50/50)")
     counts = {"wic": len(recs)}
     return recs, counts
 
@@ -101,9 +97,7 @@ def write_preview(recs, path, n=20):
     with Path(path).open("w") as f:
         for r in recs[:n]:
             msgs = sd.build_messages(r, with_target=True)
-            system = next(
-                (m["content"] for m in msgs if m["role"] == "system"), None
-            )
+            system = next((m["content"] for m in msgs if m["role"] == "system"), None)
             f.write(
                 json.dumps(
                     {
@@ -150,7 +144,12 @@ def main():
         default=None,
         help="Output dataset dir. Defaults to data/sft_wic-<strategy>-<data-stem>.",
     )
-    ap.add_argument("--preview", type=int, default=20, help="Examples to write to <out>.preview.jsonl.")
+    ap.add_argument(
+        "--preview",
+        type=int,
+        default=20,
+        help="Examples to write to <out>.preview.jsonl.",
+    )
     args = ap.parse_args()
 
     recs, counts = build_records(
@@ -172,7 +171,9 @@ def main():
 
     print(f"[prepare] tasks={counts} train={len(ds['train'])} dev={len(ds['dev'])}")
     print(f"[prepare] saved → {out}  (preview → {out}.preview.jsonl)")
-    print(f"[prepare] SFT-consumed WiC pairs → {out}.sft_pairs.json  ({n_pairs} pairs to exclude from GRPO)")
+    print(
+        f"[prepare] SFT-consumed WiC pairs → {out}.sft_pairs.json  ({n_pairs} pairs to exclude from GRPO)"
+    )
     print(json.dumps(ds["train"][0], indent=2, ensure_ascii=False)[:1200])
 
 

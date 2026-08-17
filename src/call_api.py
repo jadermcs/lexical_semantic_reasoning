@@ -4,12 +4,15 @@ import os
 import re
 import sys
 import time
+from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 from openai import OpenAI
 
-DEFAULT_MODEL_ID = "deepseek/deepseek-v4-flash"
+import sense_data as sd
+
+DEFAULT_MODEL_ID = "deepseek/deepseek-v4-flash-0731"
 BASE_URL = "https://openrouter.ai/api/v1"
 SAMPLES = 3  # self-consistency: k samples per pair, majority vote
 MAX_WORKERS = 8  # concurrent pairs in flight
@@ -50,9 +53,7 @@ def _safe_mark(word: str, sentence: str) -> str:
 def build_messages(
     lemma: str,
     pos: str,
-    word1: str,
     sentence1: str,
-    word2: str,
     sentence2: str,
 ) -> list[dict]:
     return [
@@ -62,8 +63,8 @@ def build_messages(
             "content": USER_TEMPLATE.format(
                 lemma=lemma,
                 pos=pos,
-                sentence1=_safe_mark(word1, sentence1),
-                sentence2=_safe_mark(word2, sentence2),
+                sentence1=sentence1,
+                sentence2=sentence2,
             ),
         },
     ]
@@ -216,9 +217,7 @@ def _evaluate_pair(client: OpenAI, model_id: str, item: dict) -> dict:
     messages = build_messages(
         item["lemma"],
         item["pos"],
-        item["word1"],
         item["sentence1"],
-        item["word2"],
         item["sentence2"],
     )
     try:
@@ -242,11 +241,123 @@ def _pair_key(item: dict) -> tuple:
     return (item["lemma"], item["pos"], item["sentence1"], item["sentence2"])
 
 
+# --------------------------------------------------------------------------- #
+# assign: open-inventory sense assignment (see sense_assign_data.py)
+# --------------------------------------------------------------------------- #
+# Unlike the wic prompt above -- which is frozen inline so the existing teacher
+# runs stay comparable -- this one is imported from `sense_data`, so the teacher
+# and the local policy are asked byte-identical questions and any gap between
+# them is the model rather than the phrasing.
+def _vote_assign(contents: list[str]) -> tuple[int | None, float, list[int | None]]:
+    """Majority vote over the sampled sense ids; ties and all-unparseable → None."""
+    votes = [sd.extract_assign_id(c) for c in contents]
+    valid = [v for v in votes if v is not None]
+    if not valid:
+        return None, 0.0, votes
+    counts = Counter(valid)
+    (top, n_top), *rest = counts.most_common()
+    if rest and rest[0][1] == n_top:  # tie → no prediction
+        return None, n_top / len(valid), votes
+    return top, n_top / len(valid), votes
+
+
+def _evaluate_assign(client: OpenAI, model_id: str, item: dict) -> dict:
+    base = {
+        k: item[k]
+        for k in (
+            "id", "lemma", "pos", "usage", "candidates",
+            "gold_index", "gold_gloss", "held_out",
+        )
+        if k in item
+    }
+    if "nearest_rival_f1" in item:
+        base["nearest_rival_f1"] = item["nearest_rival_f1"]
+    messages = sd.assign_messages(item, with_target=False)
+    try:
+        samples = [_sample(client, model_id, messages) for _ in range(SAMPLES)]
+    except Exception as e:
+        return {**base, "prediction": None, "error": str(e)}
+    contents = [c for c, _ in samples]
+    prediction, confidence, votes = _vote_assign(contents)
+    return {
+        **base,
+        "prediction": prediction,
+        "confidence": confidence,
+        "votes": votes,
+        "answers": contents,
+        "reasonings": [r for _, r in samples],
+    }
+
+
+def _assign_gloss(r: dict) -> str:
+    """The gloss from a sample that agrees with the majority vote.
+
+    Picking any sample's gloss would risk pairing the voted sense id with a gloss
+    written for a different one; this mirrors `sense_data._wic_candidates`, which
+    keeps only the samples consistent with the prediction.
+    """
+    for content in r.get("answers", []):
+        if sd.extract_assign_id(content) == r.get("prediction"):
+            return sd.extract_assign_gloss(content)
+    return ""
+
+
+def _assign_metrics(results: list[dict]) -> dict:
+    """Score the teacher with `eval_assign`'s own scorer -- one implementation.
+
+    The teacher and the trained policy are then reported on exactly the same
+    quantities (known/novel accuracy, the novel-decision F1, the coined-gloss
+    margin), which is the comparison this run exists to make.
+    """
+    import eval_assign as ea
+
+    rows = [
+        {
+            "id": r.get("id", ""),
+            "lemma": r.get("lemma", ""),
+            "pos": r.get("pos", ""),
+            "usage": r.get("usage", ""),
+            "candidates": r.get("candidates", []),
+            "gold_index": r.get("gold_index", 0),
+            "gold_gloss": r.get("gold_gloss", ""),
+            "held_out": r.get("held_out", False),
+            "nearest_rival_f1": r.get("nearest_rival_f1"),
+            "pred_index": r.get("prediction"),
+            "gloss": _assign_gloss(r),
+        }
+        for r in results
+        if "error" not in r
+    ]
+    # The paraphrase check needs sentence-transformers; it is the difference
+    # between the strict and the lenient novel recall, and running without it
+    # would report the floor as if it were the number. Failing soft keeps a long
+    # API run from dying at the scoring step over a missing local model.
+    try:
+        sbert = ea._Sbert("sentence-transformers/all-MiniLM-L6-v2", "cpu")
+    except Exception as e:
+        print(f"[warn] no SBERT ({e}); novel recall is the strict floor", file=sys.stderr)
+        sbert = None
+    summary = ea.score_rows(rows, sbert=sbert)
+    summary["n_errored"] = len(results) - len(rows)
+    return summary
+
+
+def _assign_key(item: dict) -> tuple:
+    # the full rendered question: the same usage under the known and the novel
+    # condition is two different items, and only `candidates` tells them apart
+    return (item["lemma"], item["pos"], item["usage"], tuple(item["candidates"]))
+
+
 # A task bundles the three things run() varies on: how to query one item, how to
 # key it for resume/caching, and how to score a batch of results. Adding a task
 # elsewhere in the repo means adding an entry here.
 TASKS = {
     "wic": {"evaluate": _evaluate_pair, "key": _pair_key, "metrics": _metrics},
+    "assign": {
+        "evaluate": _evaluate_assign,
+        "key": _assign_key,
+        "metrics": _assign_metrics,
+    },
 }
 
 
@@ -341,7 +452,8 @@ if __name__ == "__main__":
         "-f",
         "--file",
         required=True,
-        help="Path to the input JSON file (WiC pairs).",
+        help="Path to the input JSON file (WiC pairs, or assignment records "
+        "from sense_assign_data.py with -t assign).",
     )
     parser.add_argument("-m", "--model", default=DEFAULT_MODEL_ID)
     parser.add_argument(

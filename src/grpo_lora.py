@@ -1,26 +1,20 @@
 import argparse
 import json
 import os
-from functools import partial, wraps
+from functools import wraps
 from pathlib import Path
 
 import torch
-from datasets import Dataset
 from peft import LoraConfig
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from transformers.trainer_utils import get_last_checkpoint
 from trl import GRPOConfig, GRPOTrainer
 from trl.rewards import get_repetition_penalty_reward, get_soft_overlong_punishment
 
-import sense_data as sd
-from sense_rewards import KEEP_COLS, REWARDS
+from sense_rewards import REWARDS
+from utils import build_grpo_dataset
 
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
-
-
-def format_prompt(rec):
-    out = {"prompt": sd.wic_messages(rec, with_target=False)}
-    return out
 
 
 def as_text_reward(fn):
@@ -49,20 +43,6 @@ def load_policy(path, lora_kwargs):
     )
 
 
-def _prepare(recs, cap=None):
-    ds = Dataset.from_list(recs)
-    if cap is not None:
-        ds = ds.shuffle(seed=42).select(range(min(cap, len(ds))))
-    drop = [c for c in ds.column_names if c not in KEEP_COLS]
-    return ds.map(partial(format_prompt), remove_columns=drop)
-
-
-def build_dataset(file_path, cap=None):
-    file = Path(file_path)
-    data = json.loads(file.read_text())
-    return _prepare(data, cap=cap).train_test_split(test_size=200, seed=42)
-
-
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--model", default="Qwen/Qwen3-0.6B")
@@ -70,7 +50,7 @@ def main():
     ap.add_argument(
         "--batch-size",
         type=int,
-        default=8,
+        default=4,
     )
     ap.add_argument(
         "--num-generations",
@@ -127,6 +107,33 @@ def main():
         type=float,
         default=0.2,
     )
+    ap.add_argument(
+        "--temperature",
+        type=float,
+        default=1.0,
+        help="Rollout temperature. 0.6/top-k 20 is Qwen3's *inference* recipe; it "
+        "caps rollout diversity and manufactures unanimous groups (zero advantage). "
+        "1.0 with --top-k 0 is the usual RL setting.",
+    )
+    ap.add_argument("--top-p", type=float, default=0.95)
+    ap.add_argument("--top-k", type=int, default=0, help="0 disables top-k.")
+    ap.add_argument(
+        "--vllm-is-mode",
+        default="sequence_mask",
+        choices=["sequence_mask", "sequence_truncate", "token_mask", "token_truncate"],
+        help="How the vLLM/trainer logprob mismatch is corrected. The sequence_* "
+        "modes exponentiate a *sum* over tokens, so the correction decays "
+        "exponentially in completion length; the token_* modes do not.",
+    )
+    ap.add_argument("--max-steps", type=int, default=-1)
+    ap.add_argument("--warmup-steps", type=float, default=200)
+    ap.add_argument("--output-dir", default=None)
+    ap.add_argument("--run-name", default="qwen-lora-grpo-wic")
+    ap.add_argument("--logging-steps", type=int, default=25)
+    ap.add_argument("--eval-steps", type=int, default=50)
+    ap.add_argument(
+        "--save-strategy", default="steps", choices=["steps", "epoch", "no"]
+    )
     ap.add_argument("--resume", nargs="?", const=True, default=None)
     args = ap.parse_args()
 
@@ -155,7 +162,7 @@ def main():
     tokenizer = AutoTokenizer.from_pretrained(args.model, trust_remote_code=True)
     tokenizer.pad_token = tokenizer.eos_token
 
-    ds = build_dataset(args.file_path)
+    ds = build_grpo_dataset(args.file_path)
     train_ds = ds["train"]
     dev_ds = ds["test"]
     print(train_ds[0])
@@ -202,6 +209,8 @@ def main():
     print(
         f"objective: loss_type={args.loss_type} scale_rewards={args.scale_rewards} "
         f"clip=[{args.epsilon}, {args.epsilon_high}] beta={args.beta} "
+        f"sampling=T{args.temperature}/top_p{args.top_p}/top_k{args.top_k} "
+        f"vllm_is={args.vllm_is_mode} "
         + (
             f"overlong=shape(cache={args.soft_punish_cache}, w={args.overlong_penalty})"
             if not mask_truncated
@@ -209,8 +218,8 @@ def main():
         )
     )
 
-    run_name = "qwen-lora-grpo-wic"
-    output_dir = f"./{run_name}"
+    run_name = args.run_name
+    output_dir = args.output_dir or f"./{run_name}"
     training_args = GRPOConfig(
         output_dir=output_dir,
         num_generations=args.num_generations,
@@ -225,24 +234,26 @@ def main():
         beta=args.beta,
         disable_dropout=True,
         optim="paged_adamw_8bit",
-        temperature=0.6,
-        top_p=0.95,
-        top_k=20,
+        temperature=args.temperature,
+        top_p=args.top_p,
+        top_k=args.top_k,
         min_p=0.0,
+        vllm_importance_sampling_mode=args.vllm_is_mode,
         per_device_train_batch_size=args.batch_size,
         per_device_eval_batch_size=args.batch_size,
         gradient_accumulation_steps=grad_accum,
         num_train_epochs=2,
-        warmup_steps=0.03,
+        max_steps=args.max_steps,
+        warmup_steps=args.warmup_steps,
         learning_rate=3e-5,
         lr_scheduler_type="cosine",
         bf16=True,
         eval_strategy="steps",
-        eval_steps=50,
-        save_strategy="steps",
+        eval_steps=args.eval_steps,
+        save_strategy=args.save_strategy,
         save_steps=100,
         save_total_limit=6,
-        logging_steps=25,
+        logging_steps=args.logging_steps,
         report_to="wandb",
         run_name=run_name,
         log_completions=True,

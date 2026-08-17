@@ -8,7 +8,7 @@ verifiable rather than an estimate.
 The pipeline, in order:
 
 1. **Generate** distilled reasoning traces from a teacher (`deepseek-v4-flash`,
-   via OpenRouter) over MCL-WiC and SemCor-derived pairs.
+   via OpenRouter) over MCL-WiC pairs.
 2. **Filter** the traces for quality (cheap rules, then a local LLM judge).
 3. **SFT** warm-start the policy on the traces the teacher got right.
 4. **GRPO** on the verifiable same/different label.
@@ -82,10 +82,16 @@ for the wrong answer). Filtering runs in two stages:
   disagrees with the gold label, and any whose sense glosses contradict the label
   (identical glosses under *different*, differing glosses under *same*). Roughly
   half of all slots die here.
-* **Stage 2 — LLM judge (GPU).** Survivors are graded by a local Gemma 4 12B
-  (W4A16, vLLM, structured output) on four boolean axes: `english`, `coherent`,
-  `faithful` (conclusion matches gold), `consistent` (prose supports its paired
-  JSON). A trace is kept only if all required axes pass.
+* **Stage 2 — LLM judge (GPU).** Survivors are graded by a local Qwen3.5-9B
+  (AWQ int4, vLLM, structured output) on three boolean axes: `english`,
+  `coherent`, `consistent` (prose supports its paired JSON). A trace is kept
+  only if all required axes pass.
+
+  There is no `faithful` axis, and the judge is not shown the gold label. Stage
+  1's vote check already settles faithfulness exactly, so every survivor is
+  faithful by construction — over 20,804 judgements the axis fired 346 times,
+  every one a judge error, and correlated `consistent` into agreeing with it
+  (345 shared slots) because the label sat in the prompt above both questions.
 
 The script **annotates rather than deletes** — verdicts land in
 `*_scored.json` (and a resumable checkpoint), so the accept threshold can be

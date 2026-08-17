@@ -39,6 +39,22 @@ from vllm.sampling_params import StructuredOutputsParams
 import sense_data as sd
 
 
+def load_wic_records(path):
+    """WiC records straight off disk, in the teacher schema.
+
+    Not ``sense_data.load_teacher_traces`` (which keeps only teacher-correct pairs
+    and needs a reasoning trace) and not ``utils.build_grpo_dataset`` (which drops
+    everything outside ``KEEP_COLS``, including the two sentences): evaluation
+    needs every labelled pair, unfiltered, with its record intact.
+    """
+    raw = json.loads(Path(path).read_text())
+    return [
+        r
+        for r in raw
+        if r.get("task", "wic") == "wic" and r.get("label") is not None
+    ]
+
+
 def build_prompt(rec, tokenizer):
     msgs = sd.wic_messages(rec, with_target=False)
     return tokenizer.apply_chat_template(
@@ -68,7 +84,13 @@ def load_lora(path):
     return LoRARequest("adapter", 1, str(adapter)), int(cfg["r"])
 
 
-def generate_all(llm, texts, force_json=False, lora_request=None):
+def generate_all(llm, texts, force_json=False, lora_request=None, schema=None):
+    """Greedy completions; ``force_json`` constrains the answer region to ``schema``.
+
+    ``schema`` defaults to the WiC answer object — other tasks (``eval_assign``)
+    pass their own, which is the only thing about the two-phase decode that is
+    task-specific.
+    """
     if not force_json:
         sp = SamplingParams(temperature=0.0, max_tokens=1024)
         return [
@@ -94,7 +116,7 @@ def generate_all(llm, texts, force_json=False, lora_request=None):
     sp2 = SamplingParams(
         temperature=0.0,
         max_tokens=512,
-        structured_outputs=StructuredOutputsParams(json=WIC_JSON_SCHEMA),
+        structured_outputs=StructuredOutputsParams(json=schema or WIC_JSON_SCHEMA),
     )
     outs2 = llm.generate(
         [p + t for p, t in zip(texts, thinks)], sp2, lora_request=lora_request
@@ -136,7 +158,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--model", type=str, required=True)
     ap.add_argument("--lora", default=None)
-    ap.add_argument("--split", default="test")
+    ap.add_argument("--path", default="data/mcl-wic.test.json")
     ap.add_argument("--max-samples", type=int, default=0, help="0 = full split")
     ap.add_argument("--force-json", action="store_true")
     ap.add_argument("--max-model-len", type=int, default=4096)
@@ -154,7 +176,7 @@ def main():
     )
     tokenizer = llm.get_tokenizer()
 
-    data = sd.load_mclwic(args.split)
+    data = load_wic_records(args.path)
     if args.max_samples:
         data = data[: args.max_samples]
 
@@ -204,7 +226,7 @@ def main():
 
     # Bare list in the call_api.py teacher schema — directly consumable by
     # prepare_data.py --data. Metrics are printed above, not saved.
-    out_path = Path(args.output or f"predictions_sense_wic_{args.split}.json")
+    out_path = Path(args.output or f"predictions_sense_wic_{Path(args.path).stem}.json")
     out_path.write_text(json.dumps(records, ensure_ascii=False, indent=2))
     print(f"Saved predictions → {out_path}")
 

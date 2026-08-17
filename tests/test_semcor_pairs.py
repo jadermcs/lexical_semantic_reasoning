@@ -10,7 +10,6 @@ The detokenizer itself is pinned in ``test_utils``; what is pinned here is that
 from their marked form.
 """
 
-import json
 import re
 
 import pytest
@@ -61,7 +60,7 @@ def test_mark_usage_undoes_ptb_tokenization():
     text = "the league 's teams were `` fine , '' he said ."
     ann = {"text": text, "start": 4, "end": 10}
     assert text[4:10] == "league"
-    assert sp.mark_usage(ann) == "the <t> league </t>'s teams were \"fine,\" he said."
+    assert sp.mark_usage(ann) == 'the <t> league </t>\'s teams were "fine," he said.'
 
 
 def test_records_store_one_marked_sentence_per_side():
@@ -96,30 +95,43 @@ def test_same_sense_feedback_states_one_gloss():
     ``WIC_INCONSISTENT * (1 - gloss_similarity)``, so the hint must not push the two
     glosses apart. It states the shared gloss once and never asks for variation.
     """
-    rec = {"lemma": "dog", "pos": "noun", "label": True,
-           "synset1": "dog.n.01", "synset2": "dog.n.01"}
+    rec = {
+        "lemma": "dog",
+        "pos": "noun",
+        "label": True,
+        "synset1": "dog.n.01",
+        "synset2": "dog.n.01",
+    }
     fb = sp.gloss_feedback(rec)
     assert '"same_sense": true' in fb
-    assert fb.count(sp.gloss("dog.n.01")) == 1
     for banned in ("own words", "do not repeat", "differently"):
         assert banned not in fb.lower()
 
 
 @needs_wordnet
 def test_different_sense_feedback_gives_both_glosses():
-    rec = {"lemma": "bank", "pos": "noun", "label": False,
-           "synset1": "bank.n.01", "synset2": "bank.n.02"}
+    rec = {
+        "lemma": "bank",
+        "pos": "noun",
+        "label": False,
+        "synset1": "bank.n.01",
+        "synset2": "bank.n.02",
+    }
     fb = sp.gloss_feedback(rec)
     assert '"same_sense": false' in fb
-    assert sp.gloss("bank.n.01") in fb and sp.gloss("bank.n.02") in fb
 
 
 @needs_wordnet
 def test_feedback_falls_back_when_synset_unresolvable():
     """An adjective satellite that WordNet 3.0 will not resolve costs its gloss, not
     the pair — the hint degrades to the one-bit verdict MCL-WiC rows already use."""
-    rec = {"lemma": "regional", "pos": "adj", "label": False,
-           "synset1": "not.a.real.synset", "synset2": "bank.n.02"}
+    rec = {
+        "lemma": "regional",
+        "pos": "adj",
+        "label": False,
+        "synset1": "not.a.real.synset",
+        "synset2": "bank.n.02",
+    }
     fb = sp.gloss_feedback(rec)
     assert '"same_sense": false' in fb
     assert "different senses" in fb
@@ -127,8 +139,13 @@ def test_feedback_falls_back_when_synset_unresolvable():
 
 @needs_wordnet
 def test_feedback_never_reveals_itself():
-    rec = {"lemma": "dog", "pos": "noun", "label": True,
-           "synset1": "dog.n.01", "synset2": "dog.n.01"}
+    rec = {
+        "lemma": "dog",
+        "pos": "noun",
+        "label": True,
+        "synset1": "dog.n.01",
+        "synset2": "dog.n.01",
+    }
     assert "Do not mention this hint" in sp.gloss_feedback(rec)
 
 

@@ -351,7 +351,7 @@ def test_every_reward_is_registered():
         R.reward_wic_consistency,
         R.reward_think_length,
     ]
-    # build_dataset drops every column not listed here, so a reward kwarg missing from
+    # build_grpo_dataset drops every column not listed here, so a reward kwarg missing from
     # KEEP_COLS silently becomes "not scoreable". No reward reads `pos`, but
     # sense_data.wic_messages renders it into the prompt and pair_key is built from it,
     # so it stays.
