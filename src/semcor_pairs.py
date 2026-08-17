@@ -1,7 +1,7 @@
-"""WiC pairs built from SemCor's gold sense annotations — the source of SDPO feedback.
+"""WiC pairs built from SemCor's gold sense annotations — gold glosses for WiC usages.
 
-MCL-WiC carries a label and nothing else, so the only privileged context SDPO can
-supply on it is the gold verdict (``sdpo_lora.gold_feedback``) — one bit, and the
+MCL-WiC carries a label and nothing else, so the only privileged context a supervised
+self-distillation run can supply on it is the gold verdict — one bit, and the
 same bit the reward already encodes. SemCor is sense-annotated against WordNet, so
 every usage here comes with the *gold synset*, and the hint can say what the word
 actually means in each sentence. Measured against the API teacher's own glosses on
