@@ -348,6 +348,225 @@ def _assign_key(item: dict) -> tuple:
     return (item["lemma"], item["pos"], item["usage"], tuple(item["candidates"]))
 
 
+# --------------------------------------------------------------------------- #
+# quality: rubric-grade a raw pair, then answer it (see filter_quality.py)
+# --------------------------------------------------------------------------- #
+# `wic` asks the teacher to answer the question; this asks it to audit the
+# question first. A corpus-derived pair carries noise the gold label cannot
+# express -- OCR residue ("The * * f distance in * * f is 2.26 <t> A </t>"), a
+# marker sitting on a token that isn't the lemma, a context too thin to fix the
+# sense at all -- and such a pair teaches the policy a coin flip whatever its
+# label says. So the axes are graded before the verdict, and the `same_sense`
+# verdict at the end doubles as a label check: an item the teacher answers
+# against gold is either mislabelled or genuinely contested.
+#
+# Each axis is one independent yes/no about *one* sentence, never a summary
+# score: "is this a good example" collapses unrelated failures into a number
+# with no threshold, whereas `target_ok2 = false` names what to drop and why.
+# The value below is the axis's *good* polarity, which is what lets the metrics
+# and the filter read every axis the same way.
+QUALITY_AXES = {
+    "well_formed1": True,
+    "well_formed2": True,
+    "target_ok1": True,
+    "target_ok2": True,
+    "ambiguous1": False,
+    "ambiguous2": False,
+}
+
+QUALITY_SYSTEM = (
+    "You are an expert lexicographer auditing a word-in-context dataset. Each item "
+    "gives a lemma, its part of speech, and two sentences that each contain one "
+    "occurrence of that lemma marked with <t> tags. Inside <think> tags, inspect the "
+    "sentences one at a time -- is this usable English, is the right token marked, "
+    "does the context actually pin the sense down -- and only then compare the two "
+    "senses. After </think>, answer with a single JSON object and nothing else, with "
+    "exactly these keys: "
+    '"well_formed1", "well_formed2" (boolean, true if that sentence is fluent, '
+    "complete English, free of corpus artifacts such as OCR residue, placeholder "
+    "tokens, stray markup or a clause truncated mid-thought); "
+    '"target_ok1", "target_ok2" (boolean, true if the <t> tags in that sentence mark '
+    "a real occurrence of the lemma, used with the stated part of speech); "
+    '"ambiguous1", "ambiguous2" (boolean, true if that sentence leaves the sense of '
+    "the marked word genuinely undetermined -- a careful reader could not tell which "
+    "sense of the lemma is meant, even knowing the full inventory); "
+    '"difficulty" (integer 1-5: 1 the two uses are obviously the same or obviously '
+    "different, 5 a judgement call trained lexicographers would split on); "
+    '"sense1", "sense2" (string, the gloss of the marked word in each sentence); '
+    '"same_sense" (boolean, true if the two uses share the same sense). '
+    "Judge each sentence on its own -- a sentence is not ambiguous merely because "
+    "the other sentence uses the word differently. "
+    'Format: <think>...</think>\n{"well_formed1": ..., ..., "same_sense": ...}'
+)
+
+QUALITY_TEMPLATE = """\
+Lemma: {lemma}
+POS: {pos}
+
+Sentence 1: "{sentence1}"
+Sentence 2: "{sentence2}"
+
+Grade this item on every criterion, then decide whether the two <t>...</t> uses
+are the same sense.
+"""
+
+# Written back by the evaluator, so re-scoring a results file doesn't feed a
+# previous run's verdicts into the prompt as if they were corpus fields.
+_QUALITY_OUTPUT_KEYS = (
+    "quality", "prediction", "confidence", "votes", "answers", "reasonings", "error",
+)
+
+
+def _as_bool(value) -> bool | None:
+    """Coerce one model-emitted flag to a bool, or None if it isn't one.
+
+    Models occasionally quote the JSON booleans ("true"), which `json.loads`
+    hands back as strings; everything else -- null, a number, a missing key --
+    is a non-answer and must not be silently read as false.
+    """
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str) and value.strip().lower() in ("true", "false"):
+        return value.strip().lower() == "true"
+    return None
+
+
+def _majority_bool(values: list) -> bool | None:
+    """Majority over the samples for one axis; ties and all-invalid → None.
+
+    The task runs at k=1, where this is just "the value, if it parsed as a
+    bool"; it stays a vote so raising -k needs no other change.
+    """
+    valid = [b for b in (_as_bool(v) for v in values) if b is not None]
+    if not valid:
+        return None
+    trues = sum(valid)
+    if trues * 2 == len(valid):  # tie → no verdict, same convention as _vote
+        return None
+    return trues * 2 > len(valid)
+
+
+def _median_difficulty(values: list) -> int | None:
+    valid = sorted(
+        int(v) for v in values if isinstance(v, (int, float)) and not isinstance(v, bool)
+    )
+    return valid[len(valid) // 2] if valid else None  # median_low, k is small
+
+
+def _evaluate_quality(client: OpenAI, model_id: str, item: dict) -> dict:
+    base = {k: v for k, v in item.items() if k not in _QUALITY_OUTPUT_KEYS}
+    messages = [
+        {"role": "system", "content": QUALITY_SYSTEM},
+        {
+            "role": "user",
+            "content": QUALITY_TEMPLATE.format(
+                lemma=item["lemma"],
+                pos=item["pos"],
+                sentence1=item["sentence1"],
+                sentence2=item["sentence2"],
+            ),
+        },
+    ]
+    try:
+        samples = [_sample(client, model_id, messages) for _ in range(SAMPLES)]
+    except Exception as e:
+        return {**base, "prediction": None, "error": str(e)}
+    contents = [c for c, _ in samples]
+    objs = []
+    for content in contents:
+        try:
+            obj = json.loads(content)
+        except json.JSONDecodeError:
+            obj = None
+        objs.append(obj if isinstance(obj, dict) else None)
+
+    quality = {
+        axis: _majority_bool([o.get(axis) if o else None for o in objs])
+        for axis in QUALITY_AXES
+    }
+    quality["difficulty"] = _median_difficulty(
+        [o.get("difficulty") if o else None for o in objs]
+    )
+    quality["n_parsed"] = sum(o is not None for o in objs)
+    # `same_sense` sits in the same object as the axes, so the wic vote counter
+    # reads it unchanged -- one implementation of the majority rule.
+    prediction, confidence, votes = _vote(contents)
+    return {
+        **base,
+        "quality": quality,
+        "prediction": prediction,
+        "confidence": confidence,
+        "votes": votes,
+        "answers": contents,
+        "reasonings": [r for _, r in samples],
+    }
+
+
+def _agreement(rows: list[dict]) -> dict:
+    """Teacher-vs-gold agreement over rows that produced a usable prediction."""
+    scored = [
+        r for r in rows if r.get("prediction") is not None and r.get("label") is not None
+    ]
+    n = len(scored)
+    correct = sum(int(r["prediction"]) == int(r["label"]) for r in scored)
+    return {"n": n, "agreement": correct / n if n else 0.0}
+
+
+def _quality_metrics(results: list[dict]) -> dict:
+    """Flag rates, plus what each flag buys.
+
+    The number that matters per axis is not how often it fires but the
+    *agreement gap*: teacher-vs-gold agreement on the items it flags against
+    the items it clears. An axis whose flagged items agree with gold as often
+    as the clean ones is finding nothing worth dropping, however plausible it
+    reads.
+    """
+    scored = [r for r in results if "error" not in r and "quality" in r]
+    n = len(scored)
+    overall = _agreement(scored)
+
+    axes: dict[str, dict] = {}
+    for axis, good in QUALITY_AXES.items():
+        graded = [r for r in scored if r["quality"].get(axis) is not None]
+        flagged = [r for r in graded if bool(r["quality"][axis]) != good]
+        clean = [r for r in graded if bool(r["quality"][axis]) == good]
+        axes[axis] = {
+            "n_graded": len(graded),
+            "n_flagged": len(flagged),
+            "rate": len(flagged) / len(graded) if graded else 0.0,
+            "flagged": _agreement(flagged),
+            "clean": _agreement(clean),
+        }
+
+    def _is_flagged(r: dict) -> bool:
+        q = r["quality"]
+        return any(
+            q.get(a) is not None and bool(q[a]) != good for a, good in QUALITY_AXES.items()
+        )
+
+    any_flagged = [r for r in scored if _is_flagged(r)]
+    by_difficulty = {}
+    for level in range(1, 6):
+        rows = [r for r in scored if r["quality"].get("difficulty") == level]
+        if rows:
+            by_difficulty[level] = {"n": len(rows), **_agreement(rows)}
+
+    return {
+        "n_scored": n,
+        "n_errored": len(results) - n,
+        "n_unparsed": sum(1 for r in scored if r["quality"].get("n_parsed") == 0),
+        "overall": overall,
+        "any_flag": {
+            "n_flagged": len(any_flagged),
+            "rate": len(any_flagged) / n if n else 0.0,
+            "flagged": _agreement(any_flagged),
+            "clean": _agreement([r for r in scored if not _is_flagged(r)]),
+        },
+        "axes": axes,
+        "by_difficulty": by_difficulty,
+    }
+
+
 # A task bundles the three things run() varies on: how to query one item, how to
 # key it for resume/caching, and how to score a batch of results. Adding a task
 # elsewhere in the repo means adding an entry here.
@@ -357,6 +576,15 @@ TASKS = {
         "evaluate": _evaluate_assign,
         "key": _assign_key,
         "metrics": _assign_metrics,
+    },
+    "quality": {
+        "evaluate": _evaluate_quality,
+        "key": _pair_key,
+        "metrics": _quality_metrics,
+        # Self-consistency buys nothing here: the axes are near-deterministic
+        # surface judgements, not the contested call `wic` votes on. One call
+        # per item, k times cheaper over a corpus this size (override with -k).
+        "samples": 1,
     },
 }
 
@@ -383,8 +611,11 @@ def run(
     model_id: str = DEFAULT_MODEL_ID,
     resume_path: str | None = None,
     task: str = "wic",
+    samples: int | None = None,
 ) -> None:
     handlers = TASKS[task]
+    global SAMPLES  # the evaluators read it directly; set once, before any call
+    SAMPLES = samples or handlers.get("samples", SAMPLES)
     evaluate, key_fn, metrics_fn = (
         handlers["evaluate"],
         handlers["key"],
@@ -463,5 +694,14 @@ if __name__ == "__main__":
         "already-completed items are skipped.",
     )
     parser.add_argument("-t", "--task", choices=list(TASKS), default="wic")
+    parser.add_argument(
+        "-k",
+        "--samples",
+        type=int,
+        default=None,
+        help="Self-consistency samples per item; default is per-task (3 for wic "
+        "and assign, 1 for quality). The vote is a majority, so an even k ties "
+        "out more often than an odd one.",
+    )
     args = parser.parse_args()
-    run(args.file, args.model, args.resume, args.task)
+    run(args.file, args.model, args.resume, args.task, args.samples)
