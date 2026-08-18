@@ -12,7 +12,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--model", default="Qwen/Qwen3-0.6B")
     ap.add_argument("--epochs", type=int, default=3)
-    ap.add_argument("--lr", type=float, default=1e-4)
+    ap.add_argument("--lr", type=float, default=2e-5)
     ap.add_argument("--file_path", type=str, default="")
     ap.add_argument("--batch-size", type=int, default=4)
     ap.add_argument("--warmup-steps", type=float, default=0.02)
