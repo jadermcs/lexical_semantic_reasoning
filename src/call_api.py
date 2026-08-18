@@ -137,12 +137,41 @@ def _sample(
     raise last_err  # exhausted retries
 
 
+_DECODER = json.JSONDecoder()
+
+
+def _parse_object(content: str) -> dict | None:
+    """The first complete JSON object in *content*, or None.
+
+    `_extract_json` spans the first ``{`` to the last ``}``, which is right
+    when prose surrounds one object and wrong when the model emits two: the
+    span then covers both and `json.loads` raises "Extra data". Decoding just
+    the first object recovers those -- three of the eight unparsed items in the
+    300-pair quality pilot were a duplicated object, each copy valid on its
+    own. Strictly more permissive than `json.loads`, never less.
+
+    The other five are not recoverable here and should stay unparsed: three
+    came back with an empty body (the provider put everything in the reasoning
+    channel), one was truncated mid-object, and one leaked reasoning prose
+    containing a stray ``{`` into the answer region.
+    """
+    i = content.find("{")
+    if i < 0:
+        return None
+    try:
+        obj, _ = _DECODER.raw_decode(content[i:])
+    except json.JSONDecodeError:
+        return None
+    return obj if isinstance(obj, dict) else None
+
+
 def _vote(contents: list[str]) -> tuple[bool | None, float, list[bool | None]]:
     votes: list[bool | None] = []
     for content in contents:
+        obj = _parse_object(content)
         try:
-            v = bool(json.loads(content)["same_sense"])
-        except (json.JSONDecodeError, KeyError, TypeError):
+            v = bool(obj["same_sense"])
+        except (KeyError, TypeError):
             v = None
         votes.append(v)
     valid = [v for v in votes if v is not None]
@@ -360,7 +389,7 @@ def _assign_key(item: dict) -> tuple:
 # verdict at the end doubles as a label check: an item the teacher answers
 # against gold is either mislabelled or genuinely contested.
 #
-# Each axis is one independent yes/no about *one* sentence, never a summary
+# Each axis is one independent judgement about *one* sentence, never a summary
 # score: "is this a good example" collapses unrelated failures into a number
 # with no threshold, whereas `target_ok2 = false` names what to drop and why.
 # The value below is the axis's *good* polarity, which is what lets the metrics
@@ -370,8 +399,20 @@ QUALITY_AXES = {
     "well_formed2": True,
     "target_ok1": True,
     "target_ok2": True,
-    "ambiguous1": False,
-    "ambiguous2": False,
+}
+
+# Ordinals, kept out of QUALITY_AXES because they are thresholds rather than
+# verdicts -- the filter picks the cut, the scorer only reports the level.
+#
+# `evidence` started as a boolean `ambiguous`, and it was dead on arrival: 0 of
+# 220 items on sentence 1 and 3 of 220 on sentence 2. The bar ("a careful
+# reader could not tell which sense is meant") is one almost no real sentence
+# clears, so the axis measured nothing. Graded, the question becomes how much
+# discriminating context there is, which every sentence has an answer to.
+QUALITY_SCALES = {
+    "evidence1": (1, 3),  # higher is better: how well the context pins the sense down
+    "evidence2": (1, 3),
+    "difficulty": (1, 5),  # lower is easier
 }
 
 QUALITY_SYSTEM = (
@@ -387,15 +428,16 @@ QUALITY_SYSTEM = (
     "tokens, stray markup or a clause truncated mid-thought); "
     '"target_ok1", "target_ok2" (boolean, true if the <t> tags in that sentence mark '
     "a real occurrence of the lemma, used with the stated part of speech); "
-    '"ambiguous1", "ambiguous2" (boolean, true if that sentence leaves the sense of '
-    "the marked word genuinely undetermined -- a careful reader could not tell which "
-    "sense of the lemma is meant, even knowing the full inventory); "
+    '"evidence1", "evidence2" (integer 1-3, how far that sentence alone pins down '
+    "which sense of the lemma is meant: 1 the context is compatible with several "
+    "senses and gives no cue between them, 2 it favours one sense but does not settle "
+    "it, 3 the sense is unmistakable from this sentence); "
     '"difficulty" (integer 1-5: 1 the two uses are obviously the same or obviously '
     "different, 5 a judgement call trained lexicographers would split on); "
     '"sense1", "sense2" (string, the gloss of the marked word in each sentence); '
     '"same_sense" (boolean, true if the two uses share the same sense). '
-    "Judge each sentence on its own -- a sentence is not ambiguous merely because "
-    "the other sentence uses the word differently. "
+    "Judge each sentence on its own -- the evidence in one sentence does not depend "
+    "on how the other sentence uses the word. "
     'Format: <think>...</think>\n{"well_formed1": ..., ..., "same_sense": ...}'
 )
 
@@ -446,9 +488,16 @@ def _majority_bool(values: list) -> bool | None:
     return trues * 2 > len(valid)
 
 
-def _median_difficulty(values: list) -> int | None:
+def _median_level(values: list, lo: int, hi: int) -> int | None:
+    """Median of the samples for one ordinal, clipped to its range.
+
+    `bool` is an `int` in Python, so a flag leaking into an ordinal field would
+    otherwise score as 0 or 1 -- a valid-looking level nobody asked for.
+    """
     valid = sorted(
-        int(v) for v in values if isinstance(v, (int, float)) and not isinstance(v, bool)
+        int(v)
+        for v in values
+        if isinstance(v, (int, float)) and not isinstance(v, bool) and lo <= v <= hi
     )
     return valid[len(valid) // 2] if valid else None  # median_low, k is small
 
@@ -472,21 +521,16 @@ def _evaluate_quality(client: OpenAI, model_id: str, item: dict) -> dict:
     except Exception as e:
         return {**base, "prediction": None, "error": str(e)}
     contents = [c for c, _ in samples]
-    objs = []
-    for content in contents:
-        try:
-            obj = json.loads(content)
-        except json.JSONDecodeError:
-            obj = None
-        objs.append(obj if isinstance(obj, dict) else None)
+    objs = [_parse_object(c) for c in contents]
 
     quality = {
         axis: _majority_bool([o.get(axis) if o else None for o in objs])
         for axis in QUALITY_AXES
     }
-    quality["difficulty"] = _median_difficulty(
-        [o.get("difficulty") if o else None for o in objs]
-    )
+    for scale, (lo, hi) in QUALITY_SCALES.items():
+        quality[scale] = _median_level(
+            [o.get(scale) if o else None for o in objs], lo, hi
+        )
     quality["n_parsed"] = sum(o is not None for o in objs)
     # `same_sense` sits in the same object as the axes, so the wic vote counter
     # reads it unchanged -- one implementation of the majority rule.
@@ -545,11 +589,17 @@ def _quality_metrics(results: list[dict]) -> dict:
         )
 
     any_flagged = [r for r in scored if _is_flagged(r)]
-    by_difficulty = {}
-    for level in range(1, 6):
-        rows = [r for r in scored if r["quality"].get("difficulty") == level]
-        if rows:
-            by_difficulty[level] = {"n": len(rows), **_agreement(rows)}
+    # Reported per level rather than as a correlation: the useful question is
+    # where to put the cut, and a monotone drop across levels is what says a
+    # cut exists at all.
+    by_scale = {}
+    for scale, (lo, hi) in QUALITY_SCALES.items():
+        levels = {}
+        for level in range(lo, hi + 1):
+            rows = [r for r in scored if r["quality"].get(scale) == level]
+            if rows:
+                levels[level] = {"n": len(rows), **_agreement(rows)}
+        by_scale[scale] = levels
 
     return {
         "n_scored": n,
@@ -563,7 +613,7 @@ def _quality_metrics(results: list[dict]) -> dict:
             "clean": _agreement([r for r in scored if not _is_flagged(r)]),
         },
         "axes": axes,
-        "by_difficulty": by_difficulty,
+        "by_scale": by_scale,
     }
 
 
@@ -612,6 +662,7 @@ def run(
     resume_path: str | None = None,
     task: str = "wic",
     samples: int | None = None,
+    workers: int = MAX_WORKERS,
 ) -> None:
     handlers = TASKS[task]
     global SAMPLES  # the evaluators read it directly; set once, before any call
@@ -641,7 +692,7 @@ def run(
         results.append(r)
 
     interrupted = False
-    pool = ThreadPoolExecutor(max_workers=MAX_WORKERS)
+    pool = ThreadPoolExecutor(max_workers=workers)
     try:
         futures = {}
         for item in data:
@@ -703,5 +754,14 @@ if __name__ == "__main__":
         "and assign, 1 for quality). The vote is a majority, so an even k ties "
         "out more often than an odd one.",
     )
+    parser.add_argument(
+        "-w",
+        "--workers",
+        type=int,
+        default=MAX_WORKERS,
+        help="Concurrent items in flight (default %(default)s). Transient "
+        "rate-limit errors are retried with backoff, so overshooting costs "
+        "latency rather than results.",
+    )
     args = parser.parse_args()
-    run(args.file, args.model, args.resume, args.task, args.samples)
+    run(args.file, args.model, args.resume, args.task, args.samples, args.workers)

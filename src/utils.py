@@ -7,7 +7,7 @@ into one rollout batch, ``the league 's teams`` says which corpus a pair came fr
 before the policy has read a word of it.
 
 The invariant everything downstream depends on is span survival: ``sense_data.
-build_messages`` and ``reward_wic_gloss`` both read the marked span, so a
+build_messages`` and every gloss scorer read the marked span, so a
 detokenizer that shifts a marker by one character silently changes what the policy
 is asked about. The markers are therefore held out of the attachment rules entirely
 rather than treated as tokens.

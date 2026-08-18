@@ -192,8 +192,8 @@ def inventory_metrics(rows, sim):
     `sense_accuracy` can only compare against whatever other senses happen to
     share a lemma inside the eval file. When the source ships ``senses`` -- the
     lemma's full WordNet inventory -- the rivals are the actual competing senses,
-    which is a much stricter test. ``margin`` mirrors ``reward_wic_gloss``:
-    similarity to gold *minus* the best rival, so a gloss that is vaguely
+    which is a much stricter test. ``margin`` is similarity to gold *minus*
+    the best rival, so a gloss that is vaguely
     definition-shaped scores near zero rather than positive.
     """
     scored = [
@@ -525,12 +525,16 @@ def main():
         tokenizer = llm.get_tokenizer()
         filler = dict(filler_usage=args.filler_usage, filler_word=args.filler_word)
         texts = [build_prompt(r, tokenizer, **filler) for r in data]
-        decoded_all = ev.generate_all(
-            llm,
-            texts,
-            force_json=not args.no_force_json,
-            lora_request=lora_req,
-        )
+        # generate_all returns n completions per prompt; this eval scores one.
+        decoded_all = [
+            outs[0]
+            for outs in ev.generate_all(
+                llm,
+                texts,
+                force_json=not args.no_force_json,
+                lora_request=lora_req,
+            )
+        ]
 
         rows = []
         for rec, decoded in zip(data, decoded_all):

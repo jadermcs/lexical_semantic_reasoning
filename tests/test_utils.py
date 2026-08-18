@@ -1,6 +1,6 @@
 """Detokenization and the target-span invariant.
 
-Everything downstream (``sense_data.build_messages``, ``reward_wic_gloss``) reads the
+Everything downstream (``sense_data.build_messages``, the gloss scorers) reads the
 ``<t> ... </t>`` span, so a detokenizer that shifts a marker by one character
 silently changes what the policy is asked about. These pin that it does not.
 """

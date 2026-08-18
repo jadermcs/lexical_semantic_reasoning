@@ -21,6 +21,23 @@ double-counting a record that fails three ways::
 ``--teacher-disagrees keep`` is the one worth ablating: dropping every pair the
 teacher answers against gold removes real annotation errors *and* every pair
 hard enough to beat the teacher, which is not the same set.
+
+It is also **not label-neutral**. The teacher agrees with gold on 0.837 of
+`same` pairs but only 0.668 of `different` ones -- it over-predicts `same` --
+so dropping disagreements deletes the minority class at twice the rate and
+pushes semcor's balance from 0.736 same toward 0.77+. `--balance-labels` in
+`prepare_data.py` then discards real `same` pairs to compensate, so the cost
+lands twice. Check `label_balance` against `label_balance_input` in the report
+before training on the output.
+
+**`well_formed` is off by default** because its agreement gap is *inverted*:
+over 2,025 scored semcor pairs the items it flags agree with gold more often
+than the ones it clears (0.847 vs 0.803 on sentence 1, 0.850 vs 0.803 on
+sentence 2), and the same inversion showed up far more strongly on the
+pre-rebuild corpus. Whatever it is detecting, it is not a pair that trains
+badly, and filtering on it would delete examples that are above average. This
+is the axis-level version of the rule the metrics exist to enforce: a rubric
+that reads plausibly is worth nothing until its flags are shown to separate.
 """
 
 from __future__ import annotations
@@ -74,6 +91,11 @@ def reject(rec: dict, args) -> str | None:
     difficulty = q.get("difficulty")
     if args.max_difficulty and difficulty is not None and difficulty > args.max_difficulty:
         return "too_difficult"
+    if args.min_evidence:
+        for scale in ("evidence1", "evidence2"):
+            level = q.get(scale)
+            if level is not None and level < args.min_evidence:
+                return scale
     if rec.get("confidence") is not None and rec["confidence"] < args.min_confidence:
         return "low_confidence"
     if args.teacher_disagrees == "drop" and rec.get("label") is not None:
@@ -82,7 +104,7 @@ def reject(rec: dict, args) -> str | None:
     return None
 
 
-def main() -> None:
+def build_parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument(
         "--preds", required=True, help="predictions_*.jsonl from call_api.py -t quality"
@@ -100,9 +122,11 @@ def main() -> None:
     ap.add_argument(
         "--skip-axis",
         nargs="*",
-        default=[],
+        default=["well_formed1", "well_formed2"],
         choices=list(QUALITY_AXES),
-        help="Rubric axes to ignore when filtering.",
+        help="Rubric axes to ignore when filtering. Defaults to the well_formed "
+        "pair, whose agreement gap is inverted (see module docstring); pass the "
+        "flag with no values to filter on every axis.",
     )
     ap.add_argument(
         "--max-difficulty",
@@ -110,6 +134,15 @@ def main() -> None:
         default=None,
         help="Drop items graded harder than this (1-5). Off by default: hard is "
         "not the same as bad, and the hard items are where the reward signal is.",
+    )
+    ap.add_argument(
+        "--min-evidence",
+        type=int,
+        default=None,
+        choices=(2, 3),
+        help="Drop items where either sentence scored below this on how far its "
+        "context pins the sense down (1-3). 2 drops only the sentences graded "
+        "as giving no discriminating cue at all.",
     )
     ap.add_argument(
         "--min-confidence",
@@ -133,7 +166,11 @@ def main() -> None:
         action="store_true",
         help="Carry the quality/prediction fields into the output.",
     )
-    args = ap.parse_args()
+    return ap
+
+
+def main() -> None:
+    args = build_parser().parse_args()
 
     preds = _load_preds(Path(args.preds))
     if args.data:

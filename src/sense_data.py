@@ -45,25 +45,21 @@ def load_teacher_traces(
     raw = json.loads(Path(path).read_text())
     out = []
     for r in raw:
-        if r.get("prediction") is None or r.get("label") is None:
+        ans = r.get("answers", None)
+        if not ans:
             continue
-        if bool(r["prediction"]) != bool(r["label"]):  # teacher-correct only
-            continue
-        cands = _wic_candidates(r)
-        if not cands:
-            continue
-        chosen = _select_candidate(cands)
+        parsed = json.loads(r.get("answers", "null"))
         out.append(
             {
                 "task": "wic",
                 "lemma": r["lemma"],
                 "pos": r["pos"],
-                "label": bool(r["label"]),
                 "sentence1": r["sentence1"],
                 "sentence2": r["sentence2"],
-                "think": chosen["think"],
-                "sense1": chosen["sense1"],
-                "sense2": chosen["sense2"],
+                "think": r["reasonings"],
+                "sense1": parsed["sense1"],
+                "sense2": parsed["sense2"],
+                "label": parsed["same_sense"],
             }
         )
     return out
@@ -79,31 +75,6 @@ def pair_key(rec: dict) -> tuple:
     items differing only in which occurrence is marked.
     """
     return (rec["lemma"], rec["pos"], rec["sentence1"], rec["sentence2"])
-
-
-def _wic_candidates(rec: dict) -> list[dict]:
-    pred = bool(rec["prediction"])
-    cands = []
-    for ans, rea in zip(rec.get("answers", []), rec.get("reasonings", [])):
-        try:
-            obj = json.loads(ans)
-            same = bool(obj["same_sense"])
-        except json.JSONDecodeError, KeyError, TypeError:
-            continue
-        if same != pred or not (rea and rea.strip()):
-            continue
-        cands.append(
-            {
-                "think": rea.strip(),
-                "sense1": str(obj.get("sense1", "")).strip(),
-                "sense2": str(obj.get("sense2", "")).strip(),
-            }
-        )
-    return cands
-
-
-def _select_candidate(cands):
-    return max(cands, key=lambda c: len(c["think"]))
 
 
 def think_block(rec) -> str:
@@ -179,7 +150,7 @@ def extract_wic_label(text: str) -> bool | None:
     if obj is not None:
         try:
             return bool(obj["same_sense"])
-        except KeyError, TypeError:
+        except (KeyError, TypeError):
             pass
     seg = text.split("</think>")[-1]
     if "<think>" in seg:

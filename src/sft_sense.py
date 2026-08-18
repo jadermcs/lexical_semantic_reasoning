@@ -19,7 +19,7 @@ def main():
     ap.add_argument("--output-dir", default=None)
     args = ap.parse_args()
 
-    grad_accum = 16 // args.batch_size
+    grad_accum = max(16 // args.batch_size, 1)
     tokenizer = AutoTokenizer.from_pretrained(args.model, trust_remote_code=True)
     tokenizer.pad_token = tokenizer.eos_token
 

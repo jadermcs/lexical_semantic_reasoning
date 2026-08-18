@@ -160,3 +160,56 @@ def test_groups_are_scored_independently_within_a_batch():
     assert mask[:G] == [0] * G
     assert sum(mask[G:]) == 1
     assert builder.last_metrics["uopsd/correctable_group_fraction"] == 0.5
+
+
+def test_builder_stashes_the_global_distilled_fraction():
+    """The loss normalises by this, and only build() can see the whole generation batch."""
+    _, out, trainer = build(SPLIT_6_2)
+    assert trainer._last_active_fraction == pytest.approx(1 / 8)
+    # It is the GLOBAL fraction, not the returned local slice's mean -- identical on one
+    # rank, but it is the global one the accumulation arithmetic below needs.
+    assert trainer._last_active_fraction == pytest.approx(
+        out["self_distillation_mask"].mean().item()
+    )
+
+
+def test_renormalization_recovers_the_mean_over_distilled_rows(monkeypatch):
+    """Eq. 5 is a mean over the STEP's distilled rows, spanning gradient accumulation.
+
+    Pins the bug that made a real run train ~17x too weakly: normalising inside the
+    micro-batch looks right, but HF divides every micro-batch by gradient_accumulation_steps
+    including the ~97% holding no distilled row, so the empty ones silently shrink the step.
+    """
+    rows_per_micro, accum = 2, 128
+    losses = [0.5, 1.5, 2.0, 4.0, 3.0, 1.0, 2.5]  # one distilled row in each of 7 micros
+
+    trainer = object.__new__(U.RenormalizedSDPOTrainer)
+    trainer._last_active_fraction = len(losses) / (rows_per_micro * accum)
+
+    # The parent divides the micro-batch's summed row losses by its row count.
+    monkeypatch.setattr(
+        U.SDPOTrainer,
+        "_compute_self_distillation_loss",
+        lambda self, model, inputs, micro_sum: torch.tensor(micro_sum / rows_per_micro),
+    )
+
+    accumulated = sum(
+        trainer._compute_self_distillation_loss(
+            None, None, losses[i] if i < len(losses) else 0.0
+        ).item()
+        / accum  # transformers/trainer.py:1942
+        for i in range(accum)
+    )
+    assert accumulated == pytest.approx(sum(losses) / len(losses), rel=1e-6)
+
+
+def test_renormalization_is_a_noop_when_nothing_was_distilled(monkeypatch):
+    """Every eval batch: a group of 1 cannot disagree, so the fraction is 0."""
+    trainer = object.__new__(U.RenormalizedSDPOTrainer)
+    trainer._last_active_fraction = 0.0
+    monkeypatch.setattr(
+        U.SDPOTrainer,
+        "_compute_self_distillation_loss",
+        lambda self, model, inputs, dl: torch.tensor(0.0),
+    )
+    assert trainer._compute_self_distillation_loss(None, None, None).item() == 0.0

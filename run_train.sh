@@ -31,7 +31,7 @@ except LookupError:
     wn.download(gw.LEXICON)
 "
 
-# Gold-sense WiC pairs for reward_wic_gloss. `data/semcor_en.json.gz` is an external
+# Gold-sense WiC pairs. `data/semcor_en.json.gz` is an external
 # input (produced outside this repo); this stage only reads it and materialises the
 # sampled pairs, so a run is reproducible and NLTK stays off the trainer's path.
 # Needs NLTK's WordNet 3.0 corpus — a separate one-time download, like the lexicon above.

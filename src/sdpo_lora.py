@@ -24,7 +24,21 @@ Concretely, against the supervised SDPO this file used to run:
 * the divergence is forward KL, teacher → student (Table 5: reverse KL diverges outright,
   JSD lands at the untrained model), where supervised SDPO used reverse KL.
 
-The GRPO baseline lives in grpo_lora.py, unchanged; that is the comparison.
+The GRPO baseline lives in grpo_lora.py, unchanged; that is the comparison, and every
+knob that is not the objective is pinned to that run's value so the comparison is about
+the dense feedback and nothing else. Identical: the dataset and its split
+(``utils.build_grpo_dataset``, same file, same ``test_size=200, seed=42``), the rendered
+prompts, LoRA r=32/alpha=32/dropout 0.05, lr 3e-5 cosine with 200 warmup steps,
+``max_grad_norm`` 1.0, 2 epochs, micro-batch x grad-accum, G=16 rollouts per prompt,
+sampling at T=1.0/top-p 0.95/top-k 0/min-p 0, 512 completion tokens, ``beta=0``,
+``paged_adamw_8bit``, and the full reward stack including DAPO's overlong shaping and the
+repetition penalty -- kept not because they shape anything here (they cannot; see below)
+but so the logged ``reward`` curve is the *same statistic* as the baseline's.
+
+What differs, and only this: GRPO turns the reward into a group-relative advantage and
+takes a clipped policy-gradient step; U-OPSD ignores the reward in the loss entirely
+(``distillation_weight=1.0``) and takes a forward-KL step toward a teacher conditioned on
+the group's own consensus trace. Dense per-token target vs one scalar per rollout.
 """
 
 import argparse
@@ -37,17 +51,17 @@ from pathlib import Path
 
 import torch
 from accelerate.utils import gather_object
-from datasets import Dataset, concatenate_datasets
 from transformers import AutoTokenizer
 from transformers.trainer_callback import TrainerCallback
 from transformers.trainer_utils import get_last_checkpoint
 from trl.experimental.sdpo import SDPOConfig, SDPOTrainer
 from trl.experimental.sdpo.sdpo_trainer import SuccessfulRolloutTeacherContextBuilder
+from trl.rewards import get_repetition_penalty_reward, get_soft_overlong_punishment
 
-import semcor_pairs
 import sense_data as sd
 from grpo_lora import load_policy
-from sense_rewards import GLOSS_COLS, KEEP_COLS, REWARDS
+from sense_rewards import REWARDS
+from utils import build_grpo_dataset
 
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
@@ -68,8 +82,8 @@ SOLUTION_TEMPLATE = (
 )
 
 
-def format_prompt(rec):
-    """Render the prompt column, plus the label channel the vote is *scored* against.
+def add_privileged_context(rec):
+    """Attach the label channel the vote is *scored* against.
 
     ``privileged_context`` keeps its name because that is the only per-example column
     ``SDPOTrainer._prepare_training_batch`` forwards to the context builder, but under
@@ -80,17 +94,8 @@ def format_prompt(rec):
     pseudo-labels match the gold answer" probe, and the number that says whether a run's
     consensus is worth anything. Two independent switches therefore have to be flipped
     before a label could reach the teacher; if you touch either, drop this column too.
-
-    The gold-gloss columns ``reward_wic_gloss`` scores ride along, likewise for logging
-    only: with ``distillation_weight=1.0`` no reward enters the gradient.
     """
-    out = {
-        "prompt": sd.wic_messages(rec, with_target=False),
-        "privileged_context": "same" if bool(rec["label"]) else "different",
-    }
-    for col, default in GLOSS_COLS.items():
-        out[col] = rec.get(col) or default
-    return out
+    return {"privileged_context": "same" if bool(rec["label"]) else "different"}
 
 
 class VoteConsensusContextBuilder(SuccessfulRolloutTeacherContextBuilder):
@@ -245,6 +250,10 @@ class VoteConsensusContextBuilder(SuccessfulRolloutTeacherContextBuilder):
             "answer": answers[local],
             "pseudo_answer": pseudo_of[local],
         }
+        # The GLOBAL distilled fraction over the whole generation batch, which is what
+        # RenormalizedSDPOTrainer needs and what no per-micro-batch view can recover:
+        # by the time the loss runs, it sees 2 rows of the 256 this mask covers.
+        self.trainer._last_active_fraction = mask.mean().item()
         self.last_metrics = {
             "uopsd/valid_fraction": sum(a is not None for a in answers) / max(1, total),
             "uopsd/trusted_group_fraction": n_trusted / max(1, n_groups),
@@ -262,24 +271,35 @@ class VoteConsensusContextBuilder(SuccessfulRolloutTeacherContextBuilder):
 
 
 class RenormalizedSDPOTrainer(SDPOTrainer):
-    """Average the distillation loss over the distilled rollouts, not the micro-batch.
+    """Average the distillation loss over the step's distilled rollouts, per Eq. 5.
 
     ``_compute_self_distillation_loss`` sums the per-sequence losses and divides by the row
     count of the whole micro-batch, while masked-out rows contribute 0. That is harmless
-    when nearly every row is distilled (supervised SDPO's regime) but not here: at the
-    paper's default of one target per group of 8, it scales the gradient by ~1/8, and the
-    factor moves with the vote statistics from step to step, so the effective learning rate
-    drifts as the policy becomes more self-consistent. Eq. 5 normalises by |B_x^-|; this
-    rescales back to that.
+    when nearly every row is distilled (supervised SDPO's regime) but not here: only the
+    disagreeing rollouts of a decisive group are targets, ~2-3% of rows in practice.
+
+    The correction has to span gradient accumulation, which is the part that is easy to get
+    wrong. Normalising *within* the micro-batch is not enough, because HF divides every
+    micro-batch loss by ``gradient_accumulation_steps`` (trainer.py:1942) including the
+    ~97% that hold no distilled row at all. Writing R for the micro-batch rows, G for the
+    accumulation steps and N for the step's distilled rows, the accumulated loss is
+    ``s/(G*R) * sum(L_i)``, so recovering Eq. 5's ``mean(L_i)`` needs ``s = G*R/N`` -- i.e.
+    the reciprocal of the GLOBAL distilled fraction, ~34 at G=128/R=2, not the ~2 a
+    per-micro-batch count yields. (The same identity holds under DDP, which averages across
+    ranks: G*R*W/N_global is still 1/fraction.) Getting this wrong is silent -- the run
+    trains, ``grad_norm`` just sits ~17x below where it belongs and the curve goes flat.
     """
 
     def _compute_self_distillation_loss(self, model, inputs, distillation_logits):
         loss = super()._compute_self_distillation_loss(model, inputs, distillation_logits)
-        rows = distillation_logits.loss_mask.sum(-1)
-        active = int((rows > 0).sum().item())
-        if active == 0:
+        # Set by VoteConsensusContextBuilder.build once per generation batch, so it stays
+        # constant across the micro-batches that accumulate into one optimizer step --
+        # which is exactly the scope Eq. 5 normalises over. 0.0 means nothing was
+        # distilled anywhere (every eval batch, where a group of 1 cannot disagree).
+        frac = getattr(self, "_last_active_fraction", 0.0)
+        if not frac:
             return loss
-        return loss * (rows.numel() / active)
+        return loss / frac
 
 
 class RolloutDumpCallback(TrainerCallback):
@@ -358,64 +378,57 @@ def as_text_reward(fn):
     return wrapper
 
 
-def _prepare(recs, cap=None):
-    """Records → a Dataset carrying exactly KEEP_COLS + prompt + privileged_context.
+def build_datasets(file_path):
+    """The baseline's train/dev split verbatim, plus the vote-vs-gold diagnostic column.
 
-    Mapping each source to this fixed shape *before* concatenation is what lets the
-    two be merged: the raw records differ (SemCor adds ``synset1``/``synset2``), the
-    mapped ones do not.
+    ``utils.build_grpo_dataset`` is the function grpo_lora.py calls, so pointing both
+    scripts at the same ``--file-path`` gives them the same records, the same rendered
+    prompts, the same ``train_test_split(test_size=200, seed=42)`` and therefore the same
+    step count per epoch. The 200-pair dev split is fixed by that seed, so the wobble
+    between evals is pure sampling noise and the two eval curves are one measurement.
+
+    The eval *loss* is uninformative here (``--num-generations-eval 1`` leaves a group of
+    one, which has no disagreement, so the distillation term is masked out everywhere);
+    the reward metrics are the curve to read against GRPO's.
     """
-    ds = Dataset.from_list(recs)
-    if cap is not None:
-        ds = ds.shuffle(seed=42).select(range(min(cap, len(ds))))
-    drop = [c for c in ds.column_names if c not in KEEP_COLS]
-    return ds.map(format_prompt, remove_columns=drop)
-
-
-def build_dataset(split, cap=None, semcor_path=None):
-    """Rollout set for one split, optionally mixing in the saved SemCor pairs.
-
-    ``semcor_path`` points at the file ``semcor_pairs.py`` writes, exactly as in
-    grpo_lora.py — the pair set is materialised once (``run_train.sh`` does it) rather
-    than resampled per run, which is what makes a run reproducible and keeps NLTK off the
-    training host. Under U-OPSD those pairs contribute prompts and gloss *diagnostics*
-    only: their gold senses can no longer condition the teacher, since a hint from the
-    annotation is the supervision the method exists without.
-    """
-    parts = [_prepare(sd.load_mclwic(split), cap=cap)]
-    if semcor_path:
-        sc = semcor_pairs.load_pairs(semcor_path)
-        print(f"[{split}] semcor: +{len(sc)} gloss-annotated pairs")
-        parts.append(_prepare(sc, cap=cap))
-    if len(parts) == 1:
-        return parts[0]
-    # Interleave the sources: each prompt forms its own rollout group, but leaving
-    # them in blocks would make every optimizer step see one source only.
-    return concatenate_datasets(parts).shuffle(seed=42)
+    ds = build_grpo_dataset(file_path).map(add_privileged_context)
+    return ds["train"], ds["test"]
 
 
 def main():
     ap = argparse.ArgumentParser()
-    # --- rollout/batching knobs: grpo_lora.py's, so the runs stay comparable ------ #
+    # --- everything here is grpo_lora.py's value, so the runs stay comparable ----- #
+    # Changing any default in this block breaks the controlled comparison unless the
+    # same change is made in grpo_lora.py and the baseline is retrained.
     ap.add_argument("--model", default="Qwen/Qwen3-0.6B")
+    ap.add_argument(
+        "--file-path",
+        default="data/xl-lexeme.json",
+        help="Pair file, read through utils.build_grpo_dataset exactly as grpo_lora.py "
+        "reads it. Must be the SAME file the baseline was trained on — the finished "
+        "qwen-lora-grpo-wic run used data/mcl_train_dev.json (9000 pairs → 8800 train + "
+        "200 dev → 1100 steps at 2 epochs), not this default.",
+    )
     ap.add_argument(
         "--batch-size",
         type=int,
-        default=8,
+        default=2,
         help="Backward micro-batch, in completions. This is the knob that OOMs, and "
         "the ONLY thing it controls is peak activation memory — see --generation-batch "
-        "for the one that sets how many prompts each gradient averages over. Note the "
-        "teacher forward doubles the activation cost of a step relative to GRPO.",
+        "for the one that sets how many prompts each gradient averages over, which is "
+        "what has to match GRPO. Note the teacher forward roughly doubles a step's "
+        "activation cost relative to GRPO, so this may have to drop below the "
+        "baseline's 2 even though the gradient is unaffected.",
     )
     ap.add_argument(
         "--num-generations",
         type=int,
-        default=8,
-        help="Rollouts per prompt, i.e. the paper's G — here the resolution of the vote "
-        "and the pool the disagreeing rollouts are drawn from, not a group to centre an "
-        "advantage on. 8 is the paper's default; its Figure 4 (middle) finds G=4 and G=8 "
-        "indistinguishable and G=12 worth ~4.7%% more, so raise it if generation is not "
-        "the bottleneck. Below ~4 the vote stops being a signal at all.",
+        default=16,
+        help="Rollouts per prompt: GRPO's group to centre an advantage on, here the "
+        "resolution of the vote and the pool the disagreeing rollouts are drawn from. "
+        "16 is the baseline's. The paper defaults to 8 and its Figure 4 (middle) finds "
+        "G=4 and G=8 indistinguishable with G=12 worth ~4.7%% more, so 16 is on the "
+        "generous side of that curve — no reason to diverge from the baseline for it.",
     )
     ap.add_argument(
         "--generation-batch",
@@ -425,17 +438,26 @@ def main():
         "(this // --batch-size). Prompt groups per step = this // --num-generations, "
         "and that is what the gradient averages over.",
     )
-    ap.add_argument("--lora-r", type=int, default=64)
-    ap.add_argument("--lora-alpha", type=int, default=128)
+    ap.add_argument("--lora-r", type=int, default=32)
+    ap.add_argument("--lora-alpha", type=int, default=32)
     ap.add_argument("--lora-dropout", type=float, default=0.05)
     ap.add_argument(
         "--learning-rate",
         type=float,
-        default=5e-6,
-        help="5e-6 with LoRA r=64/alpha=128 is the paper's recipe, and both differ from "
-        "grpo_lora.py's 3e-5/r=32: a KL against a teacher that has seen a solution is a "
-        "much larger per-token signal than a clipped advantage, so the GRPO step size is "
-        "not transferable.",
+        default=3e-5,
+        help="grpo_lora.py's, held fixed so the step size is not a confound. The U-OPSD "
+        "paper's own recipe is 5e-6 with r=64/alpha=128 — a forward KL against a teacher "
+        "holding a solution is a much larger per-token signal than a clipped advantage, "
+        "so if the run diverges (watch self_distillation/distillation_loss and "
+        "completions/mean_length) this is the first thing to lower, at the cost of the "
+        "comparison being confounded.",
+    )
+    ap.add_argument(
+        "--max-grad-norm",
+        type=float,
+        default=1.0,
+        help="grpo_lora.py's (the HF default). The paper clips at 0.1 and notes KL "
+        "spikes carry through above that; same trade as --learning-rate.",
     )
     ap.add_argument("--vllm-server-host", default=None)
     ap.add_argument("--vllm-server-port", type=int, default=8000)
@@ -445,39 +467,30 @@ def main():
         type=int,
         default=512,
         help="The paper raises this to 4096 because a vote needs rollouts that reach a "
-        "boxed answer; here the answer is a short JSON object, so 512 already leaves "
-        "--vote-threshold measuring reasoning rather than truncation. Watch "
-        "uopsd/valid_fraction: if it sags, this is the knob.",
+        "boxed answer; here the answer is a short JSON object, and 512 is the baseline's. "
+        "Watch uopsd/valid_fraction: if it sags, this is the knob.",
     )
     ap.add_argument(
         "--temperature",
         type=float,
-        default=1.1,
-        help="Rollout temperature; 1.1 (with top-p 0.95 / top-k 20) is the paper's "
-        "training value and this is NOT the same knob it was under supervised SDPO. There "
-        "the gold hint guaranteed a teacher signal on every group; here the only signal is "
-        "disagreement among the rollouts, so at the repo's eval-convention 0.6 the groups "
-        "agree unanimously and uopsd/correctable_group_fraction collapses toward 0. "
-        "Evaluation still runs at 0.6.",
-    )
-    ap.add_argument(
-        "--semcor-pairs",
-        nargs="?",
-        const=str(semcor_pairs.DEFAULT_PAIRS),
-        default=None,
-        help="Mix the saved SemCor pair set into the training rollouts (bare flag uses "
-        f"{semcor_pairs.DEFAULT_PAIRS}). Build the file with 'uv run python "
-        "src/semcor_pairs.py', whose CLI carries the sampling knobs (--max-per-lemma, "
-        "--min-confusability, --keep-test-lemmas). The dev set stays pure MCL-WiC so the "
-        "eval curve remains comparable across runs.",
-    )
-    ap.add_argument(
-        "--gloss-reward-weight",
-        type=float,
         default=1.0,
-        help="Weight on reward_wic_gloss in the logged reward. Affects logging only: with "
-        "distillation_weight=1.0 no reward term enters the gradient.",
+        help="Rollout temperature, grpo_lora.py's. The paper trains at 1.1/top-k 20, but "
+        "1.0/top-k 0 is strictly the more diverse setting, and diversity is what the vote "
+        "needs: the only signal here is disagreement among the rollouts, so if "
+        "uopsd/correctable_group_fraction collapses toward 0 this is the knob — at the "
+        "cost of no longer sampling like the baseline.",
     )
+    ap.add_argument("--top-p", type=float, default=0.95)
+    ap.add_argument("--top-k", type=int, default=0, help="0 disables top-k.")
+    ap.add_argument(
+        "--soft-punish-cache",
+        type=int,
+        default=128,
+        help="DAPO overlong shaping, as in grpo_lora.py. Diagnostic only here — no "
+        "reward reaches the gradient — but kept so the logged reward is the same "
+        "statistic as the baseline's. 0 masks truncated completions instead.",
+    )
+    ap.add_argument("--overlong-penalty", type=float, default=0.2)
     # --- U-OPSD: the vote that replaces the gold label ---------------------- #
     ap.add_argument(
         "--vote-threshold",
@@ -571,21 +584,14 @@ def main():
         "under U-OPSD it is also the only way to see what the vote agreed on.",
     )
     ap.add_argument("--resume", nargs="?", const=True, default=None)
-    # --- eval: grpo_lora.py's settings, exposed because SDPO evals cost more --- #
+    # --- schedule/eval: grpo_lora.py's settings ----------------------------- #
+    ap.add_argument("--max-steps", type=int, default=-1)
+    ap.add_argument("--warmup-steps", type=float, default=200)
+    ap.add_argument("--output-dir", default=None)
+    ap.add_argument("--run-name", default="qwen-lora-uopsd-wic")
+    ap.add_argument("--logging-steps", type=int, default=25)
     ap.add_argument(
-        "--eval-prompts",
-        type=int,
-        default=200,
-        help="Dev prompts per eval; 0 uses the whole 1000-pair dev split. 200 matches "
-        "grpo_lora.py's hard-coded cap, so the two runs' eval curves are the same "
-        "measurement. The subset is FIXED (shuffle(seed=42).select), so the wobble "
-        "between evals is pure sampling noise, sd ~= sqrt(p(1-p)/(prompts * "
-        "generations)) — at 200x1 that floor is ~0.037 in reward units. Spending a fixed "
-        "generation budget on more prompts beats spending it on more generations: both "
-        "cut variance by the same 1/(n*k), but more prompts also kills the bias of "
-        "scoring a 200-pair slice of dev. The eval loss is uninformative here (a group of "
-        "1 has no disagreement, so the distillation term is masked out everywhere); the "
-        "reward metrics are the curve to read.",
+        "--save-strategy", default="steps", choices=["steps", "epoch", "no"]
     )
     ap.add_argument(
         "--num-generations-eval",
@@ -640,8 +646,7 @@ def main():
     tokenizer = AutoTokenizer.from_pretrained(args.model, trust_remote_code=True)
     tokenizer.pad_token = tokenizer.eos_token
 
-    train_ds = build_dataset("train", semcor_path=args.semcor_pairs)
-    dev_ds = build_dataset("dev", cap=args.eval_prompts or None)
+    train_ds, dev_ds = build_datasets(args.file_path)
     print(train_ds[0])
 
     model, peft_config = load_policy(
@@ -649,9 +654,11 @@ def main():
         dict(r=args.lora_r, lora_alpha=args.lora_alpha, lora_dropout=args.lora_dropout),
     )
 
-    # Wider than grpo_lora.py's 512: the teacher reprompt is the student prompt plus the
-    # pseudo-solution, and max_reprompt_len below budgets from the same number.
-    prompt_headroom = 768
+    # grpo_lora.py's, and it budgets the same thing: the *student's* prompt, which is
+    # byte-identical to the baseline's. The teacher reprompt is wider (student prompt +
+    # a whole pseudo-solution) but never goes through vLLM, so it is budgeted separately
+    # by max_reprompt_len below.
+    prompt_headroom = 512
     if args.vllm_server_host:
         vllm_kwargs = dict(
             use_vllm=True,
@@ -685,13 +692,28 @@ def main():
 
     # Rewards are kept purely as gold-label diagnostics: distillation_weight=1.0 means
     # compute_loss never calls _compute_policy_loss, so advantages — and therefore these
-    # rewards — do not reach the gradient. DAPO's overlong shaping and the repetition
-    # penalty are dropped with the policy term they used to shape.
+    # rewards — do not reach the gradient. That is exactly why grpo_lora.py's full stack
+    # is reproduced here rather than trimmed to the terms that "matter": the logged
+    # reward has to be the same statistic as the baseline's to be read against it, and a
+    # shaping term that cannot shape anything costs nothing but the forward pass.
     reward_funcs = [as_text_reward(f) for f in REWARDS]
-    reward_weights = [
-        args.gloss_reward_weight if f.__name__ == "reward_wic_gloss" else 1.0
-        for f in REWARDS
-    ]
+    reward_weights = [1.0 for f in REWARDS]
+    reward_funcs.append(get_repetition_penalty_reward(ngram_size=3, max_penalty=-0.2))
+    reward_weights.append(1.0)
+    if args.soft_punish_cache > 0:
+        # Not wrapped in as_text_reward: this one scores completion_ids, not text.
+        reward_funcs.append(
+            get_soft_overlong_punishment(
+                max_completion_len=args.max_completion_length,
+                soft_punish_cache=args.soft_punish_cache,
+            )
+        )
+        reward_weights.append(args.overlong_penalty)
+    # An unparsable rollout is excluded from the vote and can never be a distillation
+    # target, so truncation is already handled upstream of the loss; this follows the
+    # baseline only because zeroing a completion mask would also corrupt the teacher
+    # alignment, which is the stronger reason to leave it off.
+    mask_truncated = args.soft_punish_cache == 0
     print(
         f"distillation: forward={args.divergence} (alpha={alpha}) "
         f"mode={distill_mode_kwargs['distillation_mode']} "
@@ -700,41 +722,52 @@ def main():
         f"ref={args.teacher_reference} targets={args.distill_targets or 'all'}"
         f"({args.distill_target_select}) renorm={args.renormalize_distillation}"
     )
+    # The parity line: every field here must read the same in grpo_lora.py's launch log
+    # for the comparison to be about the objective. Rewards are logged, never gradient.
+    print(
+        f"parity vs grpo_lora: data={args.file_path} lora=r{args.lora_r}/a{args.lora_alpha} "
+        f"lr={args.learning_rate} clip={args.max_grad_norm} warmup={args.warmup_steps} "
+        f"sampling=T{args.temperature}/top_p{args.top_p}/top_k{args.top_k} "
+        f"len={args.max_completion_length} rewards={len(reward_funcs)}"
+        + (
+            f"(overlong=shape(cache={args.soft_punish_cache}, w={args.overlong_penalty}))"
+            if not mask_truncated
+            else "(overlong=mask)"
+        )
+    )
 
-    run_name = "qwen-lora-uopsd-wic"
-    output_dir = f"./{run_name}"
+    run_name = args.run_name
+    output_dir = args.output_dir or f"./{run_name}"
     training_args = SDPOConfig(
         output_dir=output_dir,
         num_generations=args.num_generations,
         num_generations_eval=args.num_generations_eval,
         max_completion_length=args.max_completion_length,
-        # An unparsable rollout is excluded from the vote and can never be a distillation
-        # target, so truncation is already handled upstream of the loss; zeroing the
-        # completion mask on top of that would only corrupt the teacher alignment.
-        mask_truncated_completions=False,
+        mask_truncated_completions=mask_truncated,
         reward_weights=reward_weights,
         beta=0.0,
         disable_dropout=True,
         optim="paged_adamw_8bit",
         temperature=args.temperature,
-        top_p=0.95,
-        top_k=20,
+        top_p=args.top_p,
+        top_k=args.top_k,
         min_p=0.0,
         per_device_train_batch_size=args.batch_size,
         per_device_eval_batch_size=args.batch_size,
         gradient_accumulation_steps=grad_accum,
         num_train_epochs=2,
-        warmup_steps=0.03,
+        max_steps=args.max_steps,
+        warmup_steps=args.warmup_steps,
         learning_rate=args.learning_rate,
         lr_scheduler_type="cosine",
-        max_grad_norm=0.1,  # the paper's clip; loosen it and the KL spikes carry through
+        max_grad_norm=args.max_grad_norm,
         bf16=True,
         eval_strategy="steps",
         eval_steps=args.eval_steps,
-        save_strategy="steps",
+        save_strategy=args.save_strategy,
         save_steps=100,
         save_total_limit=6,
-        logging_steps=25,
+        logging_steps=args.logging_steps,
         report_to="wandb",
         run_name=run_name,
         # --- the objective: Eq. 5, pure distillation ------------------------- #

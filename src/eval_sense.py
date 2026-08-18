@@ -12,9 +12,22 @@ continuation via vLLM structured outputs), so every completion parses and
 which get force-closed. Prefix caching means the phase-2 pass reuses the
 phase-1 KV cache instead of re-prefilling prompt + reasoning.
 
-Predictions are saved in the ``call_api.py`` teacher schema (one greedy sample
-per pair), so the output file can be fed straight to ``prepare_data.py --data``
-(which builds the SFT dataset ``sft_sense.py`` then trains on).
+Predictions are saved in the ``call_api.py`` teacher schema, so the output file
+feeds straight into ``sft_sense.py --file_path`` — ``utils.build_sft_dataset``
+runs it through ``sense_data.load_teacher_traces``, which keeps the pairs the
+policy got *right* and turns each into a ``{prompt, completion}`` row. That is
+the self-distillation loop: eval a checkpoint on a train split, train the next
+one on its own correct traces. Every field of the input record that isn't an
+output key is carried through, so ``source``/``lang1``/``senses`` survive into
+the SFT file and the distilled set can still be stratified.
+
+``-k`` is what makes the loop worth running. At k=1 (greedy, the default) each
+pair yields exactly one trace, so ``load_teacher_traces``'s ``longest``
+selection has nothing to select from and a lucky-but-wrong trace is kept
+whenever the verdict happens to match gold. At k>1 the pairs are decoded with
+Qwen3 thinking-mode sampling, ``prediction`` becomes a majority vote (ties →
+``None``, dropped downstream), and only the samples that agree with that vote
+are distillation candidates.
 
 Examples
 --------
@@ -27,6 +40,10 @@ Examples
   # an unmerged LoRA adapter served on top of its base model
   uv run python src/eval_sense.py --model ./qwen-sft_wic_filtered \\
       --lora ./qwen-lora-sdpo-wic/checkpoint-500
+  # self-distillation: 5 sampled traces per train pair, then SFT on the output
+  uv run python src/eval_sense.py --model ./qwen-lora-grpo-wic --force-json \\
+      --path data/xl-lexeme.json -k 5 --output data/self_distill.json
+  uv run python src/sft_sense.py --file_path data/self_distill.json
 """
 
 import argparse
@@ -74,6 +91,13 @@ WIC_JSON_SCHEMA = {
 }
 
 
+# Written by this script, so re-evaluating a predictions file doesn't feed a
+# previous run's verdicts back out as if they were corpus fields.
+OUTPUT_KEYS = frozenset(
+    {"task", "prediction", "confidence", "votes", "answers", "reasonings", "error"}
+)
+
+
 def load_lora(path):
     if not path:
         return None, None
@@ -84,44 +108,88 @@ def load_lora(path):
     return LoRARequest("adapter", 1, str(adapter)), int(cfg["r"])
 
 
-def generate_all(llm, texts, force_json=False, lora_request=None, schema=None):
-    """Greedy completions; ``force_json`` constrains the answer region to ``schema``.
+def _sampling_params(n, **kw):
+    """Greedy at n=1, Qwen3 thinking-mode sampling above it.
+
+    k=1 stays deterministic so a plain eval run is reproducible; asking for more
+    than one sample of a greedy decode would return n identical copies, so k>1
+    switches to the sampling settings Qwen3 documents for thinking mode (and that
+    the analysis scripts already match: temp 0.6 / top-p 0.95 / top-k 20 / min-p 0).
+    """
+    if n == 1:
+        return SamplingParams(temperature=0.0, **kw)
+    return SamplingParams(n=n, temperature=0.6, top_p=0.95, top_k=20, min_p=0.0, **kw)
+
+
+def generate_all(llm, texts, force_json=False, lora_request=None, schema=None, n=1):
+    """``n`` completions per prompt; ``force_json`` constrains the answer region.
+
+    Returns one list of completions per prompt (length ``n``), so callers that
+    only ever want a single verdict take ``[0]``.
 
     ``schema`` defaults to the WiC answer object — other tasks (``eval_assign``)
     pass their own, which is the only thing about the two-phase decode that is
     task-specific.
     """
     if not force_json:
-        sp = SamplingParams(temperature=0.0, max_tokens=1024)
+        sp = _sampling_params(n, max_tokens=1024)
         return [
-            out.outputs[0].text
+            [o.text for o in out.outputs]
             for out in llm.generate(texts, sp, lora_request=lora_request)
         ]
 
     # Phase 1: free-form reasoning, halted at the close of the think block.
-    sp1 = SamplingParams(
-        temperature=0.0,
+    sp1 = _sampling_params(
+        n,
         max_tokens=1024,
         stop=["</think>"],
         include_stop_str_in_output=True,
     )
-    thinks = []
+    thinks = []  # one list of n think blocks per prompt
     for out in llm.generate(texts, sp1, lora_request=lora_request):
-        think = out.outputs[0].text
-        if "</think>" not in think:  # budget ran out mid-reasoning: force-close
-            think += "\n</think>"
-        thinks.append(think.rstrip() + "\n")
+        per_prompt = []
+        for o in out.outputs:
+            think = o.text
+            if "</think>" not in think:  # budget ran out mid-reasoning: force-close
+                think += "\n</think>"
+            per_prompt.append(think.rstrip() + "\n")
+        thinks.append(per_prompt)
 
     # Phase 2: constrained continuation — only tokens forming schema-valid JSON.
+    # Flattened to one request per (prompt, sample): the samples diverge in phase 1,
+    # so each needs its own reasoning prefix. Greedy here even when n>1 — the
+    # verdict is read off the reasoning, and sampling it would add noise the vote
+    # would then have to average back out.
     sp2 = SamplingParams(
         temperature=0.0,
         max_tokens=512,
         structured_outputs=StructuredOutputsParams(json=schema or WIC_JSON_SCHEMA),
     )
-    outs2 = llm.generate(
-        [p + t for p, t in zip(texts, thinks)], sp2, lora_request=lora_request
-    )
-    return [think + out.outputs[0].text for think, out in zip(thinks, outs2)]
+    flat = [p + t for p, per_prompt in zip(texts, thinks) for t in per_prompt]
+    outs2 = llm.generate(flat, sp2, lora_request=lora_request)
+    out_all, i = [], 0
+    for per_prompt in thinks:  # re-group by each prompt's own sample count
+        out_all.append(
+            [t + out.outputs[0].text for t, out in zip(per_prompt, outs2[i:])]
+        )
+        i += len(per_prompt)
+    return out_all
+
+
+def majority_vote(votes):
+    """Self-consistency vote over the sampled verdicts → (prediction, confidence).
+
+    Mirrors ``call_api._vote``: unparseable samples abstain, and a tie is *no*
+    prediction rather than a coin flip, so ``load_teacher_traces`` drops the pair
+    instead of distilling whichever half happened to be listed first.
+    """
+    valid = [v for v in votes if v is not None]
+    if not valid:
+        return None, 0.0
+    trues = sum(valid)
+    if trues * 2 == len(valid):  # tie → no prediction
+        return None, 0.5
+    return trues * 2 > len(valid), max(trues, len(valid) - trues) / len(valid)
 
 
 def wic_metrics(preds, golds):
@@ -160,6 +228,16 @@ def main():
     ap.add_argument("--lora", default=None)
     ap.add_argument("--path", default="data/mcl-wic.test.json")
     ap.add_argument("--max-samples", type=int, default=0, help="0 = full split")
+    ap.add_argument(
+        "-k",
+        "--samples",
+        type=int,
+        default=1,
+        help="Completions per pair (default 1 = greedy). Above 1 the pairs are "
+        "decoded with thinking-mode sampling and the verdict is a majority vote, "
+        "which is what gives the SFT distillation candidates to choose between. "
+        "An even k ties out more often than an odd one.",
+    )
     ap.add_argument("--force-json", action="store_true")
     ap.add_argument("--max-model-len", type=int, default=4096)
     ap.add_argument("--gpu-memory-utilization", type=float, default=0.85)
@@ -182,31 +260,48 @@ def main():
 
     texts = [build_prompt(r, tokenizer) for r in data]
     decoded_all = generate_all(
-        llm, texts, force_json=args.force_json, lora_request=lora_req
+        llm,
+        texts,
+        force_json=args.force_json,
+        lora_request=lora_req,
+        n=args.samples,
     )
 
     hyps, refs, records = [], [], []
-    for rec, decoded in zip(data, decoded_all):
-        hyp, gold = sd.extract_wic_label(decoded), rec["label"]
+    for rec, samples in zip(data, decoded_all):
+        gold = rec["label"]
+        votes = [sd.extract_wic_label(d) for d in samples]
+        hyp, confidence = majority_vote(votes)
         hyps.append(hyp)
         refs.append(gold)
-        # Teacher-predictions schema (call_api.py), single greedy sample —
-        # the output file feeds prepare_data.py --data via load_teacher_traces.
-        think, closed, _ = decoded.partition("</think>")
-        answer = sd.parse_wic_answer(decoded)
+        # Teacher-predictions schema (call_api.py): the output file feeds
+        # sft_sense.py --file_path via load_teacher_traces. `answers` and
+        # `reasonings` are kept index-aligned and always length k — the
+        # candidate builder zips them, so a sample that lost only its JSON must
+        # still hold its slot or the next sample's verdict would be paired with
+        # this one's reasoning. Empty strings are rejected there, so a padded
+        # slot is dropped rather than distilled.
+        answers, reasonings = [], []
+        for decoded in samples:
+            think, closed, _ = decoded.partition("</think>")
+            answer = sd.parse_wic_answer(decoded)
+            answers.append(
+                json.dumps(answer, ensure_ascii=False) if answer is not None else ""
+            )
+            reasonings.append(think.replace("<think>", "").strip() if closed else "")
+        # Everything the source record carried that isn't an output key rides
+        # along (source/lang/senses/split), so the distilled SFT set can still be
+        # stratified by where its pairs came from.
+        base = {k: v for k, v in rec.items() if k not in OUTPUT_KEYS}
         records.append(
             {
-                "lemma": rec["lemma"],
-                "pos": rec["pos"],
-                "sentence1": rec["sentence1"],
-                "sentence2": rec["sentence2"],
-                "label": gold,
+                **base,
+                "task": "wic",
                 "prediction": hyp,
-                "votes": [hyp],
-                "answers": [json.dumps(answer, ensure_ascii=False)]
-                if answer is not None
-                else [],
-                "reasonings": [think.replace("<think>", "").strip()] if closed else [],
+                "confidence": confidence,
+                "votes": votes,
+                "answers": answers,
+                "reasonings": reasonings,
             }
         )
 
@@ -225,10 +320,19 @@ def main():
         print(f"{rec['lemma']:<18}  {label:<10}  {pred:<10}")
 
     # Bare list in the call_api.py teacher schema — directly consumable by
-    # prepare_data.py --data. Metrics are printed above, not saved.
+    # sft_sense.py --file_path. Metrics are printed above, not saved.
     out_path = Path(args.output or f"predictions_sense_wic_{Path(args.path).stem}.json")
     out_path.write_text(json.dumps(records, ensure_ascii=False, indent=2))
     print(f"Saved predictions → {out_path}")
+
+    # The SFT yield, measured through the loader that will actually read the file
+    # rather than re-derived here: rows kept = pairs the policy got right that
+    # also left a usable trace behind.
+    kept = sd.load_teacher_traces(out_path, strategy="longest")
+    print(
+        f"SFT-usable: {len(kept)}/{len(records)} rows "
+        f"(uv run python src/sft_sense.py --file_path {out_path})"
+    )
 
 
 if __name__ == "__main__":

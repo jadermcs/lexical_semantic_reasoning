@@ -247,20 +247,6 @@ class TestThinkLength:
         assert R.reward_think_length([wrap(GOOD_THINK, JSON_ANSWER)]) == [0.0]
 
 
-# --------------------------------------------------------------------------- #
-# Gold-gloss grounding (SemCor pairs)
-# --------------------------------------------------------------------------- #
-BANK_SENSES = [
-    "sloping land (especially the slope beside a body of water)",
-    "a financial institution that accepts deposits and channels the money into lending activities",
-    "a long ridge or pile",
-]
-
-
-def gloss_kwargs(gold1, gold2, senses=BANK_SENSES):
-    return {"gloss1": [gold1], "gloss2": [gold2], "senses": [senses]}
-
-
 SHAPE_CEILING = 0.2 + R.WIC_JSON_PARSES + R.WIC_JSON_KEYS + R.WIC_JSON_BOOL
 SHAPE_FLOOR = R.THINK_MIN_PENALTY + R.WIC_INCONSISTENT
 
@@ -279,10 +265,9 @@ def test_shape_range_cannot_close_the_accuracy_gap():
     # the full shape *span* stays narrower than the accuracy gap — otherwise shaping
     # alone could rank a correct answer below a wrong one.
     #
-    # This is the constraint any new shaping term has to buy its way into. The other
-    # terms span 1.1 against a gap of 1.5, so there was 0.4 of headroom;
-    # reward_wic_gloss spends 0.3 of it (±GLOSS_MAX), leaving 0.1. A further term of
-    # more than that has to be paid for by shrinking an existing one.
+    # This is the constraint any new shaping term has to buy its way into. The
+    # terms span 1.1 against a gap of 1.5, so a new term has 0.4 of headroom
+    # before it has to be paid for by shrinking an existing one.
     assert SHAPE_CEILING - SHAPE_FLOOR < R.WIC_CORRECT - R.WIC_WRONG
 
 
@@ -291,29 +276,6 @@ def _total(completion, label, lemma="bank", pos="noun", **extra):
         f([completion], label=[label], lemma=[lemma], pos=[pos], **extra)[0]
         for f in R.REWARDS
     )
-
-
-def test_a_correct_verdict_with_wrong_glosses_still_beats_a_wrong_verdict():
-    # The gloss term is grounded in gold, so it is the shaping term most tempted to
-    # overrule the verdict. It must not: worst-case gloss score on a correct answer
-    # still has to outrank best-case gloss score on a wrong one.
-    # The two completions are identical in shape and both take the same format, JSON
-    # and consistency credit, so flipping the gold label is what isolates the pair of
-    # terms under test: accuracy against gloss grounding.
-    kw = gloss_kwargs(BANK_SENSES[0], BANK_SENSES[1])
-    swapped = wrap(
-        GOOD_THINK,
-        json.dumps(
-            {"sense1": BANK_SENSES[1], "sense2": BANK_SENSES[0], "same_sense": False}
-        ),
-    )
-    grounded = wrap(
-        GOOD_THINK,
-        json.dumps(
-            {"sense1": BANK_SENSES[0], "sense2": BANK_SENSES[1], "same_sense": False}
-        ),
-    )
-    assert _total(swapped, False, **kw) > _total(grounded, True, **kw)
 
 
 def test_an_ugly_correct_answer_still_beats_a_pretty_wrong_one():
