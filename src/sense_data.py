@@ -49,6 +49,8 @@ def load_teacher_traces(
         if not ans:
             continue
         parsed = json.loads(r.get("answers", "null"))
+        if not {"sense1", "sense2", "same_sense"} <= parsed.keys():
+            continue
         out.append(
             {
                 "task": "wic",

@@ -254,7 +254,7 @@ def main():
         save_steps=100,
         save_total_limit=6,
         logging_steps=args.logging_steps,
-        report_to="wandb",
+        report_to="mlflow",
         run_name=run_name,
         log_completions=True,
         num_completions_to_print=3,

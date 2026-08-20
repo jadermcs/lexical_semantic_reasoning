@@ -118,7 +118,7 @@ def _sampling_params(n, **kw):
     """
     if n == 1:
         return SamplingParams(temperature=0.0, **kw)
-    return SamplingParams(n=n, temperature=0.6, top_p=0.95, top_k=20, min_p=0.0, **kw)
+    return SamplingParams(n=n, temperature=1.0, top_p=0.95, top_k=20, min_p=0.0, **kw)
 
 
 def generate_all(llm, texts, force_json=False, lora_request=None, schema=None, n=1):
