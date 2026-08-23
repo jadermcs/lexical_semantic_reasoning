@@ -135,7 +135,15 @@ def main():
         "--save-strategy", default="steps", choices=["steps", "epoch", "no"]
     )
     ap.add_argument("--resume", nargs="?", const=True, default=None)
+    ap.add_argument(
+        "--experiment",
+        default=os.environ.get("MLFLOW_EXPERIMENT_NAME", "wic-grpo"),
+        help="MLflow experiment to group runs under. MLflowCallback reads this "
+        "from MLFLOW_EXPERIMENT_NAME only -- TrainingArguments.project is "
+        "Trackio-only and is ignored by the mlflow integration.",
+    )
     args = ap.parse_args()
+    os.environ["MLFLOW_EXPERIMENT_NAME"] = args.experiment
 
     if args.generation_batch % args.batch_size:
         ap.error(

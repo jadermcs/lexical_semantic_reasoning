@@ -5,9 +5,14 @@
 set -euo pipefail
 cd "$(dirname "$0")"
 
-export WANDB_PROJECT="wic-reasoning"
+# mlflow 3.15 put the ./mlruns file store in maintenance mode and raises on it,
+# so the backend has to be a database URI (sqlalchemy + alembic are deps for it).
+export MLFLOW_TRACKING_URI="sqlite:///${PWD}/mlflow.db"
+# Deliberately NOT exporting MLFLOW_EXPERIMENT_NAME: each script defaults to its
+# own experiment (wic-sft / wic-grpo / wic-sdpo), and an export here would win
+# over all of them and dump every stage into one bucket. Override per run with
+# `--experiment`, or export it for a one-off sweep.
 export TORCHDYNAMO_DISABLE=1
-# export WANDB_MODE=disabled
 # export HF_HOME=/scratch/$USER/.cache/huggingface
 
 uv sync

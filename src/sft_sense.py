@@ -1,4 +1,5 @@
 import argparse
+import os
 from pathlib import Path
 
 import torch
@@ -17,7 +18,15 @@ def main():
     ap.add_argument("--batch-size", type=int, default=4)
     ap.add_argument("--warmup-steps", type=float, default=0.02)
     ap.add_argument("--output-dir", default=None)
+    ap.add_argument(
+        "--experiment",
+        default=os.environ.get("MLFLOW_EXPERIMENT_NAME", "wic-sft"),
+        help="MLflow experiment to group runs under. MLflowCallback reads this "
+        "from MLFLOW_EXPERIMENT_NAME only -- TrainingArguments.project is "
+        "Trackio-only and is ignored by the mlflow integration.",
+    )
     args = ap.parse_args()
+    os.environ["MLFLOW_EXPERIMENT_NAME"] = args.experiment
 
     grad_accum = max(16 // args.batch_size, 1)
     tokenizer = AutoTokenizer.from_pretrained(args.model, trust_remote_code=True)
@@ -42,7 +51,7 @@ def main():
     training_args = SFTConfig(
         output_dir=output_dir,
         run_name=f"{args.model.split('/')[-1]}-sft-{data_tag}",
-        project="sense-sft",
+        project=args.experiment,  # Trackio-only; kept consistent, not read by mlflow
         completion_only_loss=True,
         max_length=1024,
         packing=True,

@@ -131,7 +131,8 @@ uv run python src/sft_sense.py --reasoning-select longest --data data/mcl_semcor
 
 Writes `./qwen-sense-sft-wic-<strategy>-<data-stem>` (e.g.
 `qwen-sense-sft-wic-longest-mcl_semcor_filtered`), resumes from the latest
-checkpoint in that dir, logs to wandb. A 5 % dev split is carved off a
+checkpoint in that dir, logs to MLflow (`MLFLOW_TRACKING_URI`, set by
+`run_train.sh` to `sqlite:///mlflow.db`). A 5 % dev split is carved off a
 deterministic shuffle for best-checkpoint selection.
 
 ---

@@ -247,8 +247,125 @@ class TestThinkLength:
         assert R.reward_think_length([wrap(GOOD_THINK, JSON_ANSWER)]) == [0.0]
 
 
+class TestGlossForm:
+    def test_well_formed_glosses_are_free(self):
+        c = wrap(
+            GOOD_THINK,
+            json.dumps(
+                {
+                    "sense1": "a financial institution",
+                    "sense2": "sloping land beside water",
+                    "same_sense": False,
+                }
+            ),
+        )
+        assert R.reward_wic_gloss_form([c]) == [0.0]
+
+    def test_disjunction_is_penalised_per_gloss(self):
+        c = wrap(
+            GOOD_THINK,
+            json.dumps(
+                {
+                    "sense1": "a financial institution or a river edge",
+                    "sense2": "sloping land beside water",
+                    "same_sense": False,
+                }
+            ),
+        )
+        assert R.reward_wic_gloss_form([c]) == [
+            pytest.approx(R.GLOSS_DISJUNCTION_PENALTY)
+        ]
+
+    def test_both_glosses_hedged_costs_twice(self):
+        # Each disjunct here ("a bank", "a firm") is under GLOSS_MIN_WORDS, so the
+        # length term fires too: the "or" was the only thing padding these to three
+        # tokens, which is exactly the case _committed_len exists to catch.
+        c = wrap(
+            GOOD_THINK,
+            json.dumps(
+                {
+                    "sense1": "a bank or a firm",
+                    "sense2": "a slope or a shore",
+                    "same_sense": False,
+                }
+            ),
+        )
+        assert R.reward_wic_gloss_form([c]) == [
+            pytest.approx(2 * (R.GLOSS_DISJUNCTION_PENALTY + R.GLOSS_SHORT_PENALTY))
+        ]
+
+    def test_or_inside_a_word_is_not_a_disjunction(self):
+        # "for", "corn", "editor" all contain "or"; only the standalone token counts.
+        c = wrap(
+            GOOD_THINK,
+            json.dumps(
+                {
+                    "sense1": "a place for corn",
+                    "sense2": "an editor of texts",
+                    "same_sense": False,
+                }
+            ),
+        )
+        assert R.reward_wic_gloss_form([c]) == [0.0]
+
+    def test_short_gloss_is_penalised(self):
+        c = wrap(
+            GOOD_THINK,
+            json.dumps(
+                {"sense1": "money", "sense2": "sloping land beside water",
+                 "same_sense": False}
+            ),
+        )
+        assert R.reward_wic_gloss_form([c]) == [pytest.approx(R.GLOSS_SHORT_PENALTY)]
+
+    def test_short_and_hedged_stack(self):
+        # "bank or shore" is 3 raw tokens but commits to one word either way, so
+        # length is scored on the disjunct, not the string: both glosses take the
+        # pair. Scoring the raw string here is what made the term a plateau.
+        c = wrap(GOOD_THINK, json.dumps(
+            {"sense1": "bank or shore", "sense2": "gold or", "same_sense": False}
+        ))
+        assert R.reward_wic_gloss_form([c]) == [
+            pytest.approx(
+                2 * (R.GLOSS_DISJUNCTION_PENALTY + R.GLOSS_SHORT_PENALTY)
+            )
+        ]
+
+    def test_dropping_the_hedge_is_always_an_improvement(self):
+        # The invariant the term exists for. The first version scored length on the
+        # whole string, so deleting the "or" from a two-short-disjunct gloss traded
+        # GLOSS_DISJUNCTION_PENALTY for GLOSS_SHORT_PENALTY at the same magnitude:
+        # zero gradient, and the policy went on hedging through a whole GRPO run.
+        # Every step away from the hedge must strictly pay.
+        def score(s1, s2):
+            return R.reward_wic_gloss_form(
+                [wrap(GOOD_THINK, json.dumps(
+                    {"sense1": s1, "sense2": s2, "same_sense": False}
+                ))]
+            )[0]
+
+        hedged = score("fame or acclaim", "credit or discredit")
+        unhedged_stub = score("fame", "credit")
+        committed = score("public renown and esteem", "money lent at interest")
+        assert hedged < unhedged_stub < committed
+        assert committed == 0.0
+
+    def test_unparseable_answer_is_this_term_s_business(self):
+        # The json/format terms already punish a missing answer; double-charging it
+        # here would deepen the shape floor for nothing.
+        assert R.reward_wic_gloss_form([wrap(GOOD_THINK, "they differ")]) == [0.0]
+        assert R.reward_wic_gloss_form(
+            [wrap(GOOD_THINK, '{"same_sense": false}')]
+        ) == [0.0]
+
+
 SHAPE_CEILING = 0.2 + R.WIC_JSON_PARSES + R.WIC_JSON_KEYS + R.WIC_JSON_BOOL
-SHAPE_FLOOR = R.THINK_MIN_PENALTY + R.WIC_INCONSISTENT
+SHAPE_FLOOR = (
+    R.THINK_MIN_PENALTY
+    + R.WIC_INCONSISTENT
+    # both glosses hedged with "or" *and* under GLOSS_MIN_WORDS
+    + 2 * (R.GLOSS_SHORT_PENALTY + R.GLOSS_DISJUNCTION_PENALTY)
+)
 
 
 def test_accuracy_dominates_the_shape_rewards():
@@ -266,8 +383,10 @@ def test_shape_range_cannot_close_the_accuracy_gap():
     # alone could rank a correct answer below a wrong one.
     #
     # This is the constraint any new shaping term has to buy its way into. The
-    # terms span 1.1 against a gap of 1.5, so a new term has 0.4 of headroom
-    # before it has to be paid for by shrinking an existing one.
+    # terms span 1.44 against a gap of 1.5, so there is 0.06 of headroom left
+    # before a new term has to be paid for by shrinking an existing one. That is
+    # also the ceiling on GLOSS_DISJUNCTION_PENALTY: it enters the floor twice
+    # (once per gloss), so -0.15 would close the gap exactly and fail here.
     assert SHAPE_CEILING - SHAPE_FLOOR < R.WIC_CORRECT - R.WIC_WRONG
 
 
@@ -311,6 +430,7 @@ def test_every_reward_is_registered():
         R.reward_wic_format,
         R.reward_wic_json,
         R.reward_wic_consistency,
+        R.reward_wic_gloss_form,
         R.reward_think_length,
     ]
     # build_grpo_dataset drops every column not listed here, so a reward kwarg missing from

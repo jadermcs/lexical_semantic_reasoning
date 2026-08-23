@@ -209,3 +209,8 @@ __marimo__/
 # Per-machine uv environments (shared folder, see run_train.sh / run_infer.sh)
 .venv-train/
 .venv-infer/
+
+# MLflow local tracking backend (sqlite; the ./mlruns file store is deprecated)
+mlflow.db
+mlruns/
+mlartifacts/

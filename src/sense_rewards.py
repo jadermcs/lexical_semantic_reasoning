@@ -18,6 +18,9 @@ WIC_JSON_MALFORMED = -0.2  # said something after </think>, but no JSON object i
 WIC_INCONSISTENT = -0.3
 THINK_MIN_WORDS = 6  # below this many content words, reasoning is treated as a stub
 THINK_MIN_PENALTY = -0.3
+GLOSS_MIN_WORDS = 3  # a gloss shorter than this is a label, not a definition
+GLOSS_SHORT_PENALTY = -0.05  # per gloss, so both stubbed costs -0.1
+GLOSS_DISJUNCTION_PENALTY = -0.12  # per gloss containing a bare "or"
 
 
 def _tok(text):
@@ -59,6 +62,55 @@ def reward_think_length(completions, **kwargs):
         out.append(
             THINK_MIN_PENALTY if _content_word_count(think) < THINK_MIN_WORDS else 0.0
         )
+    return out
+
+
+def _glosses(text):
+    """The two emitted glosses, as strings, or [] if the answer is not usable."""
+    obj = sd.parse_wic_answer(text)
+    if obj is None:
+        return []
+    return [obj[k] for k in ("sense1", "sense2") if isinstance(obj.get(k), str)]
+
+
+def _committed_len(gloss):
+    """Word count of the longest single disjunct -- what the gloss commits to.
+
+    Measuring the whole string would let the "or" pay for itself. In a mid-run
+    rollout batch 83% of hedged glosses had *every* disjunct under
+    GLOSS_MIN_WORDS ("fame or acclaim", "credit or discredit"), so dropping the
+    hedge merely swapped GLOSS_DISJUNCTION_PENALTY for GLOSS_SHORT_PENALTY --
+    net zero, a flat optimum, and the policy kept hedging.
+    """
+    return max((len(_tok(p)) for p in re.split(r"\bor\b", gloss.lower())), default=0)
+
+
+def reward_wic_gloss_form(completions, **kwargs):
+    """Penalise glosses that hedge with "or" or are too short to be definitions.
+
+    "a river bank or the edge of a road" commits to neither sense, which lets the
+    policy keep both readings alive and still satisfy reward_wic_consistency; a
+    one- or two-word gloss ("money", "the bank") is a label rather than a
+    definition and carries no evidence that the usage was actually read. Both are
+    scored per gloss, so hedging in both usages costs twice.
+
+    Length is measured on the *committed* disjunct (see _committed_len), so
+    deleting an "or" can never buy back the length penalty, and the disjunction
+    costs more than the stub it hides behind -- otherwise the two halves of this
+    term cancel and it scores a plateau rather than a slope.
+
+    Silent (0.0) when the answer does not parse or a gloss is missing -- those are
+    reward_wic_json's and reward_wic_format's to punish, not this term's.
+    """
+    out = []
+    for c in completions:
+        r = 0.0
+        for gloss in _glosses(c):
+            if "or" in _tok(gloss):
+                r += GLOSS_DISJUNCTION_PENALTY
+            if _committed_len(gloss) < GLOSS_MIN_WORDS:
+                r += GLOSS_SHORT_PENALTY
+        out.append(r)
     return out
 
 
@@ -129,6 +181,7 @@ REWARDS = [
     reward_wic_format,
     reward_wic_json,
     reward_wic_consistency,
+    reward_wic_gloss_form,
     reward_think_length,
 ]
 
