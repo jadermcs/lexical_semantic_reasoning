@@ -6,16 +6,50 @@ from rapidfuzz import fuzz, process
 
 DATA_DIR = Path("data")
 
-WIC_SYSTEM = (
-    "You are an expert lexicographer. You are given two sentences, each using the same "
-    "target word (marked with <t> tags). Inside <think> tags, work out what the target "
-    "word means in each sentence then compare the two senses. Then, after </think>, "
-    "answer with a single JSON object and nothing else, with exactly these keys: "
-    '"sense1" (string, the gloss of the target in sentence 1), "sense2" (string, the '
-    'gloss of the target in sentence 2), and "same_sense" (boolean, true if the two '
-    "uses share the same sense). "
-    'Format: <think>...</think>\n{"sense1": ..., "sense2": ..., "same_sense": ...}'
-)
+def wic_system(with_think: bool = True, with_gloss: bool = True) -> str:
+    """The WiC system prompt, matching the answer shape the target is rendered in.
+
+    The two flags are the SFT ablations: ``with_think=False`` trains on an empty
+    ``<think></think>`` block (no reasoning trace), ``with_gloss=False`` drops the
+    per-usage glosses from the JSON verdict. The instruction has to move with the
+    target -- asking for keys the completion never contains teaches the model to
+    disregard its own prompt.
+    """
+    head = (
+        "You are an expert lexicographer. You are given two sentences, each using the "
+        "same target word (marked with <t> tags). "
+    )
+    if with_think:
+        reason = (
+            "Inside <think> tags, work out what the target word means in each "
+            "sentence then compare the two senses. Then, after </think>, answer "
+        )
+        think_fmt = "<think>...</think>"
+    else:
+        reason = (
+            "Do not reason: emit an empty <think></think> block, then answer "
+            "immediately "
+        )
+        think_fmt = "<think></think>"
+    keys = (
+        '"sense1" (string, the gloss of the target in sentence 1), "sense2" (string, '
+        'the gloss of the target in sentence 2), and "same_sense" (boolean, true if '
+        "the two uses share the same sense). "
+        if with_gloss
+        else '"same_sense" (boolean, true if the two uses share the same sense). '
+    )
+    shape = (
+        '{"sense1": ..., "sense2": ..., "same_sense": ...}'
+        if with_gloss
+        else '{"same_sense": ...}'
+    )
+    return (
+        f"{head}{reason}with a single JSON object and nothing else, with exactly "
+        f"these keys: {keys}Format: {think_fmt}\n{shape}"
+    )
+
+
+WIC_SYSTEM = wic_system()
 
 
 def mark_target(sentence: str, word: str, fuzzy_threshold: float = 70.0) -> str:
@@ -79,48 +113,64 @@ def pair_key(rec: dict) -> tuple:
     return (rec["lemma"], rec["pos"], rec["sentence1"], rec["sentence2"])
 
 
-def think_block(rec) -> str:
-    """The distilled teacher trace, wrapped in <think> tags (shared by all tasks)."""
-    return f"<think>\n{rec['think']}\n</think>"
+def think_block(rec, with_think: bool = True) -> str:
+    """The distilled teacher trace, wrapped in <think> tags (shared by all tasks).
+
+    ``with_think=False`` keeps the tags and drops the trace, so the completion still
+    has the shape the format reward and the answer parser expect.
+    """
+    return f"<think>\n{rec['think']}\n</think>" if with_think else "<think></think>"
 
 
 wic_think = think_block
 
 
-def wic_answer(rec) -> str:
+def wic_answer(rec, with_gloss: bool = True) -> str:
     """JSON verdict mirroring the teacher: sense gloss per usage + same_sense."""
-    return json.dumps(
-        {
-            "sense1": rec.get("sense1", ""),
-            "sense2": rec.get("sense2", ""),
-            "same_sense": bool(rec["label"]),
-        }
-    )
+    obj = {}
+    if with_gloss:
+        obj["sense1"] = rec.get("sense1", "")
+        obj["sense2"] = rec.get("sense2", "")
+    obj["same_sense"] = bool(rec["label"])
+    return json.dumps(obj)
 
 
-def wic_messages(rec, with_target=False):
+def wic_messages(rec, with_target=False, with_think=True, with_gloss=True):
     """Chat messages for one pair.
 
     ``with_target`` appends the assistant turn (the SFT target), which needs the
     distilled ``think``/``sense1``/``sense2`` fields — i.e. a ``load_teacher_traces``
     record. Prompt-only rendering (``with_target=False``) works for any wic record,
     including the gloss-free MCL-WiC ones GRPO and eval use.
+
+    ``with_think``/``with_gloss`` are the SFT ablations, and they shape the *prompt*
+    as well as the target: a run trained with empty think tags or a gloss-free verdict
+    is asked for exactly what it is trained to emit.
     """
+    keys = (
+        'keys "sense1", "sense2" (the gloss of the target in each sentence) and '
+        '"same_sense" (boolean)'
+        if with_gloss
+        else 'the key "same_sense" (boolean)'
+    )
     user = (
         f"Target word: {rec['lemma']} ({rec['pos']})\n\n"
         f"Sentence 1: {rec['sentence1']}\n"
         f"Sentence 2: {rec['sentence2']}\n\n"
         "Do both sentences use the target word in the same sense? Respond with a "
-        'single JSON object with keys "sense1", "sense2" (the gloss of the target '
-        'in each sentence) and "same_sense" (boolean).'
+        f"single JSON object with {keys}."
     )
     msgs = [
-        {"role": "system", "content": WIC_SYSTEM},
+        {"role": "system", "content": wic_system(with_think, with_gloss)},
         {"role": "user", "content": user},
     ]
     if with_target:
         msgs.append(
-            {"role": "assistant", "content": f"{think_block(rec)}\n{wic_answer(rec)}"}
+            {
+                "role": "assistant",
+                "content": f"{think_block(rec, with_think)}\n"
+                f"{wic_answer(rec, with_gloss)}",
+            }
         )
     return msgs
 

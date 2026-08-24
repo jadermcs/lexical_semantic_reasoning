@@ -19,6 +19,18 @@ def main():
     ap.add_argument("--warmup-steps", type=float, default=0.02)
     ap.add_argument("--output-dir", default=None)
     ap.add_argument(
+        "--no-think",
+        action="store_true",
+        help="Ablation: train on an empty <think></think> block instead of the "
+        "distilled reasoning trace (prompt asks for no reasoning to match).",
+    )
+    ap.add_argument(
+        "--no-gloss",
+        action="store_true",
+        help="Ablation: drop sense1/sense2 from the JSON verdict, training on "
+        "same_sense alone (prompt asks for that key alone to match).",
+    )
+    ap.add_argument(
         "--experiment",
         default=os.environ.get("MLFLOW_EXPERIMENT_NAME", "wic-sft"),
         help="MLflow experiment to group runs under. MLflowCallback reads this "
@@ -32,7 +44,11 @@ def main():
     tokenizer = AutoTokenizer.from_pretrained(args.model, trust_remote_code=True)
     tokenizer.pad_token = tokenizer.eos_token
 
-    ds = build_sft_dataset(args.file_path)
+    ds = build_sft_dataset(
+        args.file_path,
+        with_think=not args.no_think,
+        with_gloss=not args.no_gloss,
+    )
     train_ds = ds["train"]
     dev_ds = ds["test"]
     print(train_ds[0])
@@ -46,7 +62,11 @@ def main():
 
     print(f"[sft] train={len(train_ds)} dev={len(dev_ds)} data={args.file_path}")
 
+    # The ablations train a different model off the same corpus, so they get their own
+    # tag -- otherwise all three runs land in ./qwen-<stem> and overwrite each other.
     data_tag = Path(args.file_path.rstrip("/")).stem
+    data_tag += "-nothink" if args.no_think else ""
+    data_tag += "-nogloss" if args.no_gloss else ""
     output_dir = args.output_dir or f"./qwen-{data_tag}"
     training_args = SFTConfig(
         output_dir=output_dir,

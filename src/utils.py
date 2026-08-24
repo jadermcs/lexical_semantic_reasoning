@@ -175,13 +175,17 @@ def build_grpo_dataset(file_path, cap=None, with_split=False):
     return _prepare(data, cap=cap).train_test_split(test_size=200, seed=42)
 
 
-def format_example(rec):
+def format_example(rec, with_think=True, with_gloss=True):
     """One distilled record as the SFT pair: every turn but the last, then the last."""
-    msgs = sd.wic_messages(rec, with_target=True)
+    msgs = sd.wic_messages(
+        rec, with_target=True, with_think=with_think, with_gloss=with_gloss
+    )
     return {"prompt": msgs[:-1], "completion": msgs[-1:]}
 
 
-def build_sft_dataset(file_path, cap=None, strategy="longest"):
+def build_sft_dataset(
+    file_path, cap=None, strategy="longest", with_think=True, with_gloss=True
+):
     """Teacher traces as ``{prompt, completion}`` rows, split train/test.
 
     ``build_grpo_dataset`` renders the prompt alone and keeps ``KEEP_COLS`` beside it,
@@ -190,9 +194,16 @@ def build_sft_dataset(file_path, cap=None, strategy="longest"):
     instead, and that only exists on a record ``load_teacher_traces`` has distilled
     (teacher-correct pairs, one trace each) -- the raw file carries ``answers``/
     ``reasonings`` lists, not a single ``think``/``sense1``/``sense2``.
+
+    ``with_think=False`` renders the target with an empty ``<think></think>`` block and
+    ``with_gloss=False`` drops ``sense1``/``sense2`` from the JSON verdict — the two
+    ablations of what the distilled trace is actually buying. Both move the prompt with
+    the target, so the rows stay self-consistent; the corpus itself is unchanged.
     """
     recs = sd.load_teacher_traces(file_path, strategy=strategy)
-    ds = Dataset.from_list([format_example(r) for r in recs])
+    ds = Dataset.from_list(
+        [format_example(r, with_think, with_gloss) for r in recs]
+    )
     if cap is not None:
         ds = ds.shuffle(seed=42).select(range(min(cap, len(ds))))
     return ds.train_test_split(test_size=200, seed=42)
